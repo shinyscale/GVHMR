@@ -18,7 +18,6 @@ from smplx_to_bvh import (
     extract_gvhmr_params,
     extract_smplx_params,
     merge_gvhmr_smplestx_params,
-    _add_hand_mean_pose,
 )
 from bvh_to_fbx import convert_bvh_to_fbx
 from visualize_skeleton import render_skeleton_video, render_world_views
@@ -430,8 +429,6 @@ def run_full_pipeline(
         try:
             gvhmr_params = extract_gvhmr_params(gvhmr_pt_path)
             smplestx_params = extract_smplx_params(smplestx_pt_path)
-            # Add hand mean pose to SMPLest-X hands before merging
-            smplestx_params = _add_hand_mean_pose(smplestx_params)
             merged_params = merge_gvhmr_smplestx_params(gvhmr_params, smplestx_params)
 
             log_lines.append(f"[Merge] Body from GVHMR: {gvhmr_params['num_frames']} frames")
