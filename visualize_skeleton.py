@@ -19,6 +19,11 @@ from smplx_to_bvh import (
     JOINT_PARENTS,
     DEFAULT_OFFSETS,
     extract_smplx_params,
+    _camera_to_world_orient,
+    _correct_tilt,
+    _smooth_rotations,
+    _add_hand_mean_pose,
+    _compute_root_from_contacts,
 )
 
 # Try to import smplx for model-based FK
@@ -267,25 +272,28 @@ def project_to_2d(
 
 
 def render_skeleton_video(
-    pt_path: str,
-    video_path: str,
-    output_path: str,
+    pt_path: str = None,
+    video_path: str = "",
+    output_path: str = "",
     fps: float = 30.0,
     progress_callback=None,
+    params: dict = None,
 ) -> str:
     """Render skeleton overlay on video.
 
     Args:
-        pt_path: SMPL-X .pt file from SMPLest-X.
+        pt_path: SMPL-X .pt file from SMPLest-X. Ignored if params is provided.
         video_path: Original input video.
         output_path: Output overlay video path.
         fps: Frame rate.
         progress_callback: Optional callable(frac, msg) for GUI progress.
+        params: Pre-processed SMPL-X params dict. If provided, skips extraction.
 
     Returns:
         Path to output video.
     """
-    params = extract_smplx_params(pt_path)
+    if params is None:
+        params = extract_smplx_params(pt_path)
     n_frames = params["num_frames"]
     n_joints = len(JOINT_NAMES)
     has_bbox = "bbox" in params
@@ -398,6 +406,176 @@ def render_skeleton_video(
     subprocess.run(cmd, capture_output=True)
 
     # Clean up temp frames
+    shutil.rmtree(str(frames_dir), ignore_errors=True)
+
+    return str(output_path)
+
+
+def _world_to_screen(joints_3d, cam_forward_axis, width, height, scale, center_y):
+    """Project world-space joints to screen coords for a given view.
+
+    Args:
+        joints_3d: (N_joints, 3) world-space positions.
+        cam_forward_axis: Which world axis the camera looks along.
+            'z' = front view (camera on +Z, looking -Z): screen X = world X, screen Y = world Y
+            'x' = side view (camera on +X, looking -X): screen X = world Z, screen Y = world Y
+        width, height: Frame dimensions.
+        scale: Pixels per meter.
+        center_y: World Y coordinate mapped to vertical center of frame.
+
+    Returns:
+        (N_joints, 2) screen coordinates.
+    """
+    pts_2d = np.zeros((len(joints_3d), 2))
+    if cam_forward_axis == 'z':
+        # Front view: X right, Y up
+        pts_2d[:, 0] = width / 2 + joints_3d[:, 0] * scale
+        pts_2d[:, 1] = height / 2 - (joints_3d[:, 1] - center_y) * scale
+    else:
+        # Side view: Z right, Y up
+        pts_2d[:, 0] = width / 2 - joints_3d[:, 2] * scale
+        pts_2d[:, 1] = height / 2 - (joints_3d[:, 1] - center_y) * scale
+    return pts_2d
+
+
+def render_world_views(
+    pt_path: str = None,
+    output_path: str = "",
+    fps: float = 30.0,
+    width: int = 640,
+    height: int = 480,
+    pitch_adjust_deg: float = 0.0,
+    progress_callback=None,
+    params: dict = None,
+    skip_world_grounding: bool = False,
+) -> str:
+    """Render world-space front and side view skeleton video.
+
+    Produces a side-by-side video (2*width x height) showing the skeleton
+    from the front (+Z) and side (+X) after tilt correction and foot grounding.
+
+    Args:
+        pt_path: SMPL-X .pt file path. Ignored if params is provided.
+        output_path: Output video path.
+        fps: Frame rate.
+        width: Width of each panel.
+        height: Height of each panel.
+        pitch_adjust_deg: Manual pitch adjustment on top of auto tilt correction.
+        progress_callback: Optional callable(frac, msg).
+        params: Pre-processed SMPL-X params dict. If provided, skips extraction
+                and (optionally) world-grounding steps.
+        skip_world_grounding: If True and params is provided, use transl directly.
+
+    Returns:
+        Path to the output video.
+    """
+    if params is None:
+        # Load and process params identically to BVH pipeline
+        params = extract_smplx_params(pt_path)
+        params = _add_hand_mean_pose(params)
+        params = _camera_to_world_orient(params)
+        params = _correct_tilt(params, pitch_adjust_deg=pitch_adjust_deg)
+        params = _smooth_rotations(params, window=5)
+        params["transl"] = _compute_root_from_contacts(params)
+    elif not skip_world_grounding:
+        # params provided but still need world grounding
+        params = _add_hand_mean_pose(params)
+        params = _camera_to_world_orient(params)
+        params = _correct_tilt(params, pitch_adjust_deg=pitch_adjust_deg)
+        params = _smooth_rotations(params, window=5)
+        params["transl"] = _compute_root_from_contacts(params)
+
+    n_frames = params["num_frames"]
+    n_joints = len(JOINT_NAMES)
+
+    # Compute world-space joint positions for all frames using FK
+    all_joints = np.zeros((n_frames, n_joints, 3))
+    for f in range(n_frames):
+        all_joints[f] = forward_kinematics(params, f)
+
+    # Compute scale from bounding box of all joints across all frames
+    all_flat = all_joints[:, :22, :].reshape(-1, 3)  # body joints only for framing
+    y_min, y_max = all_flat[:, 1].min(), all_flat[:, 1].max()
+    x_range = all_flat[:, 0].max() - all_flat[:, 0].min()
+    z_range = all_flat[:, 2].max() - all_flat[:, 2].min()
+    body_height = y_max - y_min
+    max_span = max(body_height, x_range, z_range, 0.5)
+
+    # Scale so skeleton fills ~75% of frame height
+    scale = (height * 0.75) / max_span
+    center_y = (y_min + y_max) / 2
+
+    # Ground line Y in screen coords
+    ground_screen_y = int(height / 2 - (0.0 - center_y) * scale)
+
+    # Temp frames directory
+    out_dir = Path(output_path).parent
+    frames_dir = out_dir / "_worldview_frames"
+    frames_dir.mkdir(parents=True, exist_ok=True)
+
+    panel_w = width
+    total_w = panel_w * 2
+    bg_color = (40, 40, 40)  # dark gray
+    ground_color = (80, 80, 80)
+
+    for f in range(n_frames):
+        frame_img = np.full((height, total_w, 3), bg_color, dtype=np.uint8)
+
+        joints_3d = all_joints[f]
+
+        for panel_idx, (axis, label, x_off) in enumerate([
+            ('z', 'FRONT', 0),
+            ('x', 'SIDE', panel_w),
+        ]):
+            pts = _world_to_screen(joints_3d, axis, panel_w, height, scale, center_y)
+            pts[:, 0] += x_off  # offset for panel
+
+            # Ground line
+            cv2.line(frame_img, (x_off, ground_screen_y),
+                     (x_off + panel_w - 1, ground_screen_y), ground_color, 1)
+
+            # Bones
+            for j1, j2 in BONE_CONNECTIONS:
+                if j1 >= n_joints or j2 >= n_joints:
+                    continue
+                p1 = (int(pts[j1, 0]), int(pts[j1, 1]))
+                p2 = (int(pts[j2, 0]), int(pts[j2, 1]))
+                color = _bone_color(j1, j2)
+                thickness = 1 if (j1 >= 22 or j2 >= 22) else 2
+                cv2.line(frame_img, p1, p2, color, thickness, cv2.LINE_AA)
+
+            # Body joint dots
+            for j in range(min(22, n_joints)):
+                p = (int(pts[j, 0]), int(pts[j, 1]))
+                cv2.circle(frame_img, p, 3, (0, 255, 0), -1, cv2.LINE_AA)
+
+            # Panel label
+            cv2.putText(frame_img, label, (x_off + 10, 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 1)
+
+        # Divider line between panels
+        cv2.line(frame_img, (panel_w, 0), (panel_w, height - 1), (100, 100, 100), 1)
+
+        # Frame counter
+        cv2.putText(frame_img, f"F{f + 1}/{n_frames}", (total_w - 130, height - 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
+
+        cv2.imwrite(str(frames_dir / f"{f + 1:06d}.jpg"), frame_img)
+
+        if progress_callback and f % 30 == 0:
+            progress_callback(f / n_frames, f"World view {f + 1}/{n_frames}")
+
+    # Assemble with ffmpeg
+    cmd = [
+        "ffmpeg", "-y",
+        "-r", str(fps),
+        "-i", str(frames_dir / "%06d.jpg"),
+        "-c:v", "libx264", "-crf", "18",
+        "-pix_fmt", "yuv420p",
+        str(output_path),
+    ]
+    subprocess.run(cmd, capture_output=True)
+
     shutil.rmtree(str(frames_dir), ignore_errors=True)
 
     return str(output_path)

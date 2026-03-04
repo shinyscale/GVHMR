@@ -295,6 +295,55 @@ def extract_smplx_params(pt_path: str) -> dict:
     return result
 
 
+def extract_gvhmr_params(pt_path: str) -> dict:
+    """Load GVHMR hmr4d_results.pt → SMPL-X-compatible params dict.
+
+    GVHMR's smpl_params_global contains world-frame, Y-up, meters data.
+    body_pose is (N, 63) flattened — reshape to (N, 21, 3).
+    """
+    data = torch.load(pt_path, map_location="cpu", weights_only=False)
+    g = data["smpl_params_global"]
+    n = g["body_pose"].shape[0]
+    return {
+        "global_orient": np.array(g["global_orient"]).reshape(n, 3),
+        "body_pose": np.array(g["body_pose"]).reshape(n, 21, 3),
+        "left_hand_pose": np.zeros((n, 15, 3)),
+        "right_hand_pose": np.zeros((n, 15, 3)),
+        "transl": np.array(g["transl"]).reshape(n, 3),
+        "betas": np.array(g.get("betas", torch.zeros(n, 10))).reshape(n, -1),
+        "num_frames": n,
+    }
+
+
+def merge_gvhmr_smplestx_params(gvhmr: dict, smplestx: dict) -> dict:
+    """Merge GVHMR body/translation with SMPLest-X hand poses.
+
+    Takes body_pose, global_orient, transl, betas from GVHMR.
+    Takes left_hand_pose, right_hand_pose from SMPLest-X.
+    Truncates both to min(N_gvhmr, N_smplestx) frames.
+    """
+    n_gvhmr = gvhmr["num_frames"]
+    n_smplestx = smplestx["num_frames"]
+    n = min(n_gvhmr, n_smplestx)
+
+    diff = abs(n_gvhmr - n_smplestx)
+    max_n = max(n_gvhmr, n_smplestx)
+    if diff > 5 and (max_n == 0 or diff / max_n > 0.02):
+        print(f"[merge] WARNING: Frame count mismatch — GVHMR={n_gvhmr}, SMPLest-X={n_smplestx} (diff={diff})")
+    elif diff > 0:
+        print(f"[merge] Truncating to {n} frames (GVHMR={n_gvhmr}, SMPLest-X={n_smplestx})")
+
+    return {
+        "global_orient": gvhmr["global_orient"][:n],
+        "body_pose": gvhmr["body_pose"][:n],
+        "left_hand_pose": smplestx["left_hand_pose"][:n],
+        "right_hand_pose": smplestx["right_hand_pose"][:n],
+        "transl": gvhmr["transl"][:n],
+        "betas": gvhmr["betas"][:n] if "betas" in gvhmr else np.zeros((n, 10)),
+        "num_frames": n,
+    }
+
+
 def _compute_ground_offset_cm() -> float:
     """Compute the Y offset (cm) to add to the ROOT so feet rest at Y=0.
 
@@ -753,8 +802,8 @@ def _compute_root_from_contacts(params: dict) -> np.ndarray:
     return root
 
 
-def _smooth_rotations(params: dict, window: int = 5) -> dict:
-    """Temporal smoothing of all joint rotations via quaternion-space filtering.
+def _smooth_rotations(params: dict, window: int = 5, keys: list | None = None) -> dict:
+    """Temporal smoothing of joint rotations via quaternion-space filtering.
 
     SMPLest-X is a per-frame estimator with no temporal coherence. Each frame
     gets an independent rotation estimate, causing ~0.5°/frame jitter on every
@@ -766,10 +815,18 @@ def _smooth_rotations(params: dict, window: int = 5) -> dict:
     Fix: convert to quaternions, enforce continuity (negate q when dot product
     with previous frame is negative), smooth each quaternion component with a
     Savitzky-Golay filter, renormalize, convert back to axis-angle.
+
+    Args:
+        params: SMPL-X parameter dict.
+        window: Savitzky-Golay filter window size.
+        keys: Which param keys to smooth. Default: all four rotation groups.
     """
     params = dict(params)  # shallow copy
 
-    for key in ["global_orient", "body_pose", "left_hand_pose", "right_hand_pose"]:
+    if keys is None:
+        keys = ["global_orient", "body_pose", "left_hand_pose", "right_hand_pose"]
+
+    for key in keys:
         aa = params[key]
         if aa.ndim == 2:
             # (N, 3) — single joint (global_orient)
@@ -813,40 +870,60 @@ def _smooth_rotations(params: dict, window: int = 5) -> dict:
     return params
 
 
-def convert_smplx_to_bvh(
-    pt_path: str,
+def convert_params_to_bvh(
+    params: dict,
     output_path: str,
     fps: float = 30.0,
+    *,
+    skip_world_grounding: bool = False,
     pitch_adjust_deg: float = 0.0,
+    smooth_body: bool = True,
+    smooth_hands: bool = True,
 ) -> str:
-    """Convert SMPLest-X output to BVH file.
+    """Convert SMPL-X params dict to BVH file.
 
     Args:
-        pt_path: Path to SMPLest-X .pt output file.
+        params: SMPL-X parameter dict (from extract_smplx_params, extract_gvhmr_params,
+                or merge_gvhmr_smplestx_params).
         output_path: Path for output .bvh file.
         fps: Frames per second.
-        pitch_adjust_deg: Manual pitch adjustment on top of auto tilt correction.
+        skip_world_grounding: If True, use params["transl"] directly instead of
+            camera→world flip + tilt correction + foot contact root computation.
+            Use for GVHMR data which is already world-grounded.
+        pitch_adjust_deg: Manual pitch adjustment (only used when not skipping grounding).
+        smooth_body: Whether to smooth body/global_orient rotations.
+        smooth_hands: Whether to smooth hand rotations.
 
     Returns:
         Path to the written BVH file.
     """
-    params = extract_smplx_params(pt_path)
-
-    # Add SMPL-X hand mean pose — raw params from SMPLest-X need this
+    # Add SMPL-X hand mean pose — safe even with zero hands (adds natural curl)
     params = _add_hand_mean_pose(params)
 
-    # Transform root orientation from camera to world space (180° X flip)
-    params = _camera_to_world_orient(params)
+    if not skip_world_grounding:
+        # SMPLest-X path: camera→world transform + tilt correction + contact root
+        params = _camera_to_world_orient(params)
+        params = _correct_tilt(params, pitch_adjust_deg=pitch_adjust_deg)
 
-    # Auto-correct camera tilt bias BEFORE foot contact detection
-    params = _correct_tilt(params, pitch_adjust_deg=pitch_adjust_deg)
+    # Build smooth keys list based on flags
+    smooth_keys = []
+    if smooth_body:
+        smooth_keys.extend(["global_orient", "body_pose"])
+    if smooth_hands:
+        smooth_keys.extend(["left_hand_pose", "right_hand_pose"])
+    if smooth_keys:
+        params = _smooth_rotations(params, window=5, keys=smooth_keys)
 
-    # Temporal smoothing — fix axis-angle discontinuities and per-frame jitter
-    # MUST happen before root translation so FK uses clean rotations
-    params = _smooth_rotations(params, window=5)
-
-    # Derive root translation from foot-ground contacts (uses smoothed rotations)
-    params["transl"] = _compute_root_from_contacts(params)
+    if not skip_world_grounding:
+        # Derive root translation from foot-ground contacts (uses smoothed rotations)
+        params["transl"] = _compute_root_from_contacts(params)
+    else:
+        # GVHMR data is already world-grounded — re-center XZ to start at origin
+        params = dict(params)
+        transl = params["transl"].copy()
+        transl[:, 0] -= transl[0, 0]  # X starts at 0
+        transl[:, 2] -= transl[0, 2]  # Z starts at 0
+        params["transl"] = transl
 
     n_frames = params["num_frames"]
     frame_time = 1.0 / fps
@@ -893,6 +970,32 @@ Frame Time: {frame_time:.6f}
         f.write(bvh_content)
 
     return output_path
+
+
+def convert_smplx_to_bvh(
+    pt_path: str,
+    output_path: str,
+    fps: float = 30.0,
+    pitch_adjust_deg: float = 0.0,
+) -> str:
+    """Convert SMPLest-X output to BVH file.
+
+    Thin wrapper: extracts params then delegates to convert_params_to_bvh().
+
+    Args:
+        pt_path: Path to SMPLest-X .pt output file.
+        output_path: Path for output .bvh file.
+        fps: Frames per second.
+        pitch_adjust_deg: Manual pitch adjustment on top of auto tilt correction.
+
+    Returns:
+        Path to the written BVH file.
+    """
+    params = extract_smplx_params(pt_path)
+    return convert_params_to_bvh(
+        params, output_path, fps=fps,
+        pitch_adjust_deg=pitch_adjust_deg,
+    )
 
 
 if __name__ == "__main__":

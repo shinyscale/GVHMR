@@ -7,13 +7,21 @@ import json
 from pathlib import Path
 
 import numpy as np
+import torch
 import gradio as gr
 
 from preprocess import preprocess_video
 from face_capture import run_face_pipeline
-from smplx_to_bvh import convert_smplx_to_bvh
+from smplx_to_bvh import (
+    convert_smplx_to_bvh,
+    convert_params_to_bvh,
+    extract_gvhmr_params,
+    extract_smplx_params,
+    merge_gvhmr_smplestx_params,
+    _add_hand_mean_pose,
+)
 from bvh_to_fbx import convert_bvh_to_fbx
-from visualize_skeleton import render_skeleton_video
+from visualize_skeleton import render_skeleton_video, render_world_views
 
 GVHMR_DIR = Path("/mnt/f/GVHMR/GVHMR")
 DEMO_SCRIPT = GVHMR_DIR / "tools" / "demo" / "demo.py"
@@ -272,17 +280,82 @@ def _fallback_face_crops_from_video(video_path: str) -> np.ndarray:
     return bboxes
 
 
+def _run_gvhmr_subprocess(video_path: str, static_cam: bool, use_dpvo: bool) -> tuple[str | None, list[str]]:
+    """Run GVHMR demo.py as a subprocess in the current conda env.
+
+    Returns (pt_output_path, log_lines).
+    """
+    cmd = ["python", str(DEMO_SCRIPT), f"--video={video_path}"]
+    if static_cam:
+        cmd.append("--static_cam")
+    if use_dpvo:
+        cmd.append("--use_dpvo")
+
+    log_lines = [f"Running GVHMR: {' '.join(cmd)}", ""]
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        cwd=str(GVHMR_DIR),
+        bufsize=1,
+    )
+
+    for line in proc.stdout:
+        log_lines.append(line.rstrip())
+
+    proc.wait()
+
+    if proc.returncode != 0:
+        log_lines.append(f"\nERROR: GVHMR exited with code {proc.returncode}")
+        return None, log_lines
+
+    # Find the output .pt file
+    output_dir = find_output_dir(video_path)
+    if output_dir is None:
+        log_lines.append("\nERROR: GVHMR output directory not found.")
+        return None, log_lines
+
+    pt_file = find_file(output_dir, "hmr4d_results.pt")
+    if pt_file is None:
+        log_lines.append("\nERROR: hmr4d_results.pt not found in output.")
+        return None, log_lines
+
+    return pt_file, log_lines
+
+
+def _save_merged_pt(params: dict, output_path: str) -> str:
+    """Save merged SMPL-X params dict as a .pt file for re-export."""
+    save_dict = {
+        "global_orient": torch.tensor(params["global_orient"], dtype=torch.float32),
+        "body_pose": torch.tensor(params["body_pose"].reshape(params["num_frames"], -1), dtype=torch.float32),
+        "left_hand_pose": torch.tensor(params["left_hand_pose"].reshape(params["num_frames"], -1), dtype=torch.float32),
+        "right_hand_pose": torch.tensor(params["right_hand_pose"].reshape(params["num_frames"], -1), dtype=torch.float32),
+        "transl": torch.tensor(params["transl"], dtype=torch.float32),
+    }
+    if "betas" in params:
+        save_dict["betas"] = torch.tensor(params["betas"], dtype=torch.float32)
+    torch.save(save_dict, output_path)
+    return output_path
+
+
 def run_full_pipeline(
     video_upload,
     video_path_text: str,
     target_fps: str,
     fbx_naming: str,
+    pitch_adjust: float,
+    pipeline_mode: str,
+    hybrid_static_cam: bool,
+    hybrid_use_dpvo: bool,
     progress=gr.Progress(track_tqdm=False),
 ):
     """Run the full performance capture pipeline: body+hands+face."""
 
     video_path = resolve_video_path(video_upload, video_path_text)
     log_lines = []
+    is_hybrid = "Hybrid" in pipeline_mode
 
     # Parse FPS
     try:
@@ -300,48 +373,124 @@ def run_full_pipeline(
     if fps <= 0:
         fps = actual_fps
     log_lines.append(f"[Info] Video FPS: {actual_fps:.2f}, Target FPS: {fps:.2f}")
+    log_lines.append(f"[Info] Pipeline mode: {pipeline_mode}")
 
     # Set up output directory
     video_stem = Path(video_path).stem
     output_base = GVHMR_DIR / "outputs" / "perfcap" / video_stem
     output_base.mkdir(parents=True, exist_ok=True)
 
-    # ── Stage 2: SMPLest-X (body + hands) ──
-    progress(0.05, desc="Running SMPLest-X (body + hands)...")
-    log_lines.append("")
-    log_lines.append("=" * 60)
-    log_lines.append("[Stage 2] SMPLest-X — Body + Hand Capture")
-    log_lines.append("=" * 60)
+    # Track merged params for hybrid pipeline
+    merged_params = None
+    pt_path = None  # final .pt for downloads
 
-    smplestx_output_dir = output_base / "smplestx"
-    pt_path, smplestx_log = _run_smplestx_subprocess(video_path, fps, smplestx_output_dir)
-    log_lines.extend(smplestx_log)
+    if is_hybrid:
+        # ── Hybrid Stage 2a: Run GVHMR (body + world trajectory) ──
+        progress(0.05, desc="Running GVHMR (body + world trajectory)...")
+        log_lines.append("")
+        log_lines.append("=" * 60)
+        log_lines.append("[Stage 2a] GVHMR — World-Grounded Body Capture")
+        log_lines.append("=" * 60)
 
-    if pt_path is None:
-        full_log = "\n".join(log_lines)
-        return None, None, None, None, None, full_log
+        gvhmr_pt_path, gvhmr_log = _run_gvhmr_subprocess(
+            video_path, hybrid_static_cam, hybrid_use_dpvo,
+        )
+        log_lines.extend(gvhmr_log)
 
-    log_lines.append(f"\n[SMPLest-X] Output: {pt_path}")
-    progress(0.45, desc="SMPLest-X complete. Extracting face crops...")
+        if gvhmr_pt_path is None:
+            full_log = "\n".join(log_lines)
+            return None, None, None, None, None, None, full_log
 
-    # ── Stage 3: Face crop extraction + MediaPipe ──
+        log_lines.append(f"\n[GVHMR] Output: {gvhmr_pt_path}")
+        progress(0.25, desc="GVHMR complete. Running SMPLest-X for hands...")
+
+        # ── Hybrid Stage 2b: Run SMPLest-X (hands only) ──
+        log_lines.append("")
+        log_lines.append("=" * 60)
+        log_lines.append("[Stage 2b] SMPLest-X — Hand Capture")
+        log_lines.append("=" * 60)
+
+        smplestx_output_dir = output_base / "smplestx"
+        smplestx_pt_path, smplestx_log = _run_smplestx_subprocess(video_path, fps, smplestx_output_dir)
+        log_lines.extend(smplestx_log)
+
+        if smplestx_pt_path is None:
+            full_log = "\n".join(log_lines)
+            return None, None, None, None, None, None, full_log
+
+        log_lines.append(f"\n[SMPLest-X] Output: {smplestx_pt_path}")
+        progress(0.45, desc="SMPLest-X complete. Merging...")
+
+        # ── Hybrid Stage 2c: Merge GVHMR body + SMPLest-X hands ──
+        log_lines.append("")
+        log_lines.append("=" * 60)
+        log_lines.append("[Stage 2c] Merging — GVHMR Body + SMPLest-X Hands")
+        log_lines.append("=" * 60)
+
+        try:
+            gvhmr_params = extract_gvhmr_params(gvhmr_pt_path)
+            smplestx_params = extract_smplx_params(smplestx_pt_path)
+            # Add hand mean pose to SMPLest-X hands before merging
+            smplestx_params = _add_hand_mean_pose(smplestx_params)
+            merged_params = merge_gvhmr_smplestx_params(gvhmr_params, smplestx_params)
+
+            log_lines.append(f"[Merge] Body from GVHMR: {gvhmr_params['num_frames']} frames")
+            log_lines.append(f"[Merge] Hands from SMPLest-X: {smplestx_params['num_frames']} frames")
+            log_lines.append(f"[Merge] Merged: {merged_params['num_frames']} frames")
+
+            # Save merged .pt for re-export
+            merged_pt_path = str(output_base / f"{video_stem}_hybrid_smplx.pt")
+            _save_merged_pt(merged_params, merged_pt_path)
+            pt_path = merged_pt_path
+            log_lines.append(f"[Merge] Saved: {merged_pt_path}")
+        except Exception as e:
+            log_lines.append(f"[Merge] ERROR: {e}")
+            full_log = "\n".join(log_lines)
+            return None, None, None, None, None, None, full_log
+
+        progress(0.48, desc="Merge complete.")
+
+        # Get bboxes for face capture from SMPLest-X output
+        bboxes = _extract_bboxes_from_smplestx(smplestx_output_dir)
+
+    else:
+        # ── SMPLest-X Only: Stage 2 ──
+        progress(0.05, desc="Running SMPLest-X (body + hands)...")
+        log_lines.append("")
+        log_lines.append("=" * 60)
+        log_lines.append("[Stage 2] SMPLest-X — Body + Hand Capture")
+        log_lines.append("=" * 60)
+
+        smplestx_output_dir = output_base / "smplestx"
+        pt_path, smplestx_log = _run_smplestx_subprocess(video_path, fps, smplestx_output_dir)
+        log_lines.extend(smplestx_log)
+
+        if pt_path is None:
+            full_log = "\n".join(log_lines)
+            return None, None, None, None, None, None, full_log
+
+        log_lines.append(f"\n[SMPLest-X] Output: {pt_path}")
+        progress(0.45, desc="SMPLest-X complete.")
+
+        # Get bboxes for face capture
+        bboxes = _extract_bboxes_from_smplestx(smplestx_output_dir)
+
+    # ── Stage 3: Face Capture (same for both modes) ──
+    progress(0.50, desc="Extracting face captures...")
     log_lines.append("")
     log_lines.append("=" * 60)
     log_lines.append("[Stage 3] Face Capture — MediaPipe ARKit Blendshapes")
     log_lines.append("=" * 60)
 
-    # Get person bboxes from SMPLest-X output
-    bboxes = _extract_bboxes_from_smplestx(smplestx_output_dir)
     if bboxes is not None:
         log_lines.append(f"[Face] Using {len(bboxes)} person bboxes from SMPLest-X output.")
     else:
-        log_lines.append("[Face] WARNING: No person bboxes found in SMPLest-X output. Using heuristic fallback.")
+        log_lines.append("[Face] WARNING: No person bboxes found. Using heuristic fallback.")
         bboxes = _fallback_face_crops_from_video(video_path)
 
     face_csv_path = str(output_base / f"{video_stem}_arkit_blendshapes.csv")
 
     def face_progress(frac, msg):
-        # Map face progress 0-1 to overall 0.50-0.70
         overall = 0.50 + frac * 0.20
         progress(overall, desc=msg)
         log_lines.append(f"[Face] {msg}")
@@ -353,26 +502,67 @@ def run_full_pipeline(
         log_lines.append(f"[Face] ERROR: {e}")
         face_csv_path = None
 
-    # ── Stage 4: SMPL-X → BVH ──
-    progress(0.75, desc="Converting SMPL-X to BVH...")
+    # ── Stage 4: BVH Conversion ──
+    progress(0.75, desc="Converting to BVH...")
     log_lines.append("")
     log_lines.append("=" * 60)
-    log_lines.append("[Stage 4] SMPL-X → BVH Conversion")
+    log_lines.append("[Stage 4] BVH Conversion")
     log_lines.append("=" * 60)
 
     bvh_path = str(output_base / f"{video_stem}_body_hands.bvh")
 
     try:
-        convert_smplx_to_bvh(pt_path, bvh_path, fps=fps)
+        if is_hybrid and merged_params is not None:
+            # Hybrid: use merged params directly, skip world grounding (GVHMR is already grounded),
+            # only smooth hands (GVHMR body is temporally coherent)
+            convert_params_to_bvh(
+                merged_params, bvh_path, fps=fps,
+                skip_world_grounding=True,
+                smooth_body=False,
+                smooth_hands=True,
+            )
+        else:
+            # SMPLest-X only: full processing pipeline
+            convert_smplx_to_bvh(pt_path, bvh_path, fps=fps, pitch_adjust_deg=pitch_adjust)
         log_lines.append(f"[BVH] Written: {bvh_path}")
     except Exception as e:
         log_lines.append(f"[BVH] ERROR: {e}")
         bvh_path = None
 
+    # ── Stage 4.5: World View (Front + Side) ──
+    world_view_video = None
+    progress(0.80, desc="Rendering world view (front + side)...")
+    log_lines.append("")
+    log_lines.append("=" * 60)
+    log_lines.append("[Stage 4.5] World View Rendering (Front + Side)")
+    log_lines.append("=" * 60)
+
+    world_view_video = str(output_base / f"{video_stem}_world_view.mp4")
+    try:
+        def wv_progress(frac, msg):
+            progress(0.80 + frac * 0.07, desc=msg)
+
+        if is_hybrid and merged_params is not None:
+            render_world_views(
+                output_path=world_view_video, fps=fps,
+                params=merged_params,
+                skip_world_grounding=True,
+                progress_callback=wv_progress,
+            )
+        else:
+            render_world_views(
+                pt_path, world_view_video, fps=fps,
+                pitch_adjust_deg=pitch_adjust,
+                progress_callback=wv_progress,
+            )
+        log_lines.append(f"[WorldView] Video: {world_view_video}")
+    except Exception as e:
+        log_lines.append(f"[WorldView] ERROR: {e}")
+        world_view_video = None
+
     # ── Stage 5: BVH → FBX (for Cascadeur / DCC tools) ──
     fbx_path = None
     if bvh_path:
-        # Map dropdown label to naming key
         naming_key = "ue5" if "ue5" in fbx_naming.lower() else "mixamo"
 
         progress(0.90, desc=f"Converting BVH to FBX ({naming_key})...")
@@ -390,38 +580,44 @@ def run_full_pipeline(
 
     # ── Stage 6: Skeleton Visualization ──
     skeleton_video = None
-    if pt_path:
-        progress(0.93, desc="Rendering skeleton overlay...")
-        log_lines.append("")
-        log_lines.append("=" * 60)
-        log_lines.append("[Stage 6] Skeleton Overlay Visualization")
-        log_lines.append("=" * 60)
+    progress(0.93, desc="Rendering skeleton overlay...")
+    log_lines.append("")
+    log_lines.append("=" * 60)
+    log_lines.append("[Stage 6] Skeleton Overlay Visualization")
+    log_lines.append("=" * 60)
 
-        skeleton_video = str(output_base / f"{video_stem}_skeleton.mp4")
-        try:
-            def viz_progress(frac, msg):
-                progress(0.93 + frac * 0.06, desc=msg)
+    skeleton_video = str(output_base / f"{video_stem}_skeleton.mp4")
+    try:
+        def viz_progress(frac, msg):
+            progress(0.93 + frac * 0.06, desc=msg)
 
+        if is_hybrid and merged_params is not None:
+            # For hybrid, we can't do camera-space overlay (no bbox data from GVHMR),
+            # so skip skeleton overlay on video — world view is the primary visualization
+            log_lines.append("[Viz] Skipped camera overlay (hybrid mode uses world view).")
+            skeleton_video = None
+        else:
             render_skeleton_video(pt_path, video_path, skeleton_video, fps=fps, progress_callback=viz_progress)
             log_lines.append(f"[Viz] Skeleton video: {skeleton_video}")
-        except Exception as e:
-            log_lines.append(f"[Viz] ERROR: {e}")
-            skeleton_video = None
+    except Exception as e:
+        log_lines.append(f"[Viz] ERROR: {e}")
+        skeleton_video = None
 
     # ── Done ──
     progress(1.0, desc="Pipeline complete!")
     log_lines.append("")
     log_lines.append("=" * 60)
-    log_lines.append("[Done] Full performance capture pipeline complete.")
+    log_lines.append(f"[Done] {'Hybrid' if is_hybrid else 'SMPLest-X Only'} pipeline complete.")
     log_lines.append(f"  BVH:       {bvh_path or 'FAILED'}")
     log_lines.append(f"  FBX:       {fbx_path or 'SKIPPED'}")
     log_lines.append(f"  Face CSV:  {face_csv_path or 'FAILED'}")
     log_lines.append(f"  SMPL-X:    {pt_path}")
     log_lines.append(f"  Skeleton:  {skeleton_video or 'SKIPPED'}")
+    log_lines.append(f"  WorldView: {world_view_video or 'SKIPPED'}")
     log_lines.append("=" * 60)
 
     full_log = "\n".join(log_lines)
-    return skeleton_video, bvh_path, fbx_path, face_csv_path, pt_path, full_log
+    return skeleton_video, world_view_video, bvh_path, fbx_path, face_csv_path, pt_path, full_log
 
 
 # ── Gradio UI ──
@@ -475,8 +671,9 @@ with gr.Blocks(title="Motion Capture Studio") as app:
         with gr.TabItem("Full Performance Capture"):
             gr.Markdown(
                 "**Body + Hands + Face** from monocular video.\n\n"
-                "Pipeline: SMPLest-X (body+hands) → MediaPipe (face ARKit blendshapes) → BVH + CSV export.\n\n"
-                "Output is ready for Unreal Engine 5 MetaHuman import."
+                "**Hybrid mode** (recommended): GVHMR for world-grounded body + SMPLest-X for hands.\n"
+                "**SMPLest-X Only**: Original pipeline using SMPLest-X for everything.\n\n"
+                "Output is ready for Cascadeur / Unreal Engine 5 MetaHuman import."
             )
 
             with gr.Row():
@@ -488,6 +685,20 @@ with gr.Blocks(title="Motion Capture Studio") as app:
                     )
 
                 with gr.Column(scale=1):
+                    pipeline_mode = gr.Radio(
+                        label="Body Tracking",
+                        choices=["Hybrid: GVHMR Body + SMPLest-X Hands", "SMPLest-X Only"],
+                        value="Hybrid: GVHMR Body + SMPLest-X Hands",
+                    )
+                    with gr.Row():
+                        hybrid_static_cam = gr.Checkbox(
+                            label="Static Camera", value=False,
+                            info="GVHMR option: check if camera is fixed/tripod",
+                        )
+                        hybrid_use_dpvo = gr.Checkbox(
+                            label="Use DPVO", value=False,
+                            info="GVHMR option: better camera estimation, slower",
+                        )
                     perf_fps = gr.Textbox(
                         label="Target FPS",
                         value="30",
@@ -498,6 +709,11 @@ with gr.Blocks(title="Motion Capture Studio") as app:
                         choices=["Mixamo (Cascadeur)", "UE5 Mannequin"],
                         value="Mixamo (Cascadeur)",
                     )
+                    pitch_adjust = gr.Slider(
+                        label="Pitch Adjust (°)",
+                        minimum=-30, maximum=30, step=0.5, value=0,
+                        info="Fine-tune on top of auto tilt correction. 0 = auto only. (SMPLest-X Only mode)",
+                    )
                     perf_run_btn = gr.Button(
                         "Run Full Pipeline",
                         variant="primary",
@@ -505,7 +721,9 @@ with gr.Blocks(title="Motion Capture Studio") as app:
                     )
 
             gr.Markdown("### Preview")
-            skeleton_preview = gr.Video(label="Skeleton Overlay")
+            with gr.Row():
+                skeleton_preview = gr.Video(label="Skeleton Overlay")
+                world_view_preview = gr.Video(label="World View (Front + Side)")
 
             gr.Markdown("### Downloads")
             with gr.Row():
@@ -520,10 +738,24 @@ with gr.Blocks(title="Motion Capture Studio") as app:
                     interactive=False,
                 )
 
+            # Show/hide GVHMR options based on pipeline mode
+            def _toggle_gvhmr_opts(mode):
+                visible = "Hybrid" in mode
+                return gr.update(visible=visible), gr.update(visible=visible)
+
+            pipeline_mode.change(
+                fn=_toggle_gvhmr_opts,
+                inputs=[pipeline_mode],
+                outputs=[hybrid_static_cam, hybrid_use_dpvo],
+            )
+
             perf_run_btn.click(
                 fn=run_full_pipeline,
-                inputs=[perf_video_upload, perf_video_path, perf_fps, fbx_naming],
-                outputs=[skeleton_preview, bvh_download, fbx_download, face_csv_download, smplx_pt_download, perf_log],
+                inputs=[
+                    perf_video_upload, perf_video_path, perf_fps, fbx_naming, pitch_adjust,
+                    pipeline_mode, hybrid_static_cam, hybrid_use_dpvo,
+                ],
+                outputs=[skeleton_preview, world_view_preview, bvh_download, fbx_download, face_csv_download, smplx_pt_download, perf_log],
             )
 
 
