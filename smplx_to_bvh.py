@@ -316,17 +316,18 @@ def _compute_ground_offset_cm() -> float:
 PELVIS_HEIGHT_CM = _compute_ground_offset_cm()
 
 
-def _build_hierarchy_string(joint_idx: int, depth: int) -> str:
+def _build_hierarchy_string(joint_idx: int, depth: int, offsets: dict,
+                            pelvis_height_cm: float) -> str:
     """Recursively build BVH HIERARCHY section."""
     indent = "\t" * depth
     name = JOINT_NAMES[joint_idx]
-    offset = DEFAULT_OFFSETS.get(name, [0.0, 0.0, 0.0])
+    offset = offsets.get(name, [0.0, 0.0, 0.0])
     # Scale from meters to centimeters for BVH
     ox, oy, oz = [v * 100 for v in offset]
 
     # ROOT: place pelvis at correct height with feet at Y=0, centered at origin
     if joint_idx == 0:
-        ox, oy, oz = 0.0, PELVIS_HEIGHT_CM, 0.0
+        ox, oy, oz = 0.0, pelvis_height_cm, 0.0
 
     children = [i for i, p in enumerate(JOINT_PARENTS) if p == joint_idx]
 
@@ -344,15 +345,22 @@ def _build_hierarchy_string(joint_idx: int, depth: int) -> str:
         lines.append(f"{indent}\tCHANNELS 3 Zrotation Xrotation Yrotation")
 
     if not children:
-        # End site — extend last bone by 50% of its own offset for proper bone length
-        ex, ey, ez = ox * 0.5, oy * 0.5, oz * 0.5
+        if name == "Head" and "_Head_EndSite" in offsets:
+            # Use precomputed EndSite from _remap_offsets_for_bvh (~14cm)
+            es = offsets["_Head_EndSite"]
+            ex, ey, ez = [v * 100 for v in es]
+        else:
+            # End site — extend last bone by 50% of its own offset for proper bone length
+            ex, ey, ez = ox * 0.5, oy * 0.5, oz * 0.5
         lines.append(f"{indent}\tEnd Site")
         lines.append(f"{indent}\t{{")
         lines.append(f"{indent}\t\tOFFSET {ex:.4f} {ey:.4f} {ez:.4f}")
         lines.append(f"{indent}\t}}")
     else:
         for child in children:
-            lines.extend(_build_hierarchy_string(child, depth + 1).split("\n"))
+            lines.extend(
+                _build_hierarchy_string(child, depth + 1, offsets,
+                                        pelvis_height_cm).split("\n"))
 
     lines.append(f"{indent}}}")
     return "\n".join(lines)
@@ -448,6 +456,98 @@ def _camera_to_world_orient(params: dict) -> dict:
     params["global_orient"] = new_root
 
     return params
+
+
+def _correct_tilt(params: dict, pitch_adjust_deg: float = 0.0) -> dict:
+    """Auto-correct systematic camera-angle tilt, with optional manual adjustment.
+
+    Estimates the average forward lean of the pelvis and removes it,
+    then applies any manual pitch adjustment on top.
+    """
+    params = dict(params)
+    n = len(params["global_orient"])
+
+    # Extract pitch angle per frame from the pelvis forward direction
+    pitches = np.zeros(n)
+    for i in range(n):
+        R = Rotation.from_rotvec(params["global_orient"][i]).as_matrix()
+        # Local Z axis rotated by root rotation = pelvis forward direction
+        forward = R[:, 2]  # third column
+        # Project onto YZ plane (sagittal) to isolate pitch
+        yz_len = np.sqrt(forward[1] ** 2 + forward[2] ** 2)
+        if yz_len > 1e-8:
+            pitches[i] = np.arctan2(forward[1], forward[2])
+
+    mean_pitch = np.mean(pitches)
+    correction_deg = -np.degrees(mean_pitch) + pitch_adjust_deg
+    print(f"[tilt] Detected mean pitch: {np.degrees(mean_pitch):.1f}°, "
+          f"correction: {correction_deg:.1f}° (manual adjust: {pitch_adjust_deg:.1f}°)")
+
+    R_correction = Rotation.from_euler("X", correction_deg, degrees=True)
+    new_orient = np.zeros_like(params["global_orient"])
+    for i in range(n):
+        R_orig = Rotation.from_rotvec(params["global_orient"][i])
+        R_corrected = R_correction * R_orig
+        new_orient[i] = R_corrected.as_rotvec()
+
+    params["global_orient"] = new_orient
+    return params
+
+
+def _remap_offsets_for_bvh(offsets: dict) -> dict:
+    """Remap Spine3/Neck/Head offsets for DCC tool (Cascadeur/Mixamo) compatibility.
+
+    SMPL-X places joints at anatomical landmarks that differ from game rigs:
+      SMPL-X Neck (idx 12) = base of skull (C1 atlas)
+      SMPL-X Head (idx 15) = top of skull
+
+    Game rigs (Cascadeur/Mixamo) expect:
+      Neck joint = base of neck (C7, collar height)
+      Head joint = base of skull
+      Head EndSite = top of skull
+
+    In BVH, the "Neck bone" length = Head offset (Neck→Head distance), and
+    the "Head bone" length = EndSite offset. So we redistribute into 3 segments:
+      Spine3→Neck:  ~8.5cm  (upper spine, collar height)
+      Neck→Head:    ~10cm   (visible neck in Cascadeur)
+      Head→EndSite: ~14cm   (head sphere size — set in _build_hierarchy_string)
+
+    Total Spine3→skull-top distance is preserved.
+    """
+    offsets = dict(offsets)  # shallow copy
+
+    neck = np.array(offsets["Neck"])       # Spine3→Neck (~16.5cm Y)
+    head = np.array(offsets["Head"])       # Neck→Head  (~16.0cm Y)
+    l_collar = np.array(offsets["L_Collar"])
+    r_collar = np.array(offsets["R_Collar"])
+
+    # Total Y distance from Spine3 to top of skull
+    total_y = neck[1] + head[1]  # ~0.325m
+
+    # Segment 1: Spine3→Neck at collar height
+    collar_mid_y = (l_collar[1] + r_collar[1]) / 2.0  # ~0.085m
+    t_neck = collar_mid_y / neck[1] if abs(neck[1]) > 1e-6 else 0.5
+    new_neck = neck * t_neck  # ~[x, 0.085, z]
+
+    # Segment 2: Neck→Head = reasonable neck length (~10cm)
+    # Scale XZ proportionally along the original Neck→Head direction
+    target_neck_bone_y = 0.10  # 10cm — typical game-rig neck length
+    remaining_y = total_y - collar_mid_y  # ~0.240m
+    t_head = target_neck_bone_y / remaining_y if abs(remaining_y) > 1e-6 else 0.4
+    # Blend the direction from original neck residual and head offset
+    residual = neck * (1.0 - t_neck)
+    combined = residual + head  # full remaining vector (~0.240m Y)
+    new_head = combined * t_head  # ~[x, 0.10, z]
+
+    offsets["Neck"] = new_neck.tolist()
+    offsets["Head"] = new_head.tolist()
+
+    # Stash the remaining distance for Head EndSite (used in _build_hierarchy_string)
+    # EndSite Y = total - collar - neck_bone ≈ 0.325 - 0.085 - 0.10 = 0.14m
+    endsite = combined * (1.0 - t_head)
+    offsets["_Head_EndSite"] = endsite.tolist()
+
+    return offsets
 
 
 def _fk_chain_local(params: dict, frame: int, chain: list) -> np.ndarray:
@@ -565,7 +665,7 @@ def _compute_root_from_contacts(params: dict) -> np.ndarray:
     l_wy -= min_foot_y
     r_wy -= min_foot_y
 
-    contact_thresh = 0.05  # 5cm
+    contact_thresh = 0.03  # 3cm (tighter now that tilt correction improves FK)
     l_contact = l_wy < contact_thresh
     r_contact = r_wy < contact_thresh
 
@@ -637,13 +737,13 @@ def _compute_root_from_contacts(params: dict) -> np.ndarray:
         elif fulcrum_r[f]:
             root[f, 1] = -r_offset[f, 1]
 
-    # Light smoothing on all axes
+    # Light smoothing on X and Z only — Y preserves ground contact
     if n >= 7:
         win = min(7, n - 1 if n % 2 == 0 else n)
         if win % 2 == 0:
             win -= 1
         win = max(win, 5)
-        for ax in range(3):
+        for ax in [0, 2]:  # X and Z only
             root[:, ax] = savgol_filter(root[:, ax], win, 2)
 
     # Mean-center XZ (keep Y as-is for ground contact)
@@ -717,6 +817,7 @@ def convert_smplx_to_bvh(
     pt_path: str,
     output_path: str,
     fps: float = 30.0,
+    pitch_adjust_deg: float = 0.0,
 ) -> str:
     """Convert SMPLest-X output to BVH file.
 
@@ -724,6 +825,7 @@ def convert_smplx_to_bvh(
         pt_path: Path to SMPLest-X .pt output file.
         output_path: Path for output .bvh file.
         fps: Frames per second.
+        pitch_adjust_deg: Manual pitch adjustment on top of auto tilt correction.
 
     Returns:
         Path to the written BVH file.
@@ -736,6 +838,9 @@ def convert_smplx_to_bvh(
     # Transform root orientation from camera to world space (180° X flip)
     params = _camera_to_world_orient(params)
 
+    # Auto-correct camera tilt bias BEFORE foot contact detection
+    params = _correct_tilt(params, pitch_adjust_deg=pitch_adjust_deg)
+
     # Temporal smoothing — fix axis-angle discontinuities and per-frame jitter
     # MUST happen before root translation so FK uses clean rotations
     params = _smooth_rotations(params, window=5)
@@ -746,8 +851,10 @@ def convert_smplx_to_bvh(
     n_frames = params["num_frames"]
     frame_time = 1.0 / fps
 
-    # Build hierarchy
-    hierarchy = _build_hierarchy_string(0, 0)
+    # Build hierarchy — use remapped offsets for DCC-compatible proportions
+    bvh_offsets = _remap_offsets_for_bvh(dict(DEFAULT_OFFSETS))
+    pelvis_height_cm = _compute_ground_offset_cm()
+    hierarchy = _build_hierarchy_string(0, 0, bvh_offsets, pelvis_height_cm)
 
     # Build motion data
     # CRITICAL: joint rotation order in MOTION must exactly match the depth-first
