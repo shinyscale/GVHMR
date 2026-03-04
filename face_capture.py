@@ -12,60 +12,29 @@ from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
 
 
-# ARKit 52 blendshape names in canonical order
+# ARKit 52 blendshape names in Live Link Face column order (PascalCase)
 ARKIT_BLENDSHAPES = [
-    "_neutral",
-    "browDownLeft",
-    "browDownRight",
-    "browInnerUp",
-    "browOuterUpLeft",
-    "browOuterUpRight",
-    "cheekPuff",
-    "cheekSquintLeft",
-    "cheekSquintRight",
-    "eyeBlinkLeft",
-    "eyeBlinkRight",
-    "eyeLookDownLeft",
-    "eyeLookDownRight",
-    "eyeLookInLeft",
-    "eyeLookInRight",
-    "eyeLookOutLeft",
-    "eyeLookOutRight",
-    "eyeLookUpLeft",
-    "eyeLookUpRight",
-    "eyeSquintLeft",
-    "eyeSquintRight",
-    "eyeWideLeft",
-    "eyeWideRight",
-    "jawForward",
-    "jawLeft",
-    "jawOpen",
-    "jawRight",
-    "mouthClose",
-    "mouthDimpleLeft",
-    "mouthDimpleRight",
-    "mouthFrownLeft",
-    "mouthFrownRight",
-    "mouthFunnel",
-    "mouthLeft",
-    "mouthLowerDownLeft",
-    "mouthLowerDownRight",
-    "mouthPressLeft",
-    "mouthPressRight",
-    "mouthPucker",
-    "mouthRight",
-    "mouthRollLower",
-    "mouthRollUpper",
-    "mouthShrugLower",
-    "mouthShrugUpper",
-    "mouthSmileLeft",
-    "mouthSmileRight",
-    "mouthStretchLeft",
-    "mouthStretchRight",
-    "mouthUpperUpLeft",
-    "mouthUpperUpRight",
-    "noseSneerLeft",
-    "noseSneerRight",
+    "EyeBlinkLeft", "EyeLookDownLeft", "EyeLookInLeft", "EyeLookOutLeft", "EyeLookUpLeft",
+    "EyeSquintLeft", "EyeWideLeft", "EyeBlinkRight", "EyeLookDownRight", "EyeLookInRight",
+    "EyeLookOutRight", "EyeLookUpRight", "EyeSquintRight", "EyeWideRight", "JawForward",
+    "JawRight", "JawLeft", "JawOpen", "MouthClose", "MouthFunnel", "MouthPucker", "MouthRight",
+    "MouthLeft", "MouthSmileLeft", "MouthSmileRight", "MouthFrownLeft", "MouthFrownRight",
+    "MouthDimpleLeft", "MouthDimpleRight", "MouthStretchLeft", "MouthStretchRight",
+    "MouthRollLower", "MouthRollUpper", "MouthShrugLower", "MouthShrugUpper",
+    "MouthPressLeft", "MouthPressRight", "MouthLowerDownLeft", "MouthLowerDownRight",
+    "MouthUpperUpLeft", "MouthUpperUpRight", "BrowDownLeft", "BrowDownRight", "BrowInnerUp",
+    "BrowOuterUpLeft", "BrowOuterUpRight", "CheekPuff", "CheekSquintLeft", "CheekSquintRight",
+    "NoseSneerLeft", "NoseSneerRight", "TongueOut",
+]
+
+# Mapping from MediaPipe camelCase names to our PascalCase names
+_CAMEL_TO_PASCAL = {name[0].lower() + name[1:]: name for name in ARKIT_BLENDSHAPES}
+
+# 9 head/eye rotation columns appended as zeros in Live Link Face format
+_HEAD_EYE_COLUMNS = [
+    "HeadYaw", "HeadPitch", "HeadRoll",
+    "LeftEyeYaw", "LeftEyePitch", "LeftEyeRoll",
+    "RightEyeYaw", "RightEyePitch", "RightEyeRoll",
 ]
 
 
@@ -221,16 +190,28 @@ def run_face_blendshapes(face_crops: list[np.ndarray]) -> list[dict[str, float]]
             bs = detection.face_blendshapes[0]
             frame_bs = {}
             for category in bs:
-                name = category.category_name
-                if name in ARKIT_BLENDSHAPES and name != "_neutral":
-                    frame_bs[name] = round(category.score, 6)
+                pascal = _CAMEL_TO_PASCAL.get(category.category_name)
+                if pascal is not None:
+                    frame_bs[pascal] = round(category.score, 6)
             results.append(frame_bs)
         else:
             # No face detected — all zeros
-            results.append({name: 0.0 for name in ARKIT_BLENDSHAPES if name != "_neutral"})
+            results.append({name: 0.0 for name in ARKIT_BLENDSHAPES})
 
     landmarker.close()
     return results
+
+
+def _frame_to_smpte(frame_idx: int, fps: float) -> str:
+    """Convert frame index to SMPTE timecode ``HH:MM:SS:FF.mmm``."""
+    total_seconds = frame_idx / fps
+    h = int(total_seconds // 3600)
+    m = int((total_seconds % 3600) // 60)
+    s = int(total_seconds % 60)
+    remaining_frames = frame_idx % round(fps)
+    frac = (frame_idx % fps) - int(frame_idx % fps)
+    millis = int(round(frac * 1000))
+    return f"{h:02d}:{m:02d}:{s:02d}:{remaining_frames:02d}.{millis:03d}"
 
 
 def export_blendshapes_csv(
@@ -238,7 +219,7 @@ def export_blendshapes_csv(
     output_path: str,
     fps: float = 30.0,
 ) -> str:
-    """Export blendshape data to CSV for Unreal Engine import.
+    """Export blendshape data to CSV in Live Link Face format.
 
     Args:
         blendshape_data: Per-frame blendshape weights from run_face_blendshapes().
@@ -248,18 +229,20 @@ def export_blendshapes_csv(
     Returns:
         Path to the written CSV file.
     """
-    # Column names (skip _neutral)
-    bs_names = [name for name in ARKIT_BLENDSHAPES if name != "_neutral"]
+    blendshape_count = len(ARKIT_BLENDSHAPES) + len(_HEAD_EYE_COLUMNS)
+    header = ["Timecode", "BlendshapeCount"] + ARKIT_BLENDSHAPES + _HEAD_EYE_COLUMNS
 
     with open(output_path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["frame", "timecode"] + bs_names)
+        writer.writerow(header)
 
         for i, frame_bs in enumerate(blendshape_data):
-            timecode = round(i / fps, 6)
-            row = [i, timecode]
-            for name in bs_names:
-                row.append(frame_bs.get(name, 0.0))
+            timecode = _frame_to_smpte(i, fps)
+            row = [timecode, blendshape_count]
+            for name in ARKIT_BLENDSHAPES:
+                row.append(f"{frame_bs.get(name, 0.0):.10f}")
+            for _ in _HEAD_EYE_COLUMNS:
+                row.append(f"{0.0:.10f}")
             writer.writerow(row)
 
     return output_path
