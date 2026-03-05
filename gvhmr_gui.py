@@ -192,7 +192,7 @@ def _run_smplestx_subprocess(video_path: str, fps: float, output_dir: Path) -> t
 
     cmd = [
         "conda", "run", "-n", SMPLESTX_ENV,
-        "python", str(SMPLESTX_DIR / "inference_video.py"),
+        "python", str(GVHMR_DIR / "smplestx_inference.py"),
         "--video", str(video_path),
         "--fps", str(int(fps)),
         "--output_dir", str(output_dir),
