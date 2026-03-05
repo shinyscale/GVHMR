@@ -333,7 +333,7 @@ def merge_gvhmr_smplestx_params(gvhmr: dict, smplestx: dict) -> dict:
     elif diff > 0:
         print(f"[merge] Truncating to {n} frames (GVHMR={n_gvhmr}, SMPLest-X={n_smplestx})")
 
-    return {
+    merged = {
         "global_orient": gvhmr["global_orient"][:n],
         "body_pose": gvhmr["body_pose"][:n],
         "left_hand_pose": smplestx["left_hand_pose"][:n],
@@ -342,6 +342,9 @@ def merge_gvhmr_smplestx_params(gvhmr: dict, smplestx: dict) -> dict:
         "betas": gvhmr["betas"][:n] if "betas" in gvhmr else np.zeros((n, 10)),
         "num_frames": n,
     }
+    if "bbox" in smplestx:
+        merged["bbox"] = smplestx["bbox"][:n]
+    return merged
 
 
 def _compute_ground_offset_cm() -> float:

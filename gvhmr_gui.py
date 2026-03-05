@@ -11,7 +11,7 @@ import torch
 import gradio as gr
 
 from preprocess import preprocess_video
-from face_capture import run_face_pipeline
+from face_capture import run_face_pipeline, render_face_mesh_video
 from smplx_to_bvh import (
     convert_smplx_to_bvh,
     convert_params_to_bvh,
@@ -335,6 +335,8 @@ def _save_merged_pt(params: dict, output_path: str) -> str:
     }
     if "betas" in params:
         save_dict["betas"] = torch.tensor(params["betas"], dtype=torch.float32)
+    if "bbox" in params:
+        save_dict["bbox"] = torch.tensor(params["bbox"], dtype=torch.float32)
     torch.save(save_dict, output_path)
     return output_path
 
@@ -398,7 +400,7 @@ def run_full_pipeline(
 
         if gvhmr_pt_path is None:
             full_log = "\n".join(log_lines)
-            return None, None, None, None, None, None, full_log
+            return None, None, None, None, None, None, None, full_log
 
         log_lines.append(f"\n[GVHMR] Output: {gvhmr_pt_path}")
         progress(0.25, desc="GVHMR complete. Running SMPLest-X for hands...")
@@ -415,7 +417,7 @@ def run_full_pipeline(
 
         if smplestx_pt_path is None:
             full_log = "\n".join(log_lines)
-            return None, None, None, None, None, None, full_log
+            return None, None, None, None, None, None, None, full_log
 
         log_lines.append(f"\n[SMPLest-X] Output: {smplestx_pt_path}")
         progress(0.45, desc="SMPLest-X complete. Merging...")
@@ -443,7 +445,7 @@ def run_full_pipeline(
         except Exception as e:
             log_lines.append(f"[Merge] ERROR: {e}")
             full_log = "\n".join(log_lines)
-            return None, None, None, None, None, None, full_log
+            return None, None, None, None, None, None, None, full_log
 
         progress(0.48, desc="Merge complete.")
 
@@ -464,7 +466,7 @@ def run_full_pipeline(
 
         if pt_path is None:
             full_log = "\n".join(log_lines)
-            return None, None, None, None, None, None, full_log
+            return None, None, None, None, None, None, None, full_log
 
         log_lines.append(f"\n[SMPLest-X] Output: {pt_path}")
         progress(0.45, desc="SMPLest-X complete.")
@@ -498,6 +500,27 @@ def run_full_pipeline(
     except Exception as e:
         log_lines.append(f"[Face] ERROR: {e}")
         face_csv_path = None
+
+    # ── Stage 3.5: Face Mesh Visualization ──
+    progress(0.72, desc="Rendering face mesh overlay...")
+    log_lines.append("")
+    log_lines.append("=" * 60)
+    log_lines.append("[Stage 3.5] Face Mesh Visualization")
+    log_lines.append("=" * 60)
+
+    face_mesh_video = str(output_base / f"{video_stem}_face_mesh.mp4")
+    try:
+        def face_mesh_progress(frac, msg):
+            progress(0.72 + frac * 0.03, desc=msg)
+
+        render_face_mesh_video(
+            video_path, bboxes, face_mesh_video, fps=fps,
+            progress_callback=face_mesh_progress,
+        )
+        log_lines.append(f"[FaceMesh] Video: {face_mesh_video}")
+    except Exception as e:
+        log_lines.append(f"[FaceMesh] ERROR: {e}")
+        face_mesh_video = None
 
     # ── Stage 4: BVH Conversion ──
     progress(0.75, desc="Converting to BVH...")
@@ -589,10 +612,15 @@ def run_full_pipeline(
             progress(0.93 + frac * 0.06, desc=msg)
 
         if is_hybrid and merged_params is not None:
-            # For hybrid, we can't do camera-space overlay (no bbox data from GVHMR),
-            # so skip skeleton overlay on video — world view is the primary visualization
-            log_lines.append("[Viz] Skipped camera overlay (hybrid mode uses world view).")
-            skeleton_video = None
+            # Use SMPLest-X params for camera-space overlay (has bbox + cam_trans)
+            render_skeleton_video(
+                pt_path=smplestx_pt_path,
+                video_path=video_path,
+                output_path=skeleton_video,
+                fps=fps,
+                progress_callback=viz_progress,
+            )
+            log_lines.append(f"[Viz] Skeleton video: {skeleton_video}")
         else:
             render_skeleton_video(pt_path, video_path, skeleton_video, fps=fps, progress_callback=viz_progress)
             log_lines.append(f"[Viz] Skeleton video: {skeleton_video}")
@@ -610,11 +638,12 @@ def run_full_pipeline(
     log_lines.append(f"  Face CSV:  {face_csv_path or 'FAILED'}")
     log_lines.append(f"  SMPL-X:    {pt_path}")
     log_lines.append(f"  Skeleton:  {skeleton_video or 'SKIPPED'}")
+    log_lines.append(f"  FaceMesh:  {face_mesh_video or 'SKIPPED'}")
     log_lines.append(f"  WorldView: {world_view_video or 'SKIPPED'}")
     log_lines.append("=" * 60)
 
     full_log = "\n".join(log_lines)
-    return skeleton_video, world_view_video, bvh_path, fbx_path, face_csv_path, pt_path, full_log
+    return skeleton_video, face_mesh_video, world_view_video, bvh_path, fbx_path, face_csv_path, pt_path, full_log
 
 
 # ── Gradio UI ──
@@ -720,6 +749,7 @@ with gr.Blocks(title="Motion Capture Studio") as app:
             gr.Markdown("### Preview")
             with gr.Row():
                 skeleton_preview = gr.Video(label="Skeleton Overlay")
+                face_mesh_preview = gr.Video(label="Face Mesh")
                 world_view_preview = gr.Video(label="World View (Front + Side)")
 
             gr.Markdown("### Downloads")
@@ -752,7 +782,7 @@ with gr.Blocks(title="Motion Capture Studio") as app:
                     perf_video_upload, perf_video_path, perf_fps, fbx_naming, pitch_adjust,
                     pipeline_mode, hybrid_static_cam, hybrid_use_dpvo,
                 ],
-                outputs=[skeleton_preview, world_view_preview, bvh_download, fbx_download, face_csv_download, smplx_pt_download, perf_log],
+                outputs=[skeleton_preview, face_mesh_preview, world_view_preview, bvh_download, fbx_download, face_csv_download, smplx_pt_download, perf_log],
             )
 
 
