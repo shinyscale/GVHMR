@@ -196,6 +196,7 @@ def _run_smplestx_subprocess(video_path: str, fps: float, output_dir: Path) -> t
         "--video", str(video_path),
         "--fps", str(int(fps)),
         "--output_dir", str(output_dir),
+        "--no_render",
     ]
 
     log_lines = [f"Running SMPLest-X: {' '.join(cmd)}", ""]
