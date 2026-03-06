@@ -253,6 +253,115 @@ def axis_angle_to_euler_zxy(axis_angle: np.ndarray) -> np.ndarray:
     return euler.reshape(result_shape)
 
 
+def _as_numpy_array(value) -> np.ndarray:
+    """Convert tensors/lists/scalars to a detached numpy array."""
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu().numpy()
+    return np.array(value)
+
+
+def _extract_array(params: dict, keys: list[str], reshape: tuple | None = None) -> np.ndarray | None:
+    """Return the first matching tensor/array from params."""
+    for key in keys:
+        if key in params:
+            arr = _as_numpy_array(params[key])
+            if reshape is not None:
+                arr = arr.reshape(*reshape)
+            return arr
+    return None
+
+
+def _read_space_metadata(params: dict, requested_space: str | None = None) -> str | None:
+    """Read coordinate-space metadata from a serialized params dict."""
+    if requested_space:
+        return requested_space
+
+    for key in ["coordinate_space", "space"]:
+        if key in params:
+            value = params[key]
+            if isinstance(value, torch.Tensor):
+                value = value.item()
+            if isinstance(value, bytes):
+                value = value.decode("utf-8")
+            if isinstance(value, str):
+                value = value.strip().lower()
+                if value in {"camera", "world"}:
+                    return value
+    return None
+
+
+def _read_string_metadata(params: dict, key: str) -> str | None:
+    """Read a string-like metadata field from a serialized params dict."""
+    if key not in params:
+        return None
+    value = params[key]
+    if isinstance(value, torch.Tensor):
+        value = value.item() if value.ndim == 0 else value
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+    if isinstance(value, str):
+        return value.strip()
+    return None
+
+
+def _has_smplx_neutral_model(model_dir: Path) -> bool:
+    """Return True if the directory contains the neutral SMPL-X model."""
+    try:
+        return (model_dir / "smplx" / "SMPLX_NEUTRAL.npz").is_file()
+    except OSError:
+        return False
+
+
+def _root_translation_origin(params: dict) -> str:
+    """Return how params['transl'] should be interpreted."""
+    return _read_string_metadata(params, "translation_origin") or "pelvis"
+
+
+def activate_coordinate_space(params: dict, coordinate_space: str, *, strict: bool = False) -> dict:
+    """Return a params dict whose active pose/translation matches the requested space."""
+    if coordinate_space not in {"camera", "world"}:
+        raise ValueError(f"Unknown coordinate space: {coordinate_space}")
+
+    result = dict(params)
+    suffix = "cam" if coordinate_space == "camera" else "world"
+    variant_keys = {
+        "global_orient": [f"global_orient_{suffix}", f"{coordinate_space}_global_orient"],
+        "body_pose": [f"body_pose_{suffix}", f"{coordinate_space}_body_pose"],
+        "transl": [f"transl_{suffix}", f"{coordinate_space}_transl"],
+    }
+
+    found_variant = True
+    for target_key, candidate_keys in variant_keys.items():
+        arr = _extract_array(result, candidate_keys)
+        if arr is None:
+            found_variant = False
+            continue
+        result[target_key] = arr.copy()
+
+    current_space = result.get("coordinate_space")
+    if found_variant:
+        result["coordinate_space"] = coordinate_space
+        return result
+
+    if current_space == coordinate_space or current_space is None:
+        if coordinate_space == "camera" and "transl_cam" in result and "transl" not in result:
+            result["transl"] = _as_numpy_array(result["transl_cam"]).copy()
+        if coordinate_space == "world" and "transl_world" in result and "transl" not in result:
+            result["transl"] = _as_numpy_array(result["transl_world"]).copy()
+        result["coordinate_space"] = coordinate_space if current_space is None else current_space
+        return result
+
+    if strict:
+        raise ValueError(
+            f"Requested {coordinate_space}-space params, but only "
+            f"{current_space or 'untyped'} params are available."
+        )
+
+    return result
+
+
 def extract_smplx_params(pt_path: str) -> dict:
     """Extract SMPL-X parameters from SMPLest-X output .pt file.
 
@@ -281,23 +390,51 @@ def extract_smplx_params(pt_path: str) -> dict:
         raise ValueError(f"Unexpected .pt format: {type(data)}")
 
     result = {}
+    active_space = _read_space_metadata(params)
 
-    # Global orientation
-    for key in ["global_orient", "root_orient", "smplx_root_pose"]:
-        if key in params:
-            result["global_orient"] = np.array(params[key]).reshape(-1, 3)
-            break
-    if "global_orient" not in result:
+    generic_global_orient = _extract_array(
+        params,
+        ["global_orient", "root_orient", "smplx_root_pose"],
+    )
+    camera_global_orient = _extract_array(
+        params,
+        ["global_orient_cam", "camera_global_orient"],
+    )
+    world_global_orient = _extract_array(
+        params,
+        ["global_orient_world", "world_global_orient"],
+    )
+
+    result["global_orient"] = generic_global_orient
+    if result["global_orient"] is None and active_space == "camera":
+        result["global_orient"] = camera_global_orient
+    if result["global_orient"] is None and active_space == "world":
+        result["global_orient"] = world_global_orient
+    if result["global_orient"] is None:
         raise KeyError(f"No global orientation found. Keys: {list(params.keys())}")
+    result["global_orient"] = result["global_orient"].reshape(-1, 3)
 
     n_frames = len(result["global_orient"])
 
     # Body pose (21 joints)
-    for key in ["body_pose", "smplx_body_pose"]:
-        if key in params:
-            result["body_pose"] = np.array(params[key]).reshape(n_frames, 21, 3)
-            break
-    if "body_pose" not in result:
+    result["body_pose"] = _extract_array(
+        params,
+        ["body_pose", "smplx_body_pose"],
+        reshape=(n_frames, 21, 3),
+    )
+    if result["body_pose"] is None and active_space == "camera":
+        result["body_pose"] = _extract_array(
+            params,
+            ["body_pose_cam", "camera_body_pose"],
+            reshape=(n_frames, 21, 3),
+        )
+    if result["body_pose"] is None and active_space == "world":
+        result["body_pose"] = _extract_array(
+            params,
+            ["body_pose_world", "world_body_pose"],
+            reshape=(n_frames, 21, 3),
+        )
+    if result["body_pose"] is None:
         result["body_pose"] = np.zeros((n_frames, 21, 3))
 
     # Hand poses (15 joints each)
@@ -315,13 +452,71 @@ def extract_smplx_params(pt_path: str) -> dict:
     if "right_hand_pose" not in result:
         result["right_hand_pose"] = np.zeros((n_frames, 15, 3))
 
-    # Translation
-    for key in ["transl", "trans", "smplx_transl", "root_transl", "cam_trans"]:
-        if key in params:
-            result["transl"] = np.array(params[key]).reshape(n_frames, 3)
-            break
+    result["transl_cam"] = _extract_array(
+        params,
+        ["transl_cam", "camera_transl", "cam_trans"],
+        reshape=(n_frames, 3),
+    )
+    result["transl_world"] = _extract_array(
+        params,
+        ["transl_world", "world_transl"],
+        reshape=(n_frames, 3),
+    )
+
+    if active_space == "world" and result["transl_world"] is not None:
+        result["transl"] = result["transl_world"].copy()
+    elif active_space == "camera" and result["transl_cam"] is not None:
+        result["transl"] = result["transl_cam"].copy()
+    else:
+        for key in ["transl", "trans", "smplx_transl", "root_transl", "cam_trans"]:
+            if key in params:
+                result["transl"] = np.array(params[key]).reshape(n_frames, 3)
+                break
+
     if "transl" not in result:
-        result["transl"] = np.zeros((n_frames, 3))
+        if result["transl_cam"] is not None:
+            result["transl"] = result["transl_cam"].copy()
+            active_space = active_space or "camera"
+        elif result["transl_world"] is not None:
+            result["transl"] = result["transl_world"].copy()
+            active_space = active_space or "world"
+        else:
+            result["transl"] = np.zeros((n_frames, 3))
+
+    camera_global_orient = _extract_array(
+        params,
+        ["global_orient_cam", "camera_global_orient"],
+        reshape=(n_frames, 3),
+    )
+    if camera_global_orient is not None:
+        result["global_orient_cam"] = camera_global_orient
+    camera_body_pose = _extract_array(
+        params,
+        ["body_pose_cam", "camera_body_pose"],
+        reshape=(n_frames, 21, 3),
+    )
+    if camera_body_pose is not None:
+        result["body_pose_cam"] = camera_body_pose
+
+    world_global_orient = _extract_array(
+        params,
+        ["global_orient_world", "world_global_orient"],
+        reshape=(n_frames, 3),
+    )
+    if world_global_orient is not None:
+        result["global_orient_world"] = world_global_orient
+    world_body_pose = _extract_array(
+        params,
+        ["body_pose_world", "world_body_pose"],
+        reshape=(n_frames, 21, 3),
+    )
+    if world_body_pose is not None:
+        result["body_pose_world"] = world_body_pose
+
+    if result["transl_cam"] is None and (active_space == "camera" or "cam_trans" in params):
+        result["transl_cam"] = result["transl"].copy()
+    if result["transl_world"] is None and active_space == "world":
+        result["transl_world"] = result["transl"].copy()
 
     # Shape (beta) parameters — needed for shape-aware FK
     for key in ["betas", "smplx_shape", "shape"]:
@@ -339,6 +534,24 @@ def extract_smplx_params(pt_path: str) -> dict:
                 result["bbox"] = bbox_data[:n_frames, :4].reshape(n_frames, 4)
             break
 
+    k_fullimg = _extract_array(params, ["K_fullimg"])
+    if k_fullimg is not None:
+        if k_fullimg.ndim == 2:
+            k_fullimg = np.broadcast_to(k_fullimg, (n_frames, 3, 3)).copy()
+        result["K_fullimg"] = k_fullimg[:n_frames].reshape(n_frames, 3, 3)
+
+    camera_model = _read_string_metadata(params, "camera_model")
+    if camera_model:
+        result["camera_model"] = camera_model
+    translation_origin = _read_string_metadata(params, "translation_origin")
+    if translation_origin:
+        result["translation_origin"] = translation_origin
+
+    result["coordinate_space"] = active_space or ("camera" if result["transl_cam"] is not None else "world")
+    if "camera_model" not in result:
+        result["camera_model"] = "smplestx_crop" if result["coordinate_space"] == "camera" else "world_space"
+    if "translation_origin" not in result:
+        result["translation_origin"] = "pelvis"
     result["num_frames"] = n_frames
     return result
 
@@ -350,20 +563,45 @@ def extract_gvhmr_params(pt_path: str) -> dict:
     body_pose is (N, 63) flattened — reshape to (N, 21, 3).
     """
     data = torch.load(pt_path, map_location="cpu", weights_only=False)
-    g = data["smpl_params_global"]
-    n = g["body_pose"].shape[0]
-    return {
-        "global_orient": np.array(g["global_orient"]).reshape(n, 3),
-        "body_pose": np.array(g["body_pose"]).reshape(n, 21, 3),
+    g_world = data["smpl_params_global"]
+    g_cam = data.get("smpl_params_incam", {})
+    n = g_world["body_pose"].shape[0]
+
+    world_global_orient = np.array(g_world["global_orient"]).reshape(n, 3)
+    world_body_pose = np.array(g_world["body_pose"]).reshape(n, 21, 3)
+    world_transl = np.array(g_world["transl"]).reshape(n, 3)
+
+    result = {
+        "global_orient": world_global_orient.copy(),
+        "body_pose": world_body_pose.copy(),
         "left_hand_pose": np.zeros((n, 15, 3)),
         "right_hand_pose": np.zeros((n, 15, 3)),
-        "transl": np.array(g["transl"]).reshape(n, 3),
-        "betas": np.array(g.get("betas", torch.zeros(n, 10))).reshape(n, -1),
+        "transl": world_transl.copy(),
+        "global_orient_world": world_global_orient,
+        "body_pose_world": world_body_pose,
+        "transl_world": world_transl,
+        "betas": np.array(g_world.get("betas", torch.zeros(n, 10))).reshape(n, -1),
+        "coordinate_space": "world",
+        "camera_model": "world_space",
+        "translation_origin": "pelvis",
+        "source": "gvhmr",
         "num_frames": n,
     }
 
+    if g_cam:
+        result["global_orient_cam"] = np.array(g_cam["global_orient"]).reshape(n, 3)
+        result["body_pose_cam"] = np.array(g_cam["body_pose"]).reshape(n, 21, 3)
+        result["transl_cam"] = np.array(g_cam["transl"]).reshape(n, 3)
+        k_fullimg = _as_numpy_array(data.get("K_fullimg"))
+        if k_fullimg is not None:
+            if k_fullimg.ndim == 2:
+                k_fullimg = np.broadcast_to(k_fullimg, (n, 3, 3)).copy()
+            result["K_fullimg"] = k_fullimg[:n].reshape(n, 3, 3)
 
-def merge_gvhmr_smplestx_params(gvhmr: dict, smplestx: dict) -> dict:
+    return result
+
+
+def merge_gvhmr_smplestx_params(gvhmr: dict, smplestx: dict, coordinate_space: str = "world") -> dict:
     """Merge GVHMR body/translation with SMPLest-X hand poses.
 
     Takes body_pose, global_orient, transl, betas from GVHMR.
@@ -381,18 +619,97 @@ def merge_gvhmr_smplestx_params(gvhmr: dict, smplestx: dict) -> dict:
     elif diff > 0:
         print(f"[merge] Truncating to {n} frames (GVHMR={n_gvhmr}, SMPLest-X={n_smplestx})")
 
+    gvhmr_world = activate_coordinate_space(gvhmr, "world", strict=True)
+    gvhmr_camera = activate_coordinate_space(
+        gvhmr,
+        "camera",
+        strict=coordinate_space == "camera",
+    )
+
+    if coordinate_space == "camera":
+        gvhmr_active = gvhmr_camera
+    else:
+        gvhmr_active = gvhmr_world
+
     merged = {
-        "global_orient": gvhmr["global_orient"][:n],
-        "body_pose": gvhmr["body_pose"][:n],
+        "global_orient": gvhmr_active["global_orient"][:n],
+        "body_pose": gvhmr_active["body_pose"][:n],
         "left_hand_pose": smplestx["left_hand_pose"][:n],
         "right_hand_pose": smplestx["right_hand_pose"][:n],
-        "transl": gvhmr["transl"][:n],
-        "betas": gvhmr["betas"][:n] if "betas" in gvhmr else np.zeros((n, 10)),
+        "transl": gvhmr_active["transl"][:n],
+        "betas": gvhmr_active["betas"][:n] if "betas" in gvhmr_active else np.zeros((n, 10)),
+        "coordinate_space": coordinate_space,
+        "source": "hybrid",
+        "translation_origin": gvhmr_active.get("translation_origin", "model_origin"),
         "num_frames": n,
     }
+
+    if "global_orient_world" in gvhmr_world:
+        merged["global_orient_world"] = gvhmr_world["global_orient_world"][:n]
+        merged["body_pose_world"] = gvhmr_world["body_pose_world"][:n]
+    else:
+        merged["global_orient_world"] = gvhmr_world["global_orient"][:n]
+        merged["body_pose_world"] = gvhmr_world["body_pose"][:n]
+    if "transl_world" in gvhmr_world:
+        merged["transl_world"] = gvhmr_world["transl_world"][:n]
+    else:
+        merged["transl_world"] = gvhmr_world["transl"][:n]
+
+    if "global_orient_cam" in gvhmr_camera:
+        merged["global_orient_cam"] = gvhmr_camera["global_orient_cam"][:n]
+        merged["body_pose_cam"] = gvhmr_camera["body_pose_cam"][:n]
+    elif gvhmr_camera.get("coordinate_space") == "camera":
+        merged["global_orient_cam"] = gvhmr_camera["global_orient"][:n]
+        merged["body_pose_cam"] = gvhmr_camera["body_pose"][:n]
+    if "transl_cam" in gvhmr_camera:
+        merged["transl_cam"] = gvhmr_camera["transl_cam"][:n]
+    elif gvhmr_camera.get("coordinate_space") == "camera":
+        merged["transl_cam"] = gvhmr_camera["transl"][:n]
+    if "K_fullimg" in gvhmr_camera:
+        merged["K_fullimg"] = gvhmr_camera["K_fullimg"][:n]
+
     if "bbox" in smplestx:
         merged["bbox"] = smplestx["bbox"][:n]
+    if coordinate_space == "camera":
+        merged["camera_model"] = "full_image" if "K_fullimg" in merged else "smplestx_crop"
+    else:
+        merged["camera_model"] = "world_space"
     return merged
+
+
+def _heading_align_matrix_y(global_orient: np.ndarray) -> np.ndarray:
+    """Compute a Y-axis rotation that aligns the first frame to face +Z."""
+    forward = Rotation.from_rotvec(global_orient[0]).as_matrix() @ np.array([0.0, 0.0, 1.0])
+    heading = math.atan2(forward[0], forward[2])
+    return Rotation.from_euler("y", -heading).as_matrix()
+
+
+def _normalize_world_space_motion(params: dict) -> dict:
+    """Recenter and heading-align world-space motion without altering world Y."""
+    params = activate_coordinate_space(params, "world", strict=True)
+    params = dict(params)
+
+    transl = params["transl"].copy()
+    global_orient = params["global_orient"].copy()
+
+    transl[:, 0] -= transl[0, 0]
+    transl[:, 2] -= transl[0, 2]
+
+    align_R = _heading_align_matrix_y(global_orient)
+    transl = (align_R @ transl.T).T
+
+    global_R = Rotation.from_rotvec(global_orient).as_matrix()
+    global_R = np.einsum("ij,fjk->fik", align_R, global_R)
+    global_orient = Rotation.from_matrix(global_R).as_rotvec()
+
+    normalized = dict(params)
+    normalized["transl"] = transl
+    normalized["global_orient"] = global_orient
+    normalized["transl_world"] = transl.copy()
+    normalized["global_orient_world"] = global_orient.copy()
+    normalized["translation_origin"] = params.get("translation_origin", "pelvis")
+
+    return normalized
 
 
 def _compute_ground_offset_cm() -> float:
@@ -412,7 +729,6 @@ def _compute_ground_offset_cm() -> float:
     return -ground_y
 
 
-# Precompute pelvis height above ground (cm) for root translation
 PELVIS_HEIGHT_CM = _compute_ground_offset_cm()
 
 
@@ -425,9 +741,9 @@ def _build_hierarchy_string(joint_idx: int, depth: int, offsets: dict,
     # Scale from meters to centimeters for BVH
     ox, oy, oz = [v * 100 for v in offset]
 
-    # ROOT: place pelvis at correct height with feet at Y=0, centered at origin
+    # Root motion now carries the pelvis position directly.
     if joint_idx == 0:
-        ox, oy, oz = 0.0, pelvis_height_cm, 0.0
+        ox, oy, oz = 0.0, 0.0, 0.0
 
     children = [i for i, p in enumerate(JOINT_PARENTS) if p == joint_idx]
 
@@ -483,6 +799,32 @@ def _get_traversal_order(joint_idx=0):
 TRAVERSAL_ORDER = _get_traversal_order(0)
 
 
+# ── Finger state quantization constants ──
+
+_FINGER_CHAINS = [
+    [0, 1, 2],     # index (MCP, PIP, DIP)
+    [3, 4, 5],     # middle
+    [6, 7, 8],     # pinky
+    [9, 10, 11],   # ring
+    [12, 13, 14],  # thumb
+]
+
+# Canonical states: (total_curl_degrees, (mcp_rad, pip_rad, dip_rad))
+_FINGER_STATES = [
+    (5,   (0.05, 0.02, 0.01)),   # extended
+    (59,  (0.50, 0.35, 0.17)),   # relaxed
+    (120, (0.87, 0.79, 0.44)),   # half-curled
+    (220, (1.40, 1.57, 0.87)),   # curled
+]
+
+_THUMB_STATES = [
+    (5,   (0.05, 0.02, 0.01)),   # extended
+    (40,  (0.35, 0.25, 0.10)),   # relaxed
+    (80,  (0.70, 0.52, 0.35)),   # half-curled
+    (140, (1.05, 0.87, 0.52)),   # curled
+]
+
+
 def _get_joint_rotation(params: dict, frame: int, joint_idx: int) -> np.ndarray:
     """Get axis-angle rotation for a specific joint at a specific frame."""
     if joint_idx == 0:
@@ -509,12 +851,14 @@ def _add_hand_mean_pose(params: dict) -> dict:
 
         # Search for model files
         model_dirs = [
+            Path("F:/GVHMR/GVHMR/inputs/checkpoints/body_models"),
+            Path("F:/SMPLest-X/human_models/human_model_files"),
             Path("/mnt/f/SMPLest-X/human_models/human_model_files"),
             Path.home() / "human_model_files",
         ]
         model_dir = None
         for d in model_dirs:
-            if (d / "smplx" / "SMPLX_NEUTRAL.npz").is_file():
+            if _has_smplx_neutral_model(d):
                 model_dir = d
                 break
 
@@ -531,10 +875,113 @@ def _add_hand_mean_pose(params: dict) -> dict:
         params = dict(params)
         params["left_hand_pose"] = params["left_hand_pose"] + lh_mean[np.newaxis, :, :]
         params["right_hand_pose"] = params["right_hand_pose"] + rh_mean[np.newaxis, :, :]
+        # Stash mean pose for _quantize_finger_states to derive curl axes
+        params["_lh_mean"] = lh_mean
+        params["_rh_mean"] = rh_mean
         return params
 
     except Exception:
         return params
+
+
+def _quantize_finger_states(params: dict) -> dict:
+    """Quantize finger rotations to discrete curl states for cleaner gestures.
+
+    Three-stage process per frame:
+    1. Project each joint's axis-angle onto the per-joint curl axis (derived
+       from SMPL-X mean pose direction) to measure total flexion per finger.
+    2. Contrast-stretch the 4 non-thumb fingers so that inter-finger
+       differences are amplified (SMPLest-X produces vague, similar curls
+       for all fingers — stretching makes extended vs curled distinguishable).
+    3. Map each finger's total curl to canonical joint angles via smoothstep
+       blend between nearest states — biases toward clean poses instead of
+       staying ambiguously in-between.
+
+    Non-curl components (finger splay) are preserved unchanged.
+    """
+    params = dict(params)
+
+    for hand_key, mean_key in [("left_hand_pose", "_lh_mean"),
+                               ("right_hand_pose", "_rh_mean")]:
+        hand_pose = params[hand_key].copy()  # (N, 15, 3)
+        n_frames = hand_pose.shape[0]
+        mean_pose = params.get(mean_key)
+
+        # Derive per-joint curl axis from mean pose direction
+        curl_axes = np.zeros((15, 3))
+        if mean_pose is not None:
+            for j in range(15):
+                mag = np.linalg.norm(mean_pose[j])
+                if mag > 1e-6:
+                    curl_axes[j] = mean_pose[j] / mag
+                else:
+                    curl_axes[j, 0] = 1.0
+        else:
+            # No mean pose available — skip quantization
+            continue
+
+        for frame in range(n_frames):
+            # Stage 1: Decompose all fingers into curl + residual
+            finger_data = []   # [(curl_angles, residuals), ...] per finger
+            finger_totals = []  # total curl in degrees per finger
+            for chain in _FINGER_CHAINS:
+                curl_angles = []
+                residuals = []
+                for k in range(3):
+                    j = chain[k]
+                    aa = hand_pose[frame, j]
+                    curl = np.dot(aa, curl_axes[j])
+                    curl_angles.append(curl)
+                    residuals.append(aa - curl_axes[j] * curl)
+                finger_data.append((curl_angles, residuals))
+                finger_totals.append(np.degrees(sum(curl_angles)))
+
+            # Stage 2: Contrast-stretch non-thumb fingers
+            non_thumb = finger_totals[:4]
+            min_c = min(non_thumb)
+            max_c = max(non_thumb)
+            spread = max_c - min_c
+            stretch_thresh = 25.0
+            if spread > stretch_thresh:
+                # Ramp strength from 0→1 over 25-55° spread range
+                strength = min(1.0, (spread - stretch_thresh) / 30.0)
+                target_min, target_max = 0.0, 180.0
+                for i in range(4):
+                    stretched = target_min + (non_thumb[i] - min_c) / spread * target_max
+                    finger_totals[i] += (stretched - finger_totals[i]) * strength
+
+            # Stage 3: Quantize each finger with smoothstep blend
+            for ci, chain in enumerate(_FINGER_CHAINS):
+                is_thumb = ci == 4
+                states = _THUMB_STATES if is_thumb else _FINGER_STATES
+                total_curl_deg = finger_totals[ci]
+                curl_angles, residuals = finger_data[ci]
+
+                if total_curl_deg <= states[0][0]:
+                    blended = states[0][1]
+                elif total_curl_deg >= states[-1][0]:
+                    blended = states[-1][1]
+                else:
+                    for s in range(len(states) - 1):
+                        if states[s][0] <= total_curl_deg <= states[s + 1][0]:
+                            lo_deg, lo_vals = states[s]
+                            hi_deg, hi_vals = states[s + 1]
+                            t = (total_curl_deg - lo_deg) / (hi_deg - lo_deg)
+                            # Smoothstep: bias toward nearest state
+                            t = t * t * (3.0 - 2.0 * t)
+                            blended = tuple(
+                                lo_vals[i] * (1 - t) + hi_vals[i] * t
+                                for i in range(3)
+                            )
+                            break
+
+                for k in range(3):
+                    j = chain[k]
+                    hand_pose[frame, j] = residuals[k] + curl_axes[j] * blended[k]
+
+        params[hand_key] = hand_pose
+
+    return params
 
 
 def _camera_to_world_orient(params: dict) -> dict:
@@ -993,6 +1440,7 @@ def convert_params_to_bvh(
     pitch_adjust_deg: float = 0.0,
     smooth_body: bool = True,
     smooth_hands: bool = True,
+    quantize_fingers: bool = True,
 ) -> str:
     """Convert SMPL-X params dict to BVH file.
 
@@ -1003,10 +1451,13 @@ def convert_params_to_bvh(
         fps: Frames per second.
         skip_world_grounding: If True, use params["transl"] directly instead of
             camera→world flip + tilt correction + foot contact root computation.
-            Use for GVHMR data which is already world-grounded.
+            Use for GVHMR data which is already world-grounded; only X/Z recentering
+            and heading alignment will be applied.
         pitch_adjust_deg: Manual pitch adjustment (only used when not skipping grounding).
         smooth_body: Whether to smooth body/global_orient rotations.
         smooth_hands: Whether to smooth hand rotations.
+        quantize_fingers: Whether to snap finger rotations to discrete curl states
+            for cleaner, more recognizable hand gestures.
 
     Returns:
         Path to the written BVH file.
@@ -1023,6 +1474,11 @@ def convert_params_to_bvh(
     if smooth_body:
         params = _smooth_rotations(params, window=5, keys=["global_orient", "body_pose"])
 
+    # Quantize fingers to discrete curl states before temporal smoothing —
+    # One Euro then cleans up transitions between quantized states
+    if quantize_fingers:
+        params = _quantize_finger_states(params)
+
     # Smooth hands with One Euro (adaptive — kills jitter on held poses,
     # preserves fast gestures)
     if smooth_hands:
@@ -1038,12 +1494,8 @@ def convert_params_to_bvh(
         # Derive root translation from foot-ground contacts (uses smoothed rotations)
         params["transl"] = _compute_root_from_contacts(params)
     else:
-        # GVHMR data is already world-grounded — re-center XZ to start at origin
-        params = dict(params)
-        transl = params["transl"].copy()
-        transl[:, 0] -= transl[0, 0]  # X starts at 0
-        transl[:, 2] -= transl[0, 2]  # Z starts at 0
-        params["transl"] = transl
+        # GVHMR data is already world-grounded — preserve world Y and normalize only X/Z + heading.
+        params = _normalize_world_space_motion(params)
 
     n_frames = params["num_frames"]
     frame_time = 1.0 / fps
