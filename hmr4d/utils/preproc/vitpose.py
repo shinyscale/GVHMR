@@ -30,7 +30,7 @@ class VitPoseExtractor:
 
         # Inference
         L, _, H, W = imgs.shape  # (L, 3, H, W)
-        batch_size = 16
+        batch_size = 256  # scaled for 96GB VRAM (was 16 for 24GB GPUs)
         vitpose = []
         for j in tqdm(range(0, L, batch_size), desc="ViTPose", leave=self.tqdm_leave):
             # Heat map

@@ -1,7 +1,10 @@
 """SMPLest-X video inference wrapper.
 
-Accepts a video path, extracts frames, runs per-frame inference,
+Accepts a video path, extracts frames, runs batched inference,
 saves all SMPL-X parameters to a .pt file, and produces a rendered overlay video.
+
+Optimized for high-VRAM GPUs (RTX PRO 6000 96GB etc.) with batched YOLO
+detection and batched model inference.
 """
 
 import os
@@ -47,6 +50,8 @@ def parse_args():
     parser.add_argument("--ckpt_name", type=str, default="smplest_x_h", help="Checkpoint name")
     parser.add_argument("--fps", type=float, default=0, help="Extract at this FPS (0 = use video's native FPS)")
     parser.add_argument("--no_render", action="store_true", help="Skip rendering overlay video")
+    parser.add_argument("--batch_size", type=int, default=64, help="Batch size for model inference (default: 64, scale up for more VRAM)")
+    parser.add_argument("--yolo_batch_size", type=int, default=32, help="Batch size for YOLO detection (default: 32)")
     return parser.parse_args()
 
 
@@ -70,6 +75,81 @@ def extract_frames(video_path: str, output_dir: str, fps: float = 0) -> tuple[in
 
     frame_count = len(list(Path(output_dir).glob("*.jpg")))
     return frame_count, fps
+
+
+def load_all_frames(frames_dir: Path, frame_count: int) -> list[np.ndarray]:
+    """Pre-load all frames into memory."""
+    frames = []
+    for i in range(1, frame_count + 1):
+        img_path = str(frames_dir / f"{i:06d}.jpg")
+        frames.append(load_img(img_path))
+    return frames
+
+
+def batch_yolo_detect(detector, frames: list[np.ndarray], batch_size: int, conf: float) -> list[np.ndarray | None]:
+    """Run YOLO detection in batches. Returns list of bbox_xyxy arrays (or None for no detection)."""
+    all_bboxes = []
+
+    for i in tqdm(range(0, len(frames), batch_size), desc="YOLO detection (batched)"):
+        batch = frames[i:i + batch_size]
+        results = detector.predict(
+            batch,
+            device="cuda",
+            classes=0,
+            conf=conf,
+            save=False,
+            verbose=False,
+        )
+        for result in results:
+            xyxy = result.boxes.xyxy.detach().cpu().numpy()
+            if len(xyxy) >= 1:
+                all_bboxes.append(xyxy[0])  # largest/first detection
+            else:
+                all_bboxes.append(None)
+
+    return all_bboxes
+
+
+def preprocess_crops(frames: list[np.ndarray], bboxes: list[np.ndarray | None],
+                     cfg, transform) -> tuple[list[torch.Tensor | None], list[np.ndarray | None]]:
+    """Crop and preprocess all frames using their bboxes. Returns (tensors, processed_bboxes)."""
+    tensors = []
+    processed_bboxes = []
+
+    for frame, bbox_xyxy in zip(frames, bboxes):
+        if bbox_xyxy is None:
+            tensors.append(None)
+            processed_bboxes.append(None)
+            continue
+
+        h, w = frame.shape[:2]
+        yolo_bbox_xywh = np.array([
+            bbox_xyxy[0], bbox_xyxy[1],
+            abs(bbox_xyxy[2] - bbox_xyxy[0]),
+            abs(bbox_xyxy[3] - bbox_xyxy[1]),
+        ])
+
+        bbox = process_bbox(
+            bbox=yolo_bbox_xywh,
+            img_width=w,
+            img_height=h,
+            input_img_shape=cfg.model.input_img_shape,
+            ratio=getattr(cfg.data, "bbox_ratio", 1.25),
+        )
+        img, _, _ = generate_patch_image(
+            cvimg=frame,
+            bbox=bbox,
+            scale=1.0,
+            rot=0.0,
+            do_flip=False,
+            out_shape=cfg.model.input_img_shape,
+        )
+
+        img_tensor = transform(img.astype(np.float32)) / 255
+        tensors.append(img_tensor)
+        processed_bboxes.append(bbox_xyxy)
+
+    return tensors, processed_bboxes
 
 
 def main():
@@ -119,7 +199,7 @@ def main():
 
     # Init model
     demoer = Tester(cfg)
-    demoer.logger.info(f"[SMPLest-X] Processing {frame_count} frames from {video_stem}")
+    demoer.logger.info(f"[SMPLest-X] Processing {frame_count} frames from {video_stem} (batch_size={args.batch_size})")
     demoer._make_model()
 
     # Init detector
@@ -128,18 +208,62 @@ def main():
 
     transform = transforms.ToTensor()
 
-    # Storage for per-frame SMPL-X parameters
+    # ── Phase 1: Load all frames into memory ──
+    print(f"[SMPLest-X] Loading {frame_count} frames into memory...")
+    frames = load_all_frames(frames_dir, frame_count)
+    print(f"[SMPLest-X] Frames loaded ({len(frames)} frames)")
+
+    # ── Phase 2: Batch YOLO detection ──
+    det_conf = getattr(cfg.inference.detection, "conf", 0.5)
+    bboxes = batch_yolo_detect(detector, frames, args.yolo_batch_size, det_conf)
+    del detector  # free YOLO model VRAM
+    torch.cuda.empty_cache()
+
+    detected = sum(1 for b in bboxes if b is not None)
+    print(f"[SMPLest-X] YOLO: {detected}/{len(bboxes)} frames with detections")
+
+    # ── Phase 3: Preprocess all crops ──
+    print(f"[SMPLest-X] Preprocessing crops...")
+    tensors, processed_bboxes = preprocess_crops(frames, bboxes, cfg, transform)
+
+    # ── Phase 4: Batched model inference ──
+    # Build index mapping: which frames have valid detections
+    valid_indices = [i for i, t in enumerate(tensors) if t is not None]
+    valid_tensors = [tensors[i] for i in valid_indices]
+
+    # Pre-allocate output storage
     all_params = {
-        "smplx_root_pose": [],
-        "smplx_body_pose": [],
-        "smplx_lhand_pose": [],
-        "smplx_rhand_pose": [],
-        "smplx_jaw_pose": [],
-        "smplx_shape": [],
-        "smplx_expr": [],
-        "cam_trans": [],
-        "bbox": [],
+        "smplx_root_pose": [None] * frame_count,
+        "smplx_body_pose": [None] * frame_count,
+        "smplx_lhand_pose": [None] * frame_count,
+        "smplx_rhand_pose": [None] * frame_count,
+        "smplx_jaw_pose": [None] * frame_count,
+        "smplx_shape": [None] * frame_count,
+        "smplx_expr": [None] * frame_count,
+        "cam_trans": [None] * frame_count,
+        "bbox": [None] * frame_count,
     }
+
+    # Fill zeros for frames with no detection
+    zero_params = {
+        "smplx_root_pose": torch.zeros(1, 3),
+        "smplx_body_pose": torch.zeros(1, 63),
+        "smplx_lhand_pose": torch.zeros(1, 45),
+        "smplx_rhand_pose": torch.zeros(1, 45),
+        "smplx_jaw_pose": torch.zeros(1, 3),
+        "smplx_shape": torch.zeros(1, 10),
+        "smplx_expr": torch.zeros(1, 10),
+        "cam_trans": torch.zeros(1, 3),
+        "bbox": torch.zeros(1, 4),
+    }
+    for i in range(frame_count):
+        if tensors[i] is None:
+            for key in all_params:
+                all_params[key][i] = zero_params[key]
+
+    # Run batched inference
+    batch_size = args.batch_size
+    mesh_results = {}  # frame_idx -> mesh (for rendering)
 
     render_dir = output_dir / "rendered"
     can_render = not args.no_render
@@ -151,103 +275,75 @@ def main():
             print(f"[SMPLest-X] WARNING: Rendering disabled (OpenGL unavailable: {e})")
             can_render = False
 
-    for frame_idx in tqdm(range(1, frame_count + 1), desc="SMPLest-X inference"):
-        img_path = str(frames_dir / f"{frame_idx:06d}.jpg")
-        original_img = load_img(img_path)
-        vis_img = original_img.copy()
-        h, w = original_img.shape[:2]
+    for batch_start in tqdm(range(0, len(valid_indices), batch_size), desc="SMPLest-X inference (batched)"):
+        batch_idx = valid_indices[batch_start:batch_start + batch_size]
+        batch_tensors = valid_tensors[batch_start:batch_start + batch_size]
 
-        # Detect person
-        yolo_bbox = detector.predict(
-            original_img,
-            device="cuda",
-            classes=0,
-            conf=cfg.inference.detection.conf,
-            save=cfg.inference.detection.save,
-            verbose=cfg.inference.detection.verbose,
-        )[0].boxes.xyxy.detach().cpu().numpy()
-
-        if len(yolo_bbox) < 1:
-            # No detection — store zeros
-            all_params["smplx_root_pose"].append(torch.zeros(1, 3))
-            all_params["smplx_body_pose"].append(torch.zeros(1, 63))
-            all_params["smplx_lhand_pose"].append(torch.zeros(1, 45))
-            all_params["smplx_rhand_pose"].append(torch.zeros(1, 45))
-            all_params["smplx_jaw_pose"].append(torch.zeros(1, 3))
-            all_params["smplx_shape"].append(torch.zeros(1, 10))
-            all_params["smplx_expr"].append(torch.zeros(1, 10))
-            all_params["cam_trans"].append(torch.zeros(1, 3))
-            all_params["bbox"].append(torch.zeros(1, 4))
-            if can_render:
-                cv2.imwrite(str(render_dir / f"{frame_idx:06d}.jpg"), vis_img[:, :, ::-1])
-            continue
-
-        # Use largest bbox (single person)
-        bbox_xyxy = yolo_bbox[0]
-        yolo_bbox_xywh = np.array([
-            bbox_xyxy[0], bbox_xyxy[1],
-            abs(bbox_xyxy[2] - bbox_xyxy[0]),
-            abs(bbox_xyxy[3] - bbox_xyxy[1]),
-        ])
-
-        bbox = process_bbox(
-            bbox=yolo_bbox_xywh,
-            img_width=w,
-            img_height=h,
-            input_img_shape=cfg.model.input_img_shape,
-            ratio=getattr(cfg.data, "bbox_ratio", 1.25),
-        )
-        img, _, _ = generate_patch_image(
-            cvimg=original_img,
-            bbox=bbox,
-            scale=1.0,
-            rot=0.0,
-            do_flip=False,
-            out_shape=cfg.model.input_img_shape,
-        )
-
-        img_tensor = transform(img.astype(np.float32)) / 255
-        img_tensor = img_tensor.cuda()[None, :, :, :]
+        # Stack into a single batch tensor
+        img_batch = torch.stack(batch_tensors).cuda()
 
         with torch.no_grad():
-            out = demoer.model({"img": img_tensor}, {}, {}, "test")
+            out = demoer.model({"img": img_batch}, {}, {}, "test")
 
-        # Store parameters
-        all_params["smplx_root_pose"].append(out["smplx_root_pose"].cpu())
-        all_params["smplx_body_pose"].append(out["smplx_body_pose"].cpu())
-        all_params["smplx_lhand_pose"].append(out["smplx_lhand_pose"].cpu())
-        all_params["smplx_rhand_pose"].append(out["smplx_rhand_pose"].cpu())
-        all_params["smplx_jaw_pose"].append(out["smplx_jaw_pose"].cpu())
-        all_params["smplx_shape"].append(out["smplx_shape"].cpu())
-        all_params["smplx_expr"].append(out["smplx_expr"].cpu())
-        all_params["cam_trans"].append(out["cam_trans"].cpu())
-        all_params["bbox"].append(torch.tensor(bbox_xyxy).unsqueeze(0))
+        # Unpack batch results
+        for j, frame_idx in enumerate(batch_idx):
+            all_params["smplx_root_pose"][frame_idx] = out["smplx_root_pose"][j:j+1].cpu()
+            all_params["smplx_body_pose"][frame_idx] = out["smplx_body_pose"][j:j+1].cpu()
+            all_params["smplx_lhand_pose"][frame_idx] = out["smplx_lhand_pose"][j:j+1].cpu()
+            all_params["smplx_rhand_pose"][frame_idx] = out["smplx_rhand_pose"][j:j+1].cpu()
+            all_params["smplx_jaw_pose"][frame_idx] = out["smplx_jaw_pose"][j:j+1].cpu()
+            all_params["smplx_shape"][frame_idx] = out["smplx_shape"][j:j+1].cpu()
+            all_params["smplx_expr"][frame_idx] = out["smplx_expr"][j:j+1].cpu()
+            all_params["cam_trans"][frame_idx] = out["cam_trans"][j:j+1].cpu()
+            all_params["bbox"][frame_idx] = torch.tensor(processed_bboxes[frame_idx]).unsqueeze(0)
 
-        # Render overlay
-        if can_render:
-            mesh = out["smplx_mesh_cam"].detach().cpu().numpy()[0]
-            focal = [
-                cfg.model.focal[0] / cfg.model.input_body_shape[1] * bbox[2],
-                cfg.model.focal[1] / cfg.model.input_body_shape[0] * bbox[3],
-            ]
-            princpt = [
-                cfg.model.princpt[0] / cfg.model.input_body_shape[1] * bbox[2] + bbox[0],
-                cfg.model.princpt[1] / cfg.model.input_body_shape[0] * bbox[3] + bbox[1],
-            ]
-            vis_img = cv2.rectangle(
-                vis_img,
-                (int(bbox_xyxy[0]), int(bbox_xyxy[1])),
-                (int(bbox_xyxy[2]), int(bbox_xyxy[3])),
-                (0, 255, 0), 1,
-            )
-            vis_img = render_mesh(
-                vis_img, mesh, smpl_x.face,
-                {"focal": focal, "princpt": princpt},
-                mesh_as_vertices=False,
-            )
-            cv2.imwrite(str(render_dir / f"{frame_idx:06d}.jpg"), vis_img[:, :, ::-1])
+            if can_render and "smplx_mesh_cam" in out:
+                mesh_results[frame_idx] = out["smplx_mesh_cam"][j].detach().cpu().numpy()
 
-    # Stack all parameters into tensors
+    # ── Phase 5: Render overlays (if enabled) ──
+    if can_render and mesh_results:
+        print(f"[SMPLest-X] Rendering {len(mesh_results)} overlay frames...")
+        for frame_idx in tqdm(range(frame_count), desc="Rendering overlays"):
+            vis_img = frames[frame_idx].copy()
+
+            if frame_idx in mesh_results:
+                mesh = mesh_results[frame_idx]
+                bbox_xyxy = processed_bboxes[frame_idx]
+                bbox_xywh = np.array([
+                    bbox_xyxy[0], bbox_xyxy[1],
+                    abs(bbox_xyxy[2] - bbox_xyxy[0]),
+                    abs(bbox_xyxy[3] - bbox_xyxy[1]),
+                ])
+                bbox = process_bbox(
+                    bbox=bbox_xywh,
+                    img_width=vis_img.shape[1],
+                    img_height=vis_img.shape[0],
+                    input_img_shape=cfg.model.input_img_shape,
+                    ratio=getattr(cfg.data, "bbox_ratio", 1.25),
+                )
+                focal = [
+                    cfg.model.focal[0] / cfg.model.input_body_shape[1] * bbox[2],
+                    cfg.model.focal[1] / cfg.model.input_body_shape[0] * bbox[3],
+                ]
+                princpt = [
+                    cfg.model.princpt[0] / cfg.model.input_body_shape[1] * bbox[2] + bbox[0],
+                    cfg.model.princpt[1] / cfg.model.input_body_shape[0] * bbox[3] + bbox[1],
+                ]
+                vis_img = cv2.rectangle(
+                    vis_img,
+                    (int(bbox_xyxy[0]), int(bbox_xyxy[1])),
+                    (int(bbox_xyxy[2]), int(bbox_xyxy[3])),
+                    (0, 255, 0), 1,
+                )
+                vis_img = render_mesh(
+                    vis_img, mesh, smpl_x.face,
+                    {"focal": focal, "princpt": princpt},
+                    mesh_as_vertices=False,
+                )
+
+            cv2.imwrite(str(render_dir / f"{frame_idx + 1:06d}.jpg"), vis_img[:, :, ::-1])
+
+    # ── Phase 6: Save results ──
     results = {}
     for key, val_list in all_params.items():
         results[key] = torch.cat(val_list, dim=0)
