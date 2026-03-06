@@ -13,9 +13,57 @@ try:
 except ImportError:
     HAS_SMPLX = False
 
+import math
+
 from scipy.spatial.transform import Rotation, Slerp
 from scipy.signal import savgol_filter
 from scipy.ndimage import gaussian_filter1d
+
+
+# ── One Euro Filter (adaptive jitter removal for hand rotations) ──
+
+class _LowPassFilter:
+    def __init__(self):
+        self.s = None
+
+    def __call__(self, value, alpha):
+        if self.s is None:
+            self.s = value
+        else:
+            self.s = alpha * value + (1.0 - alpha) * self.s
+        return self.s
+
+
+class _OneEuroFilter:
+    """Adaptive low-pass filter: smooths heavily on slow motion, backs off on fast motion.
+
+    Args:
+        freq:       Signal sampling rate (Hz).
+        min_cutoff: Cutoff for slow/static signals (lower = more smoothing). Main jitter knob.
+        beta:       Speed coefficient (higher = less lag on fast motion).
+        d_cutoff:   Cutoff for derivative estimation (usually 1.0).
+    """
+
+    def __init__(self, freq: float, min_cutoff: float = 0.5, beta: float = 0.007, d_cutoff: float = 1.0):
+        self.freq = freq
+        self.min_cutoff = min_cutoff
+        self.beta = beta
+        self.d_cutoff = d_cutoff
+        self.x_filt = _LowPassFilter()
+        self.dx_filt = _LowPassFilter()
+
+    @staticmethod
+    def _alpha(cutoff, freq):
+        tau = 1.0 / (2.0 * math.pi * cutoff)
+        te = 1.0 / freq
+        return 1.0 / (1.0 + tau / te)
+
+    def __call__(self, x):
+        prev = self.x_filt.s
+        dx = 0.0 if prev is None else (x - prev) * self.freq
+        edx = self.dx_filt(dx, self._alpha(self.d_cutoff, self.freq))
+        cutoff = self.min_cutoff + self.beta * abs(edx)
+        return self.x_filt(x, self._alpha(cutoff, self.freq))
 
 
 # ── SMPL-X Joint Hierarchy ──
@@ -873,6 +921,69 @@ def _smooth_rotations(params: dict, window: int = 5, keys: list | None = None) -
     return params
 
 
+def _smooth_rotations_one_euro(
+    params: dict,
+    keys: list[str],
+    fps: float = 30.0,
+    min_cutoff: float = 0.5,
+    beta: float = 0.007,
+    d_cutoff: float = 1.0,
+) -> dict:
+    """Smooth rotations using One Euro filter in quaternion space.
+
+    Unlike Savitzky-Golay (fixed window), One Euro adapts per-frame:
+    heavy smoothing on slow/static motion (kills jitter on held poses),
+    light smoothing on fast motion (preserves snappy gestures).
+
+    Operates in quaternion space with continuity enforcement, same as
+    _smooth_rotations, but replaces the Savgol pass with per-component
+    One Euro filtering.
+    """
+    params = dict(params)
+
+    for key in keys:
+        aa = params[key]
+        if aa.ndim == 2:
+            aa_3d = aa[:, np.newaxis, :]
+        else:
+            aa_3d = aa
+
+        n_frames, n_joints, _ = aa_3d.shape
+        if n_frames < 3:
+            continue
+
+        smoothed = np.zeros_like(aa_3d)
+        for j in range(n_joints):
+            joint_aa = aa_3d[:, j, :]
+
+            # Axis-angle → quaternion
+            quats = Rotation.from_rotvec(joint_aa).as_quat()  # (N, 4)
+
+            # Enforce quaternion continuity
+            for i in range(1, n_frames):
+                if np.dot(quats[i], quats[i - 1]) < 0:
+                    quats[i] = -quats[i]
+
+            # One Euro filter on each quaternion component
+            for c in range(4):
+                filt = _OneEuroFilter(fps, min_cutoff, beta, d_cutoff)
+                for i in range(n_frames):
+                    quats[i, c] = filt(quats[i, c])
+
+            # Renormalize
+            norms = np.linalg.norm(quats, axis=1, keepdims=True)
+            quats = quats / np.maximum(norms, 1e-8)
+
+            smoothed[:, j, :] = Rotation.from_quat(quats).as_rotvec()
+
+        if aa.ndim == 2:
+            params[key] = smoothed[:, 0, :]
+        else:
+            params[key] = smoothed
+
+    return params
+
+
 def convert_params_to_bvh(
     params: dict,
     output_path: str,
@@ -908,14 +1019,20 @@ def convert_params_to_bvh(
         params = _camera_to_world_orient(params)
         params = _correct_tilt(params, pitch_adjust_deg=pitch_adjust_deg)
 
-    # Build smooth keys list based on flags
-    smooth_keys = []
+    # Smooth body with Savitzky-Golay (fixed window, good for large joints)
     if smooth_body:
-        smooth_keys.extend(["global_orient", "body_pose"])
+        params = _smooth_rotations(params, window=5, keys=["global_orient", "body_pose"])
+
+    # Smooth hands with One Euro (adaptive — kills jitter on held poses,
+    # preserves fast gestures)
     if smooth_hands:
-        smooth_keys.extend(["left_hand_pose", "right_hand_pose"])
-    if smooth_keys:
-        params = _smooth_rotations(params, window=5, keys=smooth_keys)
+        params = _smooth_rotations_one_euro(
+            params,
+            keys=["left_hand_pose", "right_hand_pose"],
+            fps=fps,
+            min_cutoff=0.5,
+            beta=0.007,
+        )
 
     if not skip_world_grounding:
         # Derive root translation from foot-ground contacts (uses smoothed rotations)
