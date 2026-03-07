@@ -606,6 +606,8 @@ def merge_gvhmr_smplestx_params(gvhmr: dict, smplestx: dict, coordinate_space: s
 
     Takes body_pose, global_orient, transl, betas from GVHMR.
     Takes left_hand_pose, right_hand_pose from SMPLest-X.
+    Wrist rotations (body_pose joints 19-20) are spliced from SMPLest-X,
+    which produces more responsive wrist estimates than GVHMR's body model.
     Truncates both to min(N_gvhmr, N_smplestx) frames.
     """
     n_gvhmr = gvhmr["num_frames"]
@@ -631,9 +633,17 @@ def merge_gvhmr_smplestx_params(gvhmr: dict, smplestx: dict, coordinate_space: s
     else:
         gvhmr_active = gvhmr_world
 
+    # Use SMPLest-X wrist rotations (joints 19=L_Wrist, 20=R_Wrist) —
+    # more responsive than GVHMR's body-model estimates
+    smplx_bp = smplestx["body_pose"][:n]
+
+    body_pose = gvhmr_active["body_pose"][:n].copy()
+    body_pose[:, 19, :] = smplx_bp[:, 19, :]  # L_Wrist
+    body_pose[:, 20, :] = smplx_bp[:, 20, :]  # R_Wrist
+
     merged = {
         "global_orient": gvhmr_active["global_orient"][:n],
-        "body_pose": gvhmr_active["body_pose"][:n],
+        "body_pose": body_pose,
         "left_hand_pose": smplestx["left_hand_pose"][:n],
         "right_hand_pose": smplestx["right_hand_pose"][:n],
         "transl": gvhmr_active["transl"][:n],
@@ -646,10 +656,13 @@ def merge_gvhmr_smplestx_params(gvhmr: dict, smplestx: dict, coordinate_space: s
 
     if "global_orient_world" in gvhmr_world:
         merged["global_orient_world"] = gvhmr_world["global_orient_world"][:n]
-        merged["body_pose_world"] = gvhmr_world["body_pose_world"][:n]
+        bp_world = gvhmr_world["body_pose_world"][:n].copy()
     else:
         merged["global_orient_world"] = gvhmr_world["global_orient"][:n]
-        merged["body_pose_world"] = gvhmr_world["body_pose"][:n]
+        bp_world = gvhmr_world["body_pose"][:n].copy()
+    bp_world[:, 19, :] = smplx_bp[:, 19, :]
+    bp_world[:, 20, :] = smplx_bp[:, 20, :]
+    merged["body_pose_world"] = bp_world
     if "transl_world" in gvhmr_world:
         merged["transl_world"] = gvhmr_world["transl_world"][:n]
     else:
@@ -657,10 +670,16 @@ def merge_gvhmr_smplestx_params(gvhmr: dict, smplestx: dict, coordinate_space: s
 
     if "global_orient_cam" in gvhmr_camera:
         merged["global_orient_cam"] = gvhmr_camera["global_orient_cam"][:n]
-        merged["body_pose_cam"] = gvhmr_camera["body_pose_cam"][:n]
+        bp_cam = gvhmr_camera["body_pose_cam"][:n].copy()
+        bp_cam[:, 19, :] = smplx_bp[:, 19, :]
+        bp_cam[:, 20, :] = smplx_bp[:, 20, :]
+        merged["body_pose_cam"] = bp_cam
     elif gvhmr_camera.get("coordinate_space") == "camera":
         merged["global_orient_cam"] = gvhmr_camera["global_orient"][:n]
-        merged["body_pose_cam"] = gvhmr_camera["body_pose"][:n]
+        bp_cam = gvhmr_camera["body_pose"][:n].copy()
+        bp_cam[:, 19, :] = smplx_bp[:, 19, :]
+        bp_cam[:, 20, :] = smplx_bp[:, 20, :]
+        merged["body_pose_cam"] = bp_cam
     if "transl_cam" in gvhmr_camera:
         merged["transl_cam"] = gvhmr_camera["transl_cam"][:n]
     elif gvhmr_camera.get("coordinate_space") == "camera":
