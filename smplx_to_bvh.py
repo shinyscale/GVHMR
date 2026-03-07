@@ -1195,13 +1195,15 @@ def _propagate_root_xz(l_offset, r_offset, fulcrum_left, fulcrum_right, n,
     return root
 
 
-def _compute_root_from_contacts(params: dict) -> np.ndarray:
-    """Derive root translation from foot-ground contact detection (2-pass).
+def _compute_root_from_contacts(params: dict, fps: float = 30.0) -> np.ndarray:
+    """Derive root translation from multi-signal foot-ground contact detection.
+
+    Multi-signal contact: height threshold + velocity threshold + hysteresis.
+    Airborne phase detection: skip root correction when both feet are high and fast.
 
     Pass 1: Rough root estimate using simple both-feet averaging.
     Pass 2: Compute foot world velocities from pass 1, then select the
-             more STATIONARY foot as the fulcrum. This properly detects
-             pivot points where weight transfers between feet.
+             more STATIONARY foot as the fulcrum.
 
     Returns (N, 3) root translation in world coords (meters), feet at Y=0.
     """
@@ -1223,7 +1225,7 @@ def _compute_root_from_contacts(params: dict) -> np.ndarray:
         l_offset[f] = R @ l_local[f]
         r_offset[f] = R @ r_local[f]
 
-    # Contact detection (foot near ground)
+    # Foot heights relative to ground
     l_wy = pelvis_y + l_offset[:, 1]
     r_wy = pelvis_y + r_offset[:, 1]
     min_foot_y = min(l_wy.min(), r_wy.min())
@@ -1231,16 +1233,67 @@ def _compute_root_from_contacts(params: dict) -> np.ndarray:
     l_wy -= min_foot_y
     r_wy -= min_foot_y
 
-    contact_thresh = 0.03  # 3cm (tighter now that tilt correction improves FK)
-    l_contact = l_wy < contact_thresh
-    r_contact = r_wy < contact_thresh
+    # ── Multi-signal contact detection ──
+    contact_thresh = 0.03     # 3cm height threshold
+    release_thresh = 0.05     # 5cm hysteresis release threshold
+    velocity_thresh = 0.5     # 0.5 m/s foot velocity threshold
+
+    # Compute foot velocities (m/s) from FK offsets (frame-to-frame displacement)
+    l_vel = np.zeros(n)
+    r_vel = np.zeros(n)
+    if n > 1:
+        l_vel[1:] = np.linalg.norm(np.diff(l_offset, axis=0), axis=1) * fps
+        r_vel[1:] = np.linalg.norm(np.diff(r_offset, axis=0), axis=1) * fps
+
+    # Smooth velocities for stable detection
+    if n >= 7:
+        vel_win = min(11, n - 1 if n % 2 == 0 else n)
+        if vel_win % 2 == 0:
+            vel_win -= 1
+        vel_win = max(vel_win, 5)
+        l_vel = savgol_filter(l_vel, vel_win, 2)
+        r_vel = savgol_filter(r_vel, vel_win, 2)
+
+    # Contact with hysteresis: height < thresh AND velocity < thresh to enter,
+    # height > release_thresh to exit
+    l_contact = np.zeros(n, dtype=bool)
+    r_contact = np.zeros(n, dtype=bool)
+
+    l_in_contact = False
+    r_in_contact = False
+    for f in range(n):
+        # Left foot contact with hysteresis
+        if l_in_contact:
+            if l_wy[f] > release_thresh:
+                l_in_contact = False
+        else:
+            if l_wy[f] < contact_thresh and l_vel[f] < velocity_thresh:
+                l_in_contact = True
+        l_contact[f] = l_in_contact
+
+        # Right foot contact with hysteresis
+        if r_in_contact:
+            if r_wy[f] > release_thresh:
+                r_in_contact = False
+        else:
+            if r_wy[f] < contact_thresh and r_vel[f] < velocity_thresh:
+                r_in_contact = True
+        r_contact[f] = r_in_contact
+
+    # ── Airborne phase detection ──
+    # Both feet above threshold + both moving fast = airborne (jumping/running)
+    airborne = np.zeros(n, dtype=bool)
+    for f in range(n):
+        if (not l_contact[f] and not r_contact[f] and
+                l_wy[f] > contact_thresh and r_wy[f] > contact_thresh and
+                l_vel[f] > velocity_thresh and r_vel[f] > velocity_thresh):
+            airborne[f] = True
 
     # ── PASS 1: rough root estimate (average both feet in double contact) ──
     root1 = _propagate_root_xz(l_offset, r_offset, l_contact, r_contact, n,
                                 adjusted_pelvis_y)
 
     # ── PASS 2: velocity-based fulcrum selection ──
-    # Compute foot world XZ positions from pass 1
     l_world_xz = root1[:, [0, 2]] + l_offset[:, [0, 2]]
     r_world_xz = root1[:, [0, 2]] + r_offset[:, [0, 2]]
 
@@ -1250,7 +1303,6 @@ def _compute_root_from_contacts(params: dict) -> np.ndarray:
     l_speed[1:] = np.linalg.norm(np.diff(l_world_xz, axis=0), axis=1)
     r_speed[1:] = np.linalg.norm(np.diff(r_world_xz, axis=0), axis=1)
 
-    # Smooth velocities to get stable fulcrum assignment
     if n >= 7:
         win_v = min(11, n - 1 if n % 2 == 0 else n)
         if win_v % 2 == 0:
@@ -1259,16 +1311,20 @@ def _compute_root_from_contacts(params: dict) -> np.ndarray:
         l_speed = savgol_filter(l_speed, win_v, 2)
         r_speed = savgol_filter(r_speed, win_v, 2)
 
-    # Select fulcrum: the MORE STATIONARY foot (lower world speed)
-    # Add hysteresis to prevent rapid switching
+    # Select fulcrum with hysteresis
     hysteresis = 0.002  # 2mm/frame
     fulcrum_l = np.zeros(n, dtype=bool)
     fulcrum_r = np.zeros(n, dtype=bool)
     current = 'left' if l_speed[0] <= r_speed[0] else 'right'
 
     for f in range(n):
-        if not l_contact[f] and not r_contact[f]:
-            # Airborne — keep current
+        if airborne[f]:
+            # Airborne — keep last fulcrum but don't lock position
+            if current == 'left':
+                fulcrum_l[f] = True
+            else:
+                fulcrum_r[f] = True
+        elif not l_contact[f] and not r_contact[f]:
             if current == 'left':
                 fulcrum_l[f] = True
             else:
@@ -1280,7 +1336,7 @@ def _compute_root_from_contacts(params: dict) -> np.ndarray:
             fulcrum_r[f] = True
             current = 'right'
         else:
-            # Both in contact — pick more stationary, with hysteresis
+            # Both in contact — pick more stationary
             if current == 'left':
                 if r_speed[f] + hysteresis < l_speed[f]:
                     current = 'right'
@@ -1296,21 +1352,25 @@ def _compute_root_from_contacts(params: dict) -> np.ndarray:
     root = _propagate_root_xz(l_offset, r_offset, fulcrum_l, fulcrum_r, n,
                                adjusted_pelvis_y)
 
-    # Dynamic pelvis Y: contact foot at Y=0
+    # Dynamic pelvis Y: contact foot at Y=0, preserve during airborne
     for f in range(n):
-        if fulcrum_l[f]:
+        if airborne[f]:
+            # During airborne, interpolate Y from surrounding contact frames
+            if f > 0:
+                root[f, 1] = root[f - 1, 1]
+        elif fulcrum_l[f]:
             root[f, 1] = -l_offset[f, 1]
         elif fulcrum_r[f]:
             root[f, 1] = -r_offset[f, 1]
 
-    # Light smoothing on X and Z only — Y preserves ground contact
-    if n >= 7:
-        win = min(7, n - 1 if n % 2 == 0 else n)
-        if win % 2 == 0:
-            win -= 1
-        win = max(win, 5)
+    # FPS-adaptive smoothing on X and Z
+    adaptive_win = max(3, int(fps * 0.1) | 1)  # ~100ms of frames, ensure odd
+    if adaptive_win % 2 == 0:
+        adaptive_win += 1
+
+    if n >= adaptive_win:
         for ax in [0, 2]:  # X and Z only
-            root[:, ax] = savgol_filter(root[:, ax], win, 2)
+            root[:, ax] = savgol_filter(root[:, ax], adaptive_win, 2)
 
     # Mean-center XZ (keep Y as-is for ground contact)
     root[:, 0] -= np.mean(root[:, 0])
@@ -1319,7 +1379,24 @@ def _compute_root_from_contacts(params: dict) -> np.ndarray:
     return root
 
 
-def _smooth_rotations(params: dict, window: int = 5, keys: list | None = None) -> dict:
+# Per-joint smoothing multipliers: spine/head get heavier smoothing than limbs
+_JOINT_SMOOTH_MULTIPLIER = {}
+# Body joints (indices 1-21 in body_pose, mapped to joint index - 1)
+_SPINE_HEAD_JOINTS = {2, 5, 8, 11, 14}  # Spine1(2), Spine2(5), Spine3(8), Neck(11), Head(14)
+_LIMB_JOINTS = {0, 1, 3, 4, 6, 7, 9, 10, 12, 13, 15, 16, 17, 18, 19, 20}
+for j in _SPINE_HEAD_JOINTS:
+    _JOINT_SMOOTH_MULTIPLIER[j] = 1.5  # heavier smoothing
+for j in _LIMB_JOINTS:
+    _JOINT_SMOOTH_MULTIPLIER[j] = 1.0  # standard
+
+
+def _smooth_rotations(
+    params: dict,
+    window: int = 5,
+    keys: list | None = None,
+    fps: float = 30.0,
+    per_joint_strength: bool = True,
+) -> dict:
     """Temporal smoothing of joint rotations via quaternion-space filtering.
 
     SMPLest-X is a per-frame estimator with no temporal coherence. Each frame
@@ -1335,13 +1412,22 @@ def _smooth_rotations(params: dict, window: int = 5, keys: list | None = None) -
 
     Args:
         params: SMPL-X parameter dict.
-        window: Savitzky-Golay filter window size.
+        window: Base Savitzky-Golay filter window size. When 0, uses FPS-adaptive
+            window (~100ms).
         keys: Which param keys to smooth. Default: all four rotation groups.
+        fps: Video frame rate for adaptive window calculation.
+        per_joint_strength: If True, spine/head joints get heavier smoothing.
     """
     params = dict(params)  # shallow copy
 
     if keys is None:
         keys = ["global_orient", "body_pose", "left_hand_pose", "right_hand_pose"]
+
+    # FPS-adaptive base window if not specified
+    if window <= 0:
+        window = max(3, int(fps * 0.1) | 1)
+    if window % 2 == 0:
+        window += 1
 
     for key in keys:
         aa = params[key]
@@ -1357,6 +1443,16 @@ def _smooth_rotations(params: dict, window: int = 5, keys: list | None = None) -
 
         smoothed = np.zeros_like(aa_3d)
         for j in range(n_joints):
+            # Per-joint window size
+            if per_joint_strength and key == "body_pose":
+                mult = _JOINT_SMOOTH_MULTIPLIER.get(j, 1.0)
+                j_window = max(3, int(window * mult) | 1)
+                if j_window % 2 == 0:
+                    j_window += 1
+                j_window = min(j_window, n_frames)
+            else:
+                j_window = window
+
             joint_aa = aa_3d[:, j, :]  # (N, 3)
 
             # Axis-angle → quaternion (scipy uses [x, y, z, w])
@@ -1368,9 +1464,9 @@ def _smooth_rotations(params: dict, window: int = 5, keys: list | None = None) -
                     quats[i] = -quats[i]
 
             # Savitzky-Golay filter on each quaternion component
-            poly_order = min(3, window - 2)
+            poly_order = min(3, j_window - 2)
             for c in range(4):
-                quats[:, c] = savgol_filter(quats[:, c], window, poly_order)
+                quats[:, c] = savgol_filter(quats[:, c], j_window, poly_order)
 
             # Renormalize
             norms = np.linalg.norm(quats, axis=1, keepdims=True)
@@ -1460,6 +1556,7 @@ def convert_params_to_bvh(
     smooth_body: bool = True,
     smooth_hands: bool = True,
     quantize_fingers: bool = True,
+    body_smooth_preset: str = "moderate",
 ) -> str:
     """Convert SMPL-X params dict to BVH file.
 
@@ -1489,9 +1586,16 @@ def convert_params_to_bvh(
         params = _camera_to_world_orient(params)
         params = _correct_tilt(params, pitch_adjust_deg=pitch_adjust_deg)
 
-    # Smooth body with Savitzky-Golay (fixed window, good for large joints)
+    # Body smoothing preset multipliers
+    _body_smooth_presets = {"light": 0.6, "moderate": 1.0, "heavy": 1.8}
+    smooth_mult = _body_smooth_presets.get(body_smooth_preset, 1.0)
+
+    # Smooth body with Savitzky-Golay (FPS-adaptive window with preset multiplier)
     if smooth_body:
-        params = _smooth_rotations(params, window=5, keys=["global_orient", "body_pose"])
+        adaptive_win = max(3, int(fps * 0.1 * smooth_mult) | 1)
+        if adaptive_win % 2 == 0:
+            adaptive_win += 1
+        params = _smooth_rotations(params, window=adaptive_win, keys=["global_orient", "body_pose"], fps=fps)
 
     # Quantize fingers to discrete curl states before temporal smoothing —
     # One Euro then cleans up transitions between quantized states
@@ -1511,7 +1615,7 @@ def convert_params_to_bvh(
 
     if not skip_world_grounding:
         # Derive root translation from foot-ground contacts (uses smoothed rotations)
-        params["transl"] = _compute_root_from_contacts(params)
+        params["transl"] = _compute_root_from_contacts(params, fps=fps)
     else:
         # GVHMR data is already world-grounded — preserve world Y and normalize only X/Z + heading.
         params = _normalize_world_space_motion(params)

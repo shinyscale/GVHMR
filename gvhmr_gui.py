@@ -11,7 +11,7 @@ import torch
 import gradio as gr
 
 from preprocess import preprocess_video
-from face_capture import run_face_pipeline, render_face_mesh_video
+from face_capture import run_face_pipeline, render_face_mesh_video, extract_face_crops_from_keypoints
 from smplx_to_bvh import (
     convert_smplx_to_bvh,
     convert_params_to_bvh,
@@ -19,6 +19,7 @@ from smplx_to_bvh import (
     extract_smplx_params,
     merge_gvhmr_smplestx_params,
 )
+from hamer_inference import run_hamer, merge_gvhmr_hamer_params
 from bvh_to_fbx import convert_bvh_to_fbx
 from visualize_skeleton import render_skeleton_video, render_world_views
 
@@ -351,6 +352,9 @@ def run_full_pipeline(
     pipeline_mode: str,
     hybrid_static_cam: bool,
     hybrid_use_dpvo: bool,
+    use_vitpose_face: bool = True,
+    hand_source: str = "SMPLest-X (default)",
+    body_smooth_preset: str = "Moderate (default)",
     progress=gr.Progress(track_tqdm=False),
 ):
     """Run the full performance capture pipeline: body+hands+face."""
@@ -475,6 +479,40 @@ def run_full_pipeline(
         # Get bboxes for face capture
         bboxes = _extract_bboxes_from_smplestx(smplestx_output_dir)
 
+    # ── Stage 2d (optional): HaMeR Hand Capture ──
+    if "HaMeR" in hand_source and is_hybrid and merged_params is not None:
+        progress(0.48, desc="Running HaMeR hand capture...")
+        log_lines.append("")
+        log_lines.append("=" * 60)
+        log_lines.append("[Stage 2d] HaMeR — Dedicated Hand Mesh Recovery")
+        log_lines.append("=" * 60)
+
+        try:
+            # Find vitpose.pt for wrist keypoints
+            hamer_vitpose = None
+            gvhmr_out = find_output_dir(video_path)
+            if gvhmr_out:
+                vp = find_file(gvhmr_out, "vitpose.pt")
+                if vp:
+                    hamer_vitpose = vp
+
+            hamer_result = run_hamer(
+                video_path,
+                vitpose_path=hamer_vitpose,
+                person_bboxes=bboxes,
+                device="cuda",
+            )
+            merged_params = merge_gvhmr_hamer_params(merged_params, hamer_result)
+            log_lines.append(f"[HaMeR] Left hand: {(hamer_result['left_confidence'] > 0.5).sum()} confident frames")
+            log_lines.append(f"[HaMeR] Right hand: {(hamer_result['right_confidence'] > 0.5).sum()} confident frames")
+
+            # Re-save merged .pt with HaMeR hands
+            merged_pt_path = str(output_base / f"{video_stem}_hybrid_smplx.pt")
+            _save_merged_pt(merged_params, merged_pt_path)
+            pt_path = merged_pt_path
+        except Exception as e:
+            log_lines.append(f"[HaMeR] ERROR: {e} — falling back to SMPLest-X hands")
+
     # ── Stage 3: Face Capture (same for both modes) ──
     progress(0.50, desc="Extracting face captures...")
     log_lines.append("")
@@ -490,13 +528,37 @@ def run_full_pipeline(
 
     face_csv_path = str(output_base / f"{video_stem}_arkit_blendshapes.csv")
 
+    # Find vitpose.pt from GVHMR preprocess directory
+    vitpose_path = None
+    if use_vitpose_face:
+        gvhmr_output_dir = find_output_dir(video_path)
+        if gvhmr_output_dir:
+            vp = find_file(gvhmr_output_dir, "vitpose.pt")
+            if vp:
+                vitpose_path = vp
+                log_lines.append(f"[Face] Found ViTPose: {vitpose_path}")
+        # Also check the preprocess subdirectory pattern
+        if not vitpose_path:
+            preprocess_dir = GVHMR_DIR / "outputs" / "demo" / video_stem / "preprocess"
+            vp_candidate = preprocess_dir / "vitpose.pt"
+            if vp_candidate.is_file():
+                vitpose_path = str(vp_candidate)
+                log_lines.append(f"[Face] Found ViTPose: {vitpose_path}")
+        if not vitpose_path:
+            log_lines.append("[Face] ViTPose data not found, falling back to bbox crops.")
+
     def face_progress(frac, msg):
         overall = 0.50 + frac * 0.20
         progress(overall, desc=msg)
         log_lines.append(f"[Face] {msg}")
 
     try:
-        run_face_pipeline(video_path, bboxes, face_csv_path, fps=fps, progress_callback=face_progress)
+        run_face_pipeline(
+            video_path, bboxes, face_csv_path, fps=fps,
+            progress_callback=face_progress,
+            vitpose_path=vitpose_path,
+            use_vitpose_crops=use_vitpose_face and vitpose_path is not None,
+        )
         log_lines.append(f"[Face] ARKit CSV: {face_csv_path}")
     except Exception as e:
         log_lines.append(f"[Face] ERROR: {e}")
@@ -517,6 +579,8 @@ def run_full_pipeline(
         render_face_mesh_video(
             video_path, bboxes, face_mesh_video, fps=fps,
             progress_callback=face_mesh_progress,
+            vitpose_path=vitpose_path,
+            use_vitpose_crops=use_vitpose_face and vitpose_path is not None,
         )
         log_lines.append(f"[FaceMesh] Video: {face_mesh_video}")
     except Exception as e:
@@ -532,6 +596,10 @@ def run_full_pipeline(
 
     bvh_path = str(output_base / f"{video_stem}_body_hands.bvh")
 
+    # Parse smoothing preset
+    _preset_map = {"Light": "light", "Moderate (default)": "moderate", "Heavy": "heavy"}
+    smooth_key = _preset_map.get(body_smooth_preset, "moderate")
+
     try:
         if is_hybrid and merged_params is not None:
             # Hybrid: use merged params directly, skip world grounding (GVHMR is already grounded),
@@ -541,6 +609,7 @@ def run_full_pipeline(
                 skip_world_grounding=True,
                 smooth_body=False,
                 smooth_hands=True,
+                body_smooth_preset=smooth_key,
             )
         else:
             # SMPLest-X only: full processing pipeline
@@ -741,6 +810,23 @@ with gr.Blocks(title="Motion Capture Studio") as app:
                         minimum=-30, maximum=30, step=0.5, value=0,
                         info="Fine-tune on top of auto tilt correction. 0 = auto only. (SMPLest-X Only mode)",
                     )
+                    use_vitpose_face = gr.Checkbox(
+                        label="Use ViTPose face crops",
+                        value=True,
+                        info="Use ViTPose keypoints for tight face crops (better for full-body shots)",
+                    )
+                    hand_source = gr.Radio(
+                        label="Hand Source",
+                        choices=["SMPLest-X (default)", "HaMeR"],
+                        value="SMPLest-X (default)",
+                        info="HaMeR produces better finger articulation but requires extra model download",
+                    )
+                    body_smooth_preset = gr.Dropdown(
+                        label="Body Smoothing",
+                        choices=["Light", "Moderate (default)", "Heavy"],
+                        value="Moderate (default)",
+                        info="Controls temporal smoothing strength — heavier = less jitter but more latency",
+                    )
                     perf_run_btn = gr.Button(
                         "Run Full Pipeline",
                         variant="primary",
@@ -781,7 +867,8 @@ with gr.Blocks(title="Motion Capture Studio") as app:
                 fn=run_full_pipeline,
                 inputs=[
                     perf_video_upload, perf_video_path, perf_fps, fbx_naming, pitch_adjust,
-                    pipeline_mode, hybrid_static_cam, hybrid_use_dpvo,
+                    pipeline_mode, hybrid_static_cam, hybrid_use_dpvo, use_vitpose_face,
+                    hand_source, body_smooth_preset,
                 ],
                 outputs=[skeleton_preview, face_mesh_preview, world_view_preview, bvh_download, fbx_download, face_csv_download, smplx_pt_download, perf_log],
             )

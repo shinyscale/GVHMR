@@ -248,6 +248,116 @@ def test_merge_preserves_bbox():
     assert merged["bbox"].shape[0] == n
 
 
+@test
+def test_vitpose_face_crops_synthetic():
+    """Test ViTPose-based face crop extraction with synthetic data."""
+    import tempfile
+    import cv2
+    import torch
+    from face_capture import extract_face_crops_from_keypoints
+
+    # Create a synthetic video (10 frames, 640x480, black)
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+        video_path = f.name
+    with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
+        vitpose_path = f.name
+
+    try:
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(video_path, fourcc, 30, (640, 480))
+        for _ in range(10):
+            frame = np.zeros((480, 640, 3), dtype=np.uint8)
+            # Draw a white circle where the "face" is
+            cv2.circle(frame, (320, 120), 40, (255, 255, 255), -1)
+            writer.write(frame)
+        writer.release()
+
+        # Create synthetic ViTPose data: (10, 17, 3) — face at ~(320, 120)
+        vitpose = np.zeros((10, 17, 3))
+        # nose=0, l_eye=1, r_eye=2, l_ear=3, r_ear=4
+        vitpose[:, 0] = [320, 120, 0.9]  # nose
+        vitpose[:, 1] = [305, 110, 0.9]  # left eye
+        vitpose[:, 2] = [335, 110, 0.9]  # right eye
+        vitpose[:, 3] = [290, 120, 0.8]  # left ear
+        vitpose[:, 4] = [350, 120, 0.8]  # right ear
+        torch.save(torch.tensor(vitpose, dtype=torch.float32), vitpose_path)
+
+        crops = extract_face_crops_from_keypoints(video_path, vitpose_path)
+        assert len(crops) == 10, f"Expected 10 crops, got {len(crops)}"
+        assert crops[0].shape == (384, 384, 3), f"Wrong crop shape: {crops[0].shape}"
+        # Crop should contain some non-zero pixels (the white circle)
+        assert crops[0].max() > 0, "Crop is all black — face not captured"
+    finally:
+        os.unlink(video_path)
+        os.unlink(vitpose_path)
+
+
+@test
+def test_merge_gvhmr_hamer_params():
+    """Test HaMeR hand merge with synthetic data."""
+    from hamer_inference import merge_gvhmr_hamer_params
+
+    n = 20
+    gvhmr_params = {
+        "global_orient": np.zeros((n, 3)),
+        "body_pose": np.zeros((n, 21, 3)),
+        "left_hand_pose": np.ones((n, 15, 3)) * 0.1,  # SMPLest-X baseline
+        "right_hand_pose": np.ones((n, 15, 3)) * 0.1,
+        "transl": np.zeros((n, 3)),
+        "betas": np.zeros((n, 10)),
+        "num_frames": n,
+    }
+
+    # HaMeR: confident on first 10 frames only
+    hamer_params = {
+        "left_hand_pose": np.ones((n, 15, 3)) * 0.5,
+        "right_hand_pose": np.ones((n, 15, 3)) * 0.5,
+        "left_confidence": np.concatenate([np.ones(10) * 0.9, np.zeros(10)]),
+        "right_confidence": np.concatenate([np.ones(10) * 0.9, np.zeros(10)]),
+    }
+
+    merged = merge_gvhmr_hamer_params(gvhmr_params, hamer_params, confidence_threshold=0.5)
+
+    # First 10 frames should use HaMeR (0.5)
+    assert np.allclose(merged["left_hand_pose"][0], 0.5), "Frame 0 should use HaMeR"
+    assert np.allclose(merged["left_hand_pose"][9], 0.5), "Frame 9 should use HaMeR"
+    # Last 10 frames should keep SMPLest-X baseline (0.1)
+    assert np.allclose(merged["left_hand_pose"][10], 0.1), "Frame 10 should keep SMPLest-X"
+    assert np.allclose(merged["left_hand_pose"][19], 0.1), "Frame 19 should keep SMPLest-X"
+    assert merged["hand_source"] == "hamer"
+
+
+@test
+def test_multi_signal_contact_detection():
+    """Test enhanced foot contact detection with synthetic trajectory data."""
+    from smplx_to_bvh import _compute_root_from_contacts, PELVIS_HEIGHT_CM
+
+    n = 30
+    # Create synthetic params where a person is standing, then walking
+    params = {
+        "global_orient": np.zeros((n, 3)),
+        "body_pose": np.zeros((n, 21, 3)),
+        "left_hand_pose": np.zeros((n, 15, 3)),
+        "right_hand_pose": np.zeros((n, 15, 3)),
+        "transl": np.zeros((n, 3)),
+        "num_frames": n,
+    }
+    # Set a slight hip rotation so feet separate in FK
+    # L_Hip (body_pose index 0) and R_Hip (body_pose index 1)
+    # Small rotation to spread legs naturally
+    params["body_pose"][:, 0, 2] = 0.1   # L_Hip slight outward
+    params["body_pose"][:, 1, 2] = -0.1  # R_Hip slight outward
+
+    root = _compute_root_from_contacts(params, fps=30.0)
+
+    assert root.shape == (n, 3), f"Wrong root shape: {root.shape}"
+    # Root Y should be positive (above ground)
+    assert root[:, 1].min() > -0.1, "Root Y dropped below ground"
+    # XZ should be approximately centered
+    assert abs(root[:, 0].mean()) < 0.1, "Root X not centered"
+    assert abs(root[:, 2].mean()) < 0.1, "Root Z not centered"
+
+
 # ── Runner ──
 
 if __name__ == "__main__":

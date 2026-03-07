@@ -149,6 +149,123 @@ _HEAD_EYE_COLUMNS = [
 ]
 
 
+def extract_face_crops_from_keypoints(
+    video_path: str,
+    vitpose_path: str,
+    padding: float = 1.5,
+    target_size: int = 384,
+    confidence_threshold: float = 0.3,
+    ema_alpha: float = 0.7,
+) -> list[np.ndarray]:
+    """Extract face crops using ViTPose keypoints for tight head bounding boxes.
+
+    Uses nose (0), left_eye (1), right_eye (2), left_ear (3), right_ear (4)
+    from the COCO-17 keypoint format saved by GVHMR preprocessing.
+
+    Args:
+        video_path: Path to the video file.
+        vitpose_path: Path to vitpose.pt file — (F, 17, 3) tensor with (x, y, conf).
+        padding: Multiplier for the face bbox. 1.5 = 50% padding on each side.
+        target_size: Output crop size (square).
+        confidence_threshold: Min confidence to use a keypoint.
+        ema_alpha: EMA smoothing factor for bbox coordinates (0-1, higher = less smooth).
+
+    Returns:
+        List of face crop images (numpy arrays, BGR, target_size x target_size).
+    """
+    import torch
+
+    vitpose = torch.load(vitpose_path, map_location="cpu", weights_only=False)
+    if isinstance(vitpose, dict):
+        # Some formats wrap in a dict
+        for key in ["vitpose", "keypoints", "poses"]:
+            if key in vitpose:
+                vitpose = vitpose[key]
+                break
+    vitpose = np.array(vitpose)  # (F, 17, 3) — x, y, confidence
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open video: {video_path}")
+
+    frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    # Face keypoint indices in COCO-17: nose=0, l_eye=1, r_eye=2, l_ear=3, r_ear=4
+    face_kp_indices = [0, 1, 2, 3, 4]
+
+    crops = []
+    smoothed_bbox = None  # EMA state: [cx, cy, size]
+    frame_idx = 0
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        if frame_idx >= len(vitpose):
+            crops.append(np.zeros((target_size, target_size, 3), dtype=np.uint8))
+            frame_idx += 1
+            continue
+
+        # Get face keypoints for this frame
+        kps = vitpose[frame_idx, face_kp_indices]  # (5, 3) — x, y, conf
+        valid = kps[:, 2] > confidence_threshold
+
+        if valid.sum() >= 2:
+            # Compute tight bbox from valid face keypoints
+            valid_kps = kps[valid, :2]  # (K, 2)
+            x_min, y_min = valid_kps.min(axis=0)
+            x_max, y_max = valid_kps.max(axis=0)
+
+            cx = (x_min + x_max) / 2
+            cy = (y_min + y_max) / 2
+            size = max(x_max - x_min, y_max - y_min)
+            # Ensure minimum size (at least 20px before padding)
+            size = max(size, 20.0)
+
+            current_bbox = np.array([cx, cy, size])
+
+            # EMA temporal smoothing
+            if smoothed_bbox is None:
+                smoothed_bbox = current_bbox.copy()
+            else:
+                smoothed_bbox = ema_alpha * current_bbox + (1 - ema_alpha) * smoothed_bbox
+
+            # Apply padding
+            half = smoothed_bbox[2] * padding / 2
+
+            cx1 = int(max(0, smoothed_bbox[0] - half))
+            cy1 = int(max(0, smoothed_bbox[1] - half))
+            cx2 = int(min(frame_w, smoothed_bbox[0] + half))
+            cy2 = int(min(frame_h, smoothed_bbox[1] + half))
+
+            face_crop = frame[cy1:cy2, cx1:cx2]
+
+            if face_crop.size == 0:
+                crops.append(np.zeros((target_size, target_size, 3), dtype=np.uint8))
+            else:
+                # Resize preserving aspect ratio with padding
+                h, w = face_crop.shape[:2]
+                scale = target_size / max(h, w)
+                new_w, new_h = int(w * scale), int(h * scale)
+                resized = cv2.resize(face_crop, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+                canvas = np.zeros((target_size, target_size, 3), dtype=np.uint8)
+                y_off = (target_size - new_h) // 2
+                x_off = (target_size - new_w) // 2
+                canvas[y_off:y_off + new_h, x_off:x_off + new_w] = resized
+                crops.append(canvas)
+        else:
+            # Fallback: not enough face keypoints — use black frame
+            crops.append(np.zeros((target_size, target_size, 3), dtype=np.uint8))
+
+        frame_idx += 1
+
+    cap.release()
+    return crops
+
+
 def _find_mediapipe_model() -> str:
     """Find the MediaPipe face landmarker model file.
 
@@ -478,6 +595,8 @@ def render_face_mesh_video(
     margin: float = 0.20,
     target_size: int = 256,
     progress_callback=None,
+    vitpose_path: str | None = None,
+    use_vitpose_crops: bool = False,
 ) -> str:
     """Render face mesh overlay video using MediaPipe face landmarks.
 
@@ -514,6 +633,18 @@ def render_face_mesh_video(
     frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     is_normalized = person_bboxes.max() <= 1.0 if len(person_bboxes) > 0 else False
 
+    # Load ViTPose keypoints if requested
+    import torch as _torch
+    vitpose_data = None
+    if use_vitpose_crops and vitpose_path and Path(vitpose_path).is_file():
+        vp = _torch.load(vitpose_path, map_location="cpu", weights_only=False)
+        if isinstance(vp, dict):
+            for key in ["vitpose", "keypoints", "poses"]:
+                if key in vp:
+                    vp = vp[key]
+                    break
+        vitpose_data = np.array(vp)  # (F, 17, 3)
+
     # Classify contour connections by region for coloring
     contour_set = set(FACEMESH_CONTOURS)
     iris_set = set(FACEMESH_IRISES) if FACEMESH_IRISES else set()
@@ -523,6 +654,7 @@ def render_face_mesh_video(
     frames_dir = out_dir / "_facemesh_frames"
     frames_dir.mkdir(parents=True, exist_ok=True)
 
+    smoothed_vp_bbox = None  # EMA state for ViTPose crops
     frame_idx = 0
     while True:
         ret, frame = cap.read()
@@ -532,7 +664,33 @@ def render_face_mesh_video(
         # Dim frame to 60% brightness
         frame = (frame * 0.6).astype(np.uint8).copy()
 
-        if frame_idx < len(person_bboxes):
+        # Determine crop region — ViTPose keypoints or person bbox
+        cx1, cy1, cx2, cy2 = 0, 0, 0, 0
+        has_crop = False
+
+        if vitpose_data is not None and frame_idx < len(vitpose_data):
+            face_kps = vitpose_data[frame_idx, [0, 1, 2, 3, 4]]  # nose, eyes, ears
+            valid = face_kps[:, 2] > 0.3
+            if valid.sum() >= 2:
+                vkps = face_kps[valid, :2]
+                x_min, y_min = vkps.min(axis=0)
+                x_max, y_max = vkps.max(axis=0)
+                cx = (x_min + x_max) / 2
+                cy = (y_min + y_max) / 2
+                size = max(x_max - x_min, y_max - y_min, 20.0)
+                current = np.array([cx, cy, size])
+                if smoothed_vp_bbox is None:
+                    smoothed_vp_bbox = current.copy()
+                else:
+                    smoothed_vp_bbox = 0.7 * current + 0.3 * smoothed_vp_bbox
+                half_vp = smoothed_vp_bbox[2] * 1.5 / 2
+                cx1 = int(max(0, smoothed_vp_bbox[0] - half_vp))
+                cy1 = int(max(0, smoothed_vp_bbox[1] - half_vp))
+                cx2 = int(min(frame_w, smoothed_vp_bbox[0] + half_vp))
+                cy2 = int(min(frame_h, smoothed_vp_bbox[1] + half_vp))
+                has_crop = True
+
+        if not has_crop and frame_idx < len(person_bboxes):
             bbox = person_bboxes[frame_idx].copy()
             if is_normalized:
                 bbox[0] *= frame_w
@@ -556,7 +714,9 @@ def render_face_mesh_video(
             cy1 = int(max(0, head_cy - half))
             cx2 = int(min(frame_w, head_cx + half))
             cy2 = int(min(frame_h, head_cy + half))
+            has_crop = True
 
+        if has_crop:
             face_crop = frame[cy1:cy2, cx1:cx2]
 
             if face_crop.size > 0:
@@ -702,6 +862,8 @@ def run_face_pipeline(
     smooth_window: int | str = 0,
     eq_preset: str | None = None,
     progress_callback=None,
+    vitpose_path: str | None = None,
+    use_vitpose_crops: bool = False,
 ) -> str:
     """Full face capture pipeline: crop → MediaPipe → smooth/EQ → CSV.
 
@@ -714,6 +876,9 @@ def run_face_pipeline(
             Accepts an int or a preset name ("light", "moderate", "heavy", "very_heavy").
         eq_preset: EQ preset name (e.g. "subtle"). When set, replaces smooth_window.
         progress_callback: Optional callable(fraction, message) for progress updates.
+        vitpose_path: Path to vitpose.pt for keypoint-based face crops.
+        use_vitpose_crops: If True and vitpose_path exists, use ViTPose keypoints
+            for face crop extraction instead of person bboxes.
 
     Returns:
         Path to the output CSV file.
@@ -721,7 +886,12 @@ def run_face_pipeline(
     if progress_callback:
         progress_callback(0.0, "Extracting face crops from video...")
 
-    crops = extract_face_crops(video_path, person_bboxes)
+    if use_vitpose_crops and vitpose_path and Path(vitpose_path).is_file():
+        if progress_callback:
+            progress_callback(0.05, "Using ViTPose keypoints for face crops...")
+        crops = extract_face_crops_from_keypoints(video_path, vitpose_path)
+    else:
+        crops = extract_face_crops(video_path, person_bboxes)
 
     if progress_callback:
         progress_callback(0.3, f"Running MediaPipe on {len(crops)} face crops...")
