@@ -1,13 +1,12 @@
 """Face capture pipeline — extract face crops + MediaPipe ARKit blendshapes."""
 
 import csv
-import subprocess
-import shutil
 from pathlib import Path
 
 import cv2
 import numpy as np
 from scipy.signal import savgol_filter
+from hmr4d.utils.video_io_utils import get_stream_writer
 
 # MediaPipe imports
 import mediapipe as mp
@@ -649,10 +648,14 @@ def render_face_mesh_video(
     contour_set = set(FACEMESH_CONTOURS)
     iris_set = set(FACEMESH_IRISES) if FACEMESH_IRISES else set()
 
-    # Temp directory for frames
-    out_dir = Path(output_path).parent
-    frames_dir = out_dir / "_facemesh_frames"
-    frames_dir.mkdir(parents=True, exist_ok=True)
+    writer = get_stream_writer(
+        output_path,
+        width=frame_w,
+        height=frame_h,
+        fps=fps,
+        crf=18,
+        prefer_nvenc=True,
+    )
 
     smoothed_vp_bbox = None  # EMA state for ViTPose crops
     frame_idx = 0
@@ -780,7 +783,7 @@ def render_face_mesh_video(
             (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1,
         )
 
-        cv2.imwrite(str(frames_dir / f"{frame_idx + 1:06d}.jpg"), frame)
+        writer.write_frame(frame)
 
         if progress_callback and frame_idx % 30 == 0:
             total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or len(person_bboxes)
@@ -790,20 +793,7 @@ def render_face_mesh_video(
 
     cap.release()
     landmarker.close()
-
-    # Assemble video with ffmpeg
-    cmd = [
-        "ffmpeg", "-y",
-        "-r", str(fps),
-        "-i", str(frames_dir / "%06d.jpg"),
-        "-c:v", "libx264", "-crf", "18",
-        "-pix_fmt", "yuv420p",
-        str(output_path),
-    ]
-    subprocess.run(cmd, capture_output=True)
-
-    # Clean up temp frames
-    shutil.rmtree(str(frames_dir), ignore_errors=True)
+    writer.close()
 
     return str(output_path)
 

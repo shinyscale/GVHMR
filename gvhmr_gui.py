@@ -10,7 +10,7 @@ import numpy as np
 import torch
 import gradio as gr
 
-from preprocess import preprocess_video
+from preprocess import preprocess_video, get_video_fps
 from face_capture import run_face_pipeline, render_face_mesh_video, extract_face_crops_from_keypoints
 from smplx_to_bvh import (
     convert_smplx_to_bvh,
@@ -77,29 +77,6 @@ def find_file(output_dir: Path, pattern: str) -> str | None:
     """Find a file matching a glob pattern in the output dir."""
     matches = list(output_dir.rglob(pattern))
     return str(matches[0]) if matches else None
-
-
-def get_video_fps(video_path: str) -> float:
-    """Get video FPS using ffprobe."""
-    cmd = [
-        "ffprobe", "-v", "quiet", "-print_format", "json",
-        "-select_streams", "v:0", "-show_entries", "stream=r_frame_rate",
-        str(video_path),
-    ]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if result.returncode == 0:
-            data = json.loads(result.stdout)
-            streams = data.get("streams", [])
-            if streams:
-                rate = streams[0].get("r_frame_rate", "30/1")
-                if "/" in rate:
-                    num, den = rate.split("/")
-                    return float(num) / float(den)
-                return float(rate)
-    except (subprocess.TimeoutExpired, json.JSONDecodeError, ValueError, ZeroDivisionError):
-        pass
-    return 30.0
 
 
 # ── Tab 1: GVHMR Body Pipeline ──
@@ -195,7 +172,7 @@ def _run_smplestx_subprocess(video_path: str, fps: float, output_dir: Path) -> t
         "conda", "run", "-n", SMPLESTX_ENV,
         "python", str(GVHMR_DIR / "smplestx_inference.py"),
         "--video", str(video_path),
-        "--fps", str(int(fps)),
+        "--fps", str(fps),
         "--output_dir", str(output_dir),
         "--no_render",
     ]
@@ -334,11 +311,29 @@ def _save_merged_pt(params: dict, output_path: str) -> str:
         "left_hand_pose": torch.tensor(params["left_hand_pose"].reshape(params["num_frames"], -1), dtype=torch.float32),
         "right_hand_pose": torch.tensor(params["right_hand_pose"].reshape(params["num_frames"], -1), dtype=torch.float32),
         "transl": torch.tensor(params["transl"], dtype=torch.float32),
+        "coordinate_space": params.get("coordinate_space", "world"),
+        "camera_model": params.get("camera_model", "world_space"),
+        "translation_origin": params.get("translation_origin", "model_origin"),
+        "source": params.get("source", "hybrid"),
     }
     if "betas" in params:
         save_dict["betas"] = torch.tensor(params["betas"], dtype=torch.float32)
     if "bbox" in params:
         save_dict["bbox"] = torch.tensor(params["bbox"], dtype=torch.float32)
+    for key in [
+        "transl_cam",
+        "transl_world",
+        "global_orient_cam",
+        "global_orient_world",
+        "body_pose_cam",
+        "body_pose_world",
+        "K_fullimg",
+    ]:
+        if key in params:
+            value = params[key]
+            if key.startswith("body_pose"):
+                value = value.reshape(params["num_frames"], -1)
+            save_dict[key] = torch.tensor(value, dtype=torch.float32)
     torch.save(save_dict, output_path)
     return output_path
 
@@ -359,7 +354,7 @@ def run_full_pipeline(
 ):
     """Run the full performance capture pipeline: body+hands+face."""
 
-    video_path = resolve_video_path(video_upload, video_path_text)
+    source_video_path = resolve_video_path(video_upload, video_path_text)
     log_lines = []
     is_hybrid = "Hybrid" in pipeline_mode
 
@@ -369,25 +364,37 @@ def run_full_pipeline(
     except ValueError:
         fps = 30.0
 
+    source_fps = get_video_fps(source_video_path)
+    source_stem = Path(source_video_path).stem
+
+    # Set up output directory early so shared preprocessing artifacts land with the run.
+    output_base = GVHMR_DIR / "outputs" / "perfcap" / source_stem
+    output_base.mkdir(parents=True, exist_ok=True)
+
     # ── Stage 1: Preprocess (portrait fix) ──
     progress(0.02, desc="Preprocessing video...")
-    video_path, preprocess_msg = preprocess_video(video_path)
+    video_path, preprocess_msg = preprocess_video(
+        source_video_path,
+        output_dir=str(output_base / "preprocess"),
+        target_fps=fps if fps > 0 else None,
+    )
     log_lines.append(f"[Preprocess] {preprocess_msg}")
 
-    # Detect actual FPS if not specified
+    # Detect actual FPS after shared preprocessing / resampling.
     actual_fps = get_video_fps(video_path)
     if fps <= 0:
         fps = actual_fps
-    log_lines.append(f"[Info] Video FPS: {actual_fps:.2f}, Target FPS: {fps:.2f}")
+    log_lines.append(f"[Info] Source video FPS: {source_fps:.2f}")
+    log_lines.append(f"[Info] Analysis video FPS: {actual_fps:.2f}")
+    log_lines.append(f"[Info] Target FPS: {fps:.2f}")
     log_lines.append(f"[Info] Pipeline mode: {pipeline_mode}")
-
-    # Set up output directory
-    video_stem = Path(video_path).stem
-    output_base = GVHMR_DIR / "outputs" / "perfcap" / video_stem
-    output_base.mkdir(parents=True, exist_ok=True)
+    if abs(actual_fps - fps) > 0.5:
+        log_lines.append("[Info] WARNING: Shared preprocessing did not fully match the requested FPS.")
+    video_stem = source_stem
 
     # Track merged params for hybrid pipeline
-    merged_params = None
+    merged_camera_params = None
+    merged_world_params = None
     pt_path = None  # final .pt for downloads
 
     if is_hybrid:
@@ -436,15 +443,25 @@ def run_full_pipeline(
         try:
             gvhmr_params = extract_gvhmr_params(gvhmr_pt_path)
             smplestx_params = extract_smplx_params(smplestx_pt_path)
-            merged_params = merge_gvhmr_smplestx_params(gvhmr_params, smplestx_params)
+            merged_world_params = merge_gvhmr_smplestx_params(
+                gvhmr_params,
+                smplestx_params,
+                coordinate_space="world",
+            )
+            merged_camera_params = merge_gvhmr_smplestx_params(
+                gvhmr_params,
+                smplestx_params,
+                coordinate_space="camera",
+            )
 
             log_lines.append(f"[Merge] Body from GVHMR: {gvhmr_params['num_frames']} frames")
             log_lines.append(f"[Merge] Hands from SMPLest-X: {smplestx_params['num_frames']} frames")
-            log_lines.append(f"[Merge] Merged: {merged_params['num_frames']} frames")
+            log_lines.append(f"[Merge] Hybrid world bundle: {merged_world_params['num_frames']} frames")
+            log_lines.append(f"[Merge] Hybrid camera bundle: {merged_camera_params['num_frames']} frames")
 
             # Save merged .pt for re-export
             merged_pt_path = str(output_base / f"{video_stem}_hybrid_smplx.pt")
-            _save_merged_pt(merged_params, merged_pt_path)
+            _save_merged_pt(merged_world_params, merged_pt_path)
             pt_path = merged_pt_path
             log_lines.append(f"[Merge] Saved: {merged_pt_path}")
         except Exception as e:
@@ -601,11 +618,11 @@ def run_full_pipeline(
     smooth_key = _preset_map.get(body_smooth_preset, "moderate")
 
     try:
-        if is_hybrid and merged_params is not None:
+        if is_hybrid and merged_world_params is not None:
             # Hybrid: use merged params directly, skip world grounding (GVHMR is already grounded),
             # only smooth hands (GVHMR body is temporally coherent)
             convert_params_to_bvh(
-                merged_params, bvh_path, fps=fps,
+                merged_world_params, bvh_path, fps=fps,
                 skip_world_grounding=True,
                 smooth_body=False,
                 smooth_hands=True,
@@ -632,10 +649,10 @@ def run_full_pipeline(
         def wv_progress(frac, msg):
             progress(0.80 + frac * 0.07, desc=msg)
 
-        if is_hybrid and merged_params is not None:
+        if is_hybrid and merged_world_params is not None:
             render_world_views(
                 output_path=world_view_video, fps=fps,
-                params=merged_params,
+                params=merged_world_params,
                 skip_world_grounding=True,
                 progress_callback=wv_progress,
             )
@@ -681,18 +698,28 @@ def run_full_pipeline(
         def viz_progress(frac, msg):
             progress(0.93 + frac * 0.06, desc=msg)
 
-        if is_hybrid and merged_params is not None:
-            # Use SMPLest-X params for camera-space overlay (has bbox + cam_trans)
+        if is_hybrid and merged_camera_params is not None:
+            log_lines.append("[Viz] Rendering Hybrid-camera overlay (GVHMR body/root + SMPLest-X hands).")
             render_skeleton_video(
-                pt_path=smplestx_pt_path,
                 video_path=video_path,
                 output_path=skeleton_video,
                 fps=fps,
                 progress_callback=viz_progress,
+                params=merged_camera_params,
+                coordinate_space="camera",
+                render_label="Hybrid-camera",
             )
             log_lines.append(f"[Viz] Skeleton video: {skeleton_video}")
         else:
-            render_skeleton_video(pt_path, video_path, skeleton_video, fps=fps, progress_callback=viz_progress)
+            render_skeleton_video(
+                pt_path,
+                video_path,
+                skeleton_video,
+                fps=fps,
+                progress_callback=viz_progress,
+                coordinate_space="camera",
+                render_label="SMPLest-X camera",
+            )
             log_lines.append(f"[Viz] Skeleton video: {skeleton_video}")
     except Exception as e:
         log_lines.append(f"[Viz] ERROR: {e}")
