@@ -179,6 +179,12 @@ def _run_smplestx_subprocess(video_path: str, fps: float, output_dir: Path) -> t
 
     log_lines = [f"Running SMPLest-X: {' '.join(cmd)}", ""]
 
+    # Strip gvhmr cross-compiler env vars so conda run -n smplestx starts clean
+    clean_env = {k: v for k, v in os.environ.items()
+                 if not k.startswith("CONDA_BACKUP_")}
+    for var in ["CXX", "CC", "GXX", "GCC", "CXX_FOR_BUILD", "CXXFLAGS", "DEBUG_CXXFLAGS"]:
+        clean_env.pop(var, None)
+
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -186,6 +192,7 @@ def _run_smplestx_subprocess(video_path: str, fps: float, output_dir: Path) -> t
         text=True,
         cwd=str(SMPLESTX_DIR),
         bufsize=1,
+        env=clean_env,
     )
 
     for line in proc.stdout:

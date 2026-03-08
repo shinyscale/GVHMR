@@ -178,3 +178,8 @@ tensorboard
 
 # glove
 glove
+
+# Third-party clones and pretrained model weights
+third_party/
+pretrained_models/
+_DATA/

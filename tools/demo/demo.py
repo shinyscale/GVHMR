@@ -112,11 +112,11 @@ def run_preprocess(cfg):
         torch.save({"bbx_xyxy": bbx_xyxy, "bbx_xys": bbx_xys}, paths.bbx)
         del tracker
     else:
-        bbx_xys = torch.load(paths.bbx)["bbx_xys"]
+        bbx_xys = torch.load(weights_only=False, f=paths.bbx)["bbx_xys"]
         Log.info(f"[Preprocess] bbx (xyxy, xys) from {paths.bbx}")
     if verbose:
         video = read_video_np(video_path)
-        bbx_xyxy = torch.load(paths.bbx)["bbx_xyxy"]
+        bbx_xyxy = torch.load(weights_only=False, f=paths.bbx)["bbx_xyxy"]
         video_overlay = draw_bbx_xyxy_on_image_batch(bbx_xyxy, video)
         save_video(video_overlay, cfg.paths.bbx_xyxy_video_overlay)
 
@@ -127,7 +127,7 @@ def run_preprocess(cfg):
         torch.save(vitpose, paths.vitpose)
         del vitpose_extractor
     else:
-        vitpose = torch.load(paths.vitpose)
+        vitpose = torch.load(weights_only=False, f=paths.vitpose)
         Log.info(f"[Preprocess] vitpose from {paths.vitpose}")
     if verbose:
         video = read_video_np(video_path)
@@ -178,7 +178,7 @@ def load_data_dict(cfg):
     if cfg.static_cam:
         R_w2c = torch.eye(3).repeat(length, 1, 1)
     else:
-        traj = torch.load(cfg.paths.slam)
+        traj = torch.load(weights_only=False, f=cfg.paths.slam)
         if cfg.use_dpvo:  # DPVO
             traj_quat = torch.from_numpy(traj[:, [6, 3, 4, 5]])
             R_w2c = quaternion_to_matrix(traj_quat).mT
@@ -191,11 +191,11 @@ def load_data_dict(cfg):
 
     data = {
         "length": torch.tensor(length),
-        "bbx_xys": torch.load(paths.bbx)["bbx_xys"],
-        "kp2d": torch.load(paths.vitpose),
+        "bbx_xys": torch.load(weights_only=False, f=paths.bbx)["bbx_xys"],
+        "kp2d": torch.load(weights_only=False, f=paths.vitpose),
         "K_fullimg": K_fullimg,
         "cam_angvel": compute_cam_angvel(R_w2c),
-        "f_imgseq": torch.load(paths.vit_features),
+        "f_imgseq": torch.load(weights_only=False, f=paths.vit_features),
     }
     return data
 
@@ -206,9 +206,9 @@ def render_incam(cfg):
         Log.info(f"[Render Incam] Video already exists at {incam_video_path}")
         return
 
-    pred = torch.load(cfg.paths.hmr4d_results)
+    pred = torch.load(weights_only=False, f=cfg.paths.hmr4d_results)
     smplx = make_smplx("supermotion").cuda()
-    smplx2smpl = torch.load("hmr4d/utils/body_model/smplx2smpl_sparse.pt").cuda()
+    smplx2smpl = torch.load(weights_only=False, f="hmr4d/utils/body_model/smplx2smpl_sparse.pt").cuda()
     faces_smpl = make_smplx("smpl").faces
 
     # smpl
@@ -223,7 +223,7 @@ def render_incam(cfg):
     # renderer
     renderer = Renderer(width, height, device="cuda", faces=faces_smpl, K=K)
     reader = get_video_reader(video_path)  # (F, H, W, 3), uint8, numpy
-    bbx_xys_render = torch.load(cfg.paths.bbx)["bbx_xys"]
+    bbx_xys_render = torch.load(weights_only=False, f=cfg.paths.bbx)["bbx_xys"]
 
     # -- render mesh -- #
     verts_incam = pred_c_verts
@@ -249,11 +249,11 @@ def render_global(cfg):
         return
 
     debug_cam = False
-    pred = torch.load(cfg.paths.hmr4d_results)
+    pred = torch.load(weights_only=False, f=cfg.paths.hmr4d_results)
     smplx = make_smplx("supermotion").cuda()
-    smplx2smpl = torch.load("hmr4d/utils/body_model/smplx2smpl_sparse.pt").cuda()
+    smplx2smpl = torch.load(weights_only=False, f="hmr4d/utils/body_model/smplx2smpl_sparse.pt").cuda()
     faces_smpl = make_smplx("smpl").faces
-    J_regressor = torch.load("hmr4d/utils/body_model/smpl_neutral_J_regressor.pt").cuda()
+    J_regressor = torch.load(weights_only=False, f="hmr4d/utils/body_model/smpl_neutral_J_regressor.pt").cuda()
 
     # smpl
     smplx_out = smplx(**to_cuda(pred["smpl_params_global"]))
