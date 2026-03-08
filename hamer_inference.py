@@ -3,14 +3,18 @@
 Integrates geopavlakos/hamer (CVPR 2024) to produce per-frame MANO
 parameters for left and right hands, compatible with SMPL-X hand_pose.
 
-Requires: HaMeR cloned at third_party/hamer/ with model weights downloaded.
+Requires: HaMeR cloned at third_party/hamer/ with model weights downloaded
+via fetch_demo_data.sh, and MANO_RIGHT.pkl in _DATA/data/mano/.
 """
 
+import os
 import sys
 from pathlib import Path
 
+import cv2
 import numpy as np
 import torch
+from scipy.spatial.transform import Rotation
 
 # ── HaMeR Setup ──
 
@@ -25,75 +29,120 @@ def _ensure_hamer_on_path():
 
 
 def _load_hamer_model(device: str = "cuda"):
-    """Load the HaMeR model and return (model, model_cfg).
+    """Load the HaMeR model using the official load_hamer() function.
 
-    Downloads checkpoint on first run (~2GB).
+    The HaMeR codebase uses relative paths (./_DATA/...), so we temporarily
+    change CWD to the HaMeR directory during loading.
     """
     _ensure_hamer_on_path()
 
-    from hamer.models import HAMER
-    from hamer.utils import recursive_to
-    from hamer.configs import CACHE_DIR_HAMER
+    checkpoint = HAMER_DIR / "_DATA" / "hamer_ckpts" / "checkpoints" / "hamer.ckpt"
+    if not checkpoint.exists():
+        raise FileNotFoundError(
+            f"HaMeR checkpoint not found at {checkpoint}. "
+            f"Run: cd {HAMER_DIR} && bash fetch_demo_data.sh"
+        )
 
-    # Use the default HaMeR checkpoint
-    checkpoint_path = Path(CACHE_DIR_HAMER) / "hamer_ckpts" / "checkpoints" / "hamer.ckpt"
+    old_cwd = os.getcwd()
+    os.chdir(str(HAMER_DIR))
+    try:
+        from hamer.models import load_hamer
+        model, model_cfg = load_hamer(str(checkpoint))
+    finally:
+        os.chdir(old_cwd)
 
-    if not checkpoint_path.exists():
-        # Trigger download
-        from hamer.utils.download import download_models
-        download_models(CACHE_DIR_HAMER)
-
-    from hamer.configs import get_config
-    model_cfg = get_config("hamer")
-
-    model = HAMER.load_from_checkpoint(str(checkpoint_path), strict=False, cfg=model_cfg)
     model = model.to(device)
     model.eval()
-
     return model, model_cfg
 
 
-def _crop_hand_region(
-    frame: np.ndarray,
+def _preprocess_hand(
+    frame_bgr: np.ndarray,
+    bbox: np.ndarray,
+    is_right: int,
+    model_cfg,
+    rescale_factor: float = 2.0,
+) -> torch.Tensor:
+    """Preprocess a hand crop for HaMeR, replicating ViTDetDataset logic.
+
+    Steps: bbox → center/scale → aspect-ratio expansion → anti-alias blur →
+    affine crop (with flip for left hands) → BGR→RGB → normalize.
+
+    Returns:
+        (3, IMAGE_SIZE, IMAGE_SIZE) float tensor, ImageNet-normalized.
+    """
+    from hamer.datasets.utils import (
+        expand_to_aspect_ratio,
+        generate_image_patch_cv2,
+        convert_cvimg_to_tensor,
+    )
+    from skimage.filters import gaussian
+
+    img_size = model_cfg.MODEL.IMAGE_SIZE  # 256
+    BBOX_SHAPE = model_cfg.MODEL.get("BBOX_SHAPE", None)  # [192, 256]
+
+    center = (bbox[2:4] + bbox[0:2]) / 2.0
+    scale = rescale_factor * (bbox[2:4] - bbox[0:2]) / 200.0
+    bbox_size = expand_to_aspect_ratio(
+        scale * 200, target_aspect_ratio=BBOX_SHAPE
+    ).max()
+
+    flip = is_right == 0  # Left hands get mirrored so model always sees "right hand"
+
+    cvimg = frame_bgr.copy()
+    downsampling_factor = (bbox_size * 1.0) / img_size / 2.0
+    if downsampling_factor > 1.1:
+        cvimg = gaussian(
+            cvimg,
+            sigma=(downsampling_factor - 1) / 2,
+            channel_axis=2,
+            preserve_range=True,
+        )
+
+    img_patch, _ = generate_image_patch_cv2(
+        cvimg,
+        center[0],
+        center[1],
+        bbox_size,
+        bbox_size,
+        img_size,
+        img_size,
+        flip,
+        1.0,
+        0,
+        border_mode=cv2.BORDER_CONSTANT,
+    )
+
+    img_patch = img_patch[:, :, ::-1]  # BGR → RGB
+    img_tensor = convert_cvimg_to_tensor(img_patch)  # HWC uint8 → CHW float
+
+    mean = 255.0 * np.array(model_cfg.MODEL.IMAGE_MEAN)
+    std = 255.0 * np.array(model_cfg.MODEL.IMAGE_STD)
+    for c in range(3):
+        img_tensor[c] = (img_tensor[c] - mean[c]) / std[c]
+
+    return torch.from_numpy(img_tensor.copy())
+
+
+def _make_hand_bbox(
     wrist_x: float,
     wrist_y: float,
     frame_w: int,
     frame_h: int,
-    padding: float = 2.0,
-    crop_size: int = 256,
-) -> np.ndarray | None:
-    """Crop a square region around a wrist keypoint.
-
-    Args:
-        frame: BGR video frame.
-        wrist_x, wrist_y: Wrist pixel coordinates.
-        frame_w, frame_h: Frame dimensions.
-        padding: Multiplier for crop size relative to estimated hand size.
-        crop_size: Output crop size (square).
-
-    Returns:
-        Cropped and resized BGR image, or None if wrist is out of frame.
-    """
-    # Estimate hand region size as ~15% of typical person height
-    # Use a fixed base size since we don't have person height here
-    hand_size = min(frame_w, frame_h) * 0.12
-    half = hand_size * padding / 2
-
-    x1 = int(max(0, wrist_x - half))
-    y1 = int(max(0, wrist_y - half))
-    x2 = int(min(frame_w, wrist_x + half))
-    y2 = int(min(frame_h, wrist_y + half))
-
-    if x2 - x1 < 10 or y2 - y1 < 10:
-        return None
-
-    import cv2
-    crop = frame[y1:y2, x1:x2]
-    if crop.size == 0:
-        return None
-
-    resized = cv2.resize(crop, (crop_size, crop_size), interpolation=cv2.INTER_LINEAR)
-    return resized
+    hand_size_frac: float = 0.12,
+) -> np.ndarray:
+    """Create an [x1, y1, x2, y2] bounding box centered on a wrist keypoint."""
+    hand_size = min(frame_w, frame_h) * hand_size_frac
+    half = hand_size / 2
+    return np.array(
+        [
+            max(0, wrist_x - half),
+            max(0, wrist_y - half),
+            min(frame_w, wrist_x + half),
+            min(frame_h, wrist_y + half),
+        ],
+        dtype=np.float32,
+    )
 
 
 def run_hamer(
@@ -101,29 +150,16 @@ def run_hamer(
     vitpose_path: str | None = None,
     person_bboxes: np.ndarray | None = None,
     device: str = "cuda",
-    batch_size: int = 16,
+    batch_size: int = 32,
 ) -> dict:
     """Run HaMeR on a video to extract MANO hand parameters.
 
-    Uses ViTPose wrist keypoints (9=left_wrist, 10=right_wrist) to crop
-    hand regions, then runs HaMeR on the crops.
-
-    Args:
-        video_path: Path to the video file.
-        vitpose_path: Path to vitpose.pt for wrist keypoints.
-        person_bboxes: (N, 4) person bboxes as fallback for hand region estimation.
-        device: PyTorch device.
-        batch_size: Batch size for HaMeR inference.
+    Uses ViTPose wrist keypoints (9=left_wrist, 10=right_wrist) to create
+    hand bounding boxes, then runs HaMeR with proper preprocessing.
 
     Returns:
-        Dict with:
-            - left_hand_pose: (F, 15, 3) axis-angle rotations
-            - right_hand_pose: (F, 15, 3) axis-angle rotations
-            - left_confidence: (F,) per-frame confidence scores
-            - right_confidence: (F,) per-frame confidence scores
+        Dict with left/right_hand_pose (F, 15, 3) and confidence (F,).
     """
-    import cv2
-
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open video: {video_path}")
@@ -131,6 +167,13 @@ def run_hamer(
     frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    zeros_result = {
+        "left_hand_pose": np.zeros((n_frames, 15, 3)),
+        "right_hand_pose": np.zeros((n_frames, 15, 3)),
+        "left_confidence": np.zeros(n_frames),
+        "right_confidence": np.zeros(n_frames),
+    }
 
     # Load ViTPose for wrist keypoints
     vitpose = None
@@ -148,109 +191,94 @@ def run_hamer(
         model, model_cfg = _load_hamer_model(device)
     except Exception as e:
         print(f"[HaMeR] Failed to load model: {e}")
-        print("[HaMeR] Returning zero hand poses.")
-        return {
-            "left_hand_pose": np.zeros((n_frames, 15, 3)),
-            "right_hand_pose": np.zeros((n_frames, 15, 3)),
-            "left_confidence": np.zeros(n_frames),
-            "right_confidence": np.zeros(n_frames),
-        }
+        cap.release()
+        return zeros_result
 
-    # Process frames
+    # COCO-17 wrist indices
+    LEFT_WRIST_IDX = 9
+    RIGHT_WRIST_IDX = 10
+    WRIST_CONF_THRESH = 0.3
+
+    # Results arrays
     left_poses = np.zeros((n_frames, 15, 3))
     right_poses = np.zeros((n_frames, 15, 3))
     left_conf = np.zeros(n_frames)
     right_conf = np.zeros(n_frames)
 
-    # COCO-17 wrist indices: 9=left_wrist, 10=right_wrist
-    LEFT_WRIST_IDX = 9
-    RIGHT_WRIST_IDX = 10
+    # Accumulate preprocessed crops for batched inference
+    crop_tensors = []  # preprocessed image tensors
+    crop_meta = []  # (frame_idx, is_right)
+
+    def _flush_batch():
+        """Run model on accumulated crops and store results."""
+        if not crop_tensors:
+            return
+        batch_img = torch.stack(crop_tensors).to(device)
+        with torch.no_grad():
+            output = model({"img": batch_img})
+
+        hp_rotmat = output["pred_mano_params"]["hand_pose"].cpu().numpy()
+        B, J = hp_rotmat.shape[:2]  # (B, 15, 3, 3)
+        hp_aa = Rotation.from_matrix(hp_rotmat.reshape(-1, 3, 3)).as_rotvec()
+        hp_aa = hp_aa.reshape(B, J, 3)
+
+        for i, (fidx, is_r) in enumerate(crop_meta):
+            aa = hp_aa[i]
+            if is_r == 0:
+                # Left hand was flipped — mirror x-axis rotations back
+                aa[:, 0] *= -1
+                left_poses[fidx] = aa
+                left_conf[fidx] = 0.8
+            else:
+                right_poses[fidx] = aa
+                right_conf[fidx] = 0.8
+
+        crop_tensors.clear()
+        crop_meta.clear()
 
     frame_idx = 0
     while True:
         ret, frame = cap.read()
-        if not ret:
+        if not ret or frame_idx >= n_frames:
             break
 
-        if frame_idx >= n_frames:
-            break
-
-        # Get wrist positions from ViTPose
-        left_crop = None
-        right_crop = None
+        # Determine wrist positions
+        wrists = []  # [(wx, wy, is_right), ...]
 
         if vitpose is not None and frame_idx < len(vitpose):
-            lw = vitpose[frame_idx, LEFT_WRIST_IDX]  # (x, y, conf)
+            lw = vitpose[frame_idx, LEFT_WRIST_IDX]
             rw = vitpose[frame_idx, RIGHT_WRIST_IDX]
-
-            if lw[2] > 0.3:
-                left_crop = _crop_hand_region(frame, lw[0], lw[1], frame_w, frame_h)
-            if rw[2] > 0.3:
-                right_crop = _crop_hand_region(frame, rw[0], rw[1], frame_w, frame_h)
-
+            if lw[2] > WRIST_CONF_THRESH:
+                wrists.append((lw[0], lw[1], 0))
+            if rw[2] > WRIST_CONF_THRESH:
+                wrists.append((rw[0], rw[1], 1))
         elif person_bboxes is not None and frame_idx < len(person_bboxes):
-            # Fallback: estimate wrist from bbox
             bbox = person_bboxes[frame_idx]
             bx1, by1, bx2, by2 = bbox
             if max(bbox) <= 1.0:
                 bx1, bx2 = bx1 * frame_w, bx2 * frame_w
                 by1, by2 = by1 * frame_h, by2 * frame_h
-            # Left wrist: right side of bbox, ~70% down
-            lw_x = bx2 - (bx2 - bx1) * 0.15
-            lw_y = by1 + (by2 - by1) * 0.70
-            left_crop = _crop_hand_region(frame, lw_x, lw_y, frame_w, frame_h)
-            # Right wrist: left side of bbox, ~70% down
-            rw_x = bx1 + (bx2 - bx1) * 0.15
-            rw_y = by1 + (by2 - by1) * 0.70
-            right_crop = _crop_hand_region(frame, rw_x, rw_y, frame_w, frame_h)
+            wrists.append((bx2 - (bx2 - bx1) * 0.15, by1 + (by2 - by1) * 0.70, 0))
+            wrists.append((bx1 + (bx2 - bx1) * 0.15, by1 + (by2 - by1) * 0.70, 1))
 
-        # Run HaMeR on crops
-        for crop, side in [(left_crop, "left"), (right_crop, "right")]:
-            if crop is None:
+        for wx, wy, is_r in wrists:
+            bbox = _make_hand_bbox(wx, wy, frame_w, frame_h)
+            if bbox[2] - bbox[0] < 10 or bbox[3] - bbox[1] < 10:
                 continue
-
             try:
-                # Prepare input for HaMeR
-                img_tensor = torch.from_numpy(crop).float().permute(2, 0, 1) / 255.0
-                img_tensor = img_tensor.unsqueeze(0).to(device)
-
-                with torch.no_grad():
-                    output = model(img_tensor)
-
-                # Extract MANO parameters
-                # HaMeR outputs hand_pose as (B, 15, 3, 3) rotation matrices
-                # or (B, 45) axis-angle depending on config
-                if "pred_mano_params" in output:
-                    mano = output["pred_mano_params"]
-                    if "hand_pose" in mano:
-                        hp = mano["hand_pose"].cpu().numpy()  # (1, 15, 3) or (1, 45)
-                        if hp.ndim == 2 and hp.shape[-1] == 45:
-                            hp = hp.reshape(1, 15, 3)
-                        elif hp.ndim == 3 and hp.shape[-1] == 3 and hp.shape[-2] == 3:
-                            # Rotation matrix format — convert
-                            from scipy.spatial.transform import Rotation
-                            hp = hp.reshape(-1, 3, 3)
-                            hp = Rotation.from_matrix(hp).as_rotvec().reshape(1, 15, 3)
-
-                        # Apply flat_hand_mean=True convention
-                        # Left hand X-axis flip per geopavlakos/hamer#26
-                        if side == "left":
-                            hp[:, :, 0] *= -1
-
-                        if side == "left":
-                            left_poses[frame_idx] = hp[0]
-                            left_conf[frame_idx] = 0.8  # Base confidence
-                        else:
-                            right_poses[frame_idx] = hp[0]
-                            right_conf[frame_idx] = 0.8
-
+                tensor = _preprocess_hand(frame, bbox, is_r, model_cfg)
+                crop_tensors.append(tensor)
+                crop_meta.append((frame_idx, is_r))
             except Exception as e:
-                # Skip this frame's hand on error
-                continue
+                print(f"[HaMeR] Preprocessing error frame {frame_idx}: {e}")
+
+        if len(crop_tensors) >= batch_size:
+            _flush_batch()
 
         frame_idx += 1
 
     cap.release()
+    _flush_batch()
 
     return {
         "left_hand_pose": left_poses,
@@ -270,19 +298,10 @@ def merge_gvhmr_hamer_params(
     For each frame and each hand independently: if HaMeR confidence exceeds
     the threshold, use HaMeR hand pose; otherwise fall back to the existing
     hand pose from gvhmr_params (which may be zeros or SMPLest-X data).
-
-    Args:
-        gvhmr_params: Full SMPL-X params dict (body + existing hands).
-        hamer_params: Output from run_hamer().
-        confidence_threshold: Min confidence to use HaMeR data.
-
-    Returns:
-        Updated params dict with merged hand poses.
     """
     result = dict(gvhmr_params)
     n = result["num_frames"]
 
-    # Ensure shapes match
     n_hamer = len(hamer_params["left_hand_pose"])
     n_use = min(n, n_hamer)
 
@@ -292,12 +311,10 @@ def merge_gvhmr_hamer_params(
     left_conf = hamer_params["left_confidence"][:n_use]
     right_conf = hamer_params["right_confidence"][:n_use]
 
-    # Left hand: replace frames where HaMeR has high confidence
     for f in range(n_use):
         if left_conf[f] >= confidence_threshold:
             left_hp[f] = hamer_params["left_hand_pose"][f]
 
-    # Right hand: same
     for f in range(n_use):
         if right_conf[f] >= confidence_threshold:
             right_hp[f] = hamer_params["right_hand_pose"][f]
