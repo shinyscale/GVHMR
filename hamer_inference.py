@@ -129,17 +129,36 @@ def _make_hand_bbox(
     wrist_y: float,
     frame_w: int,
     frame_h: int,
-    hand_size_frac: float = 0.12,
+    elbow_x: float | None = None,
+    elbow_y: float | None = None,
+    hand_size_frac: float = 0.15,
 ) -> np.ndarray:
-    """Create an [x1, y1, x2, y2] bounding box centered on a wrist keypoint."""
+    """Create an [x1, y1, x2, y2] bounding box for a hand.
+
+    Centers the box slightly past the wrist (toward the fingers) using the
+    elbow→wrist direction vector.  This avoids clipping fingertips when the
+    hand is extended.
+    """
     hand_size = min(frame_w, frame_h) * hand_size_frac
     half = hand_size / 2
+
+    # Offset center from wrist toward fingers (~40% of hand_size along
+    # the forearm direction).  Falls back to wrist center if no elbow.
+    cx, cy = wrist_x, wrist_y
+    if elbow_x is not None and elbow_y is not None:
+        dx = wrist_x - elbow_x
+        dy = wrist_y - elbow_y
+        length = max((dx**2 + dy**2) ** 0.5, 1e-6)
+        offset = hand_size * 0.4
+        cx += dx / length * offset
+        cy += dy / length * offset
+
     return np.array(
         [
-            max(0, wrist_x - half),
-            max(0, wrist_y - half),
-            min(frame_w, wrist_x + half),
-            min(frame_h, wrist_y + half),
+            max(0, cx - half),
+            max(0, cy - half),
+            min(frame_w, cx + half),
+            min(frame_h, cy + half),
         ],
         dtype=np.float32,
     )
@@ -194,7 +213,9 @@ def run_hamer(
         cap.release()
         return zeros_result
 
-    # COCO-17 wrist indices
+    # COCO-17 indices
+    LEFT_ELBOW_IDX = 7
+    RIGHT_ELBOW_IDX = 8
     LEFT_WRIST_IDX = 9
     RIGHT_WRIST_IDX = 10
     WRIST_CONF_THRESH = 0.3
@@ -225,8 +246,10 @@ def run_hamer(
         for i, (fidx, is_r) in enumerate(crop_meta):
             aa = hp_aa[i]
             if is_r == 0:
-                # Left hand was flipped — mirror x-axis rotations back
-                aa[:, 0] *= -1
+                # Left hand was flipped — mirror Y/Z axis rotations back.
+                # Horizontal flip preserves X-axis rotation (curl) but
+                # negates Y (twist) and Z (spread) components.
+                aa[:, 1:] *= -1
                 left_poses[fidx] = aa
                 left_conf[fidx] = 0.8
             else:
@@ -243,26 +266,30 @@ def run_hamer(
             break
 
         # Determine wrist positions
-        wrists = []  # [(wx, wy, is_right), ...]
+        wrists = []  # [(wx, wy, is_right, elbow_x, elbow_y), ...]
 
         if vitpose is not None and frame_idx < len(vitpose):
             lw = vitpose[frame_idx, LEFT_WRIST_IDX]
             rw = vitpose[frame_idx, RIGHT_WRIST_IDX]
+            le = vitpose[frame_idx, LEFT_ELBOW_IDX]
+            re = vitpose[frame_idx, RIGHT_ELBOW_IDX]
             if lw[2] > WRIST_CONF_THRESH:
-                wrists.append((lw[0], lw[1], 0))
+                ex, ey = (le[0], le[1]) if le[2] > 0.3 else (None, None)
+                wrists.append((lw[0], lw[1], 0, ex, ey))
             if rw[2] > WRIST_CONF_THRESH:
-                wrists.append((rw[0], rw[1], 1))
+                ex, ey = (re[0], re[1]) if re[2] > 0.3 else (None, None)
+                wrists.append((rw[0], rw[1], 1, ex, ey))
         elif person_bboxes is not None and frame_idx < len(person_bboxes):
             bbox = person_bboxes[frame_idx]
             bx1, by1, bx2, by2 = bbox
             if max(bbox) <= 1.0:
                 bx1, bx2 = bx1 * frame_w, bx2 * frame_w
                 by1, by2 = by1 * frame_h, by2 * frame_h
-            wrists.append((bx2 - (bx2 - bx1) * 0.15, by1 + (by2 - by1) * 0.70, 0))
-            wrists.append((bx1 + (bx2 - bx1) * 0.15, by1 + (by2 - by1) * 0.70, 1))
+            wrists.append((bx2 - (bx2 - bx1) * 0.15, by1 + (by2 - by1) * 0.70, 0, None, None))
+            wrists.append((bx1 + (bx2 - bx1) * 0.15, by1 + (by2 - by1) * 0.70, 1, None, None))
 
-        for wx, wy, is_r in wrists:
-            bbox = _make_hand_bbox(wx, wy, frame_w, frame_h)
+        for wx, wy, is_r, ex, ey in wrists:
+            bbox = _make_hand_bbox(wx, wy, frame_w, frame_h, ex, ey)
             if bbox[2] - bbox[0] < 10 or bbox[3] - bbox[1] < 10:
                 continue
             try:
