@@ -1,5 +1,6 @@
 """Motion Capture Studio — GVHMR Body + Full Performance Capture GUI."""
 
+import os
 import subprocess
 import re
 import shutil
@@ -21,12 +22,13 @@ from smplx_to_bvh import (
 )
 from hamer_inference import run_hamer, merge_gvhmr_hamer_params
 from bvh_to_fbx import convert_bvh_to_fbx
-from visualize_skeleton import render_skeleton_video, render_world_views
+from visualize_skeleton import render_skeleton_video, render_world_views, render_hand_overlay_video
 
 GVHMR_DIR = Path("/mnt/f/GVHMR/GVHMR")
 DEMO_SCRIPT = GVHMR_DIR / "tools" / "demo" / "demo.py"
 SMPLESTX_DIR = Path("/mnt/f/SMPLest-X")
 SMPLESTX_ENV = "smplestx"
+SMPLESTX_PYTHON = Path("/home/shinyscale/miniconda3/envs") / SMPLESTX_ENV / "bin" / "python"
 
 # Pipeline stages for GVHMR tab
 STAGE_PATTERNS = [
@@ -169,8 +171,8 @@ def _run_smplestx_subprocess(video_path: str, fps: float, output_dir: Path) -> t
     output_dir.mkdir(parents=True, exist_ok=True)
 
     cmd = [
-        "conda", "run", "-n", SMPLESTX_ENV,
-        "python", str(GVHMR_DIR / "smplestx_inference.py"),
+        str(SMPLESTX_PYTHON),
+        str(GVHMR_DIR / "smplestx_inference.py"),
         "--video", str(video_path),
         "--fps", str(fps),
         "--output_dir", str(output_dir),
@@ -179,12 +181,6 @@ def _run_smplestx_subprocess(video_path: str, fps: float, output_dir: Path) -> t
 
     log_lines = [f"Running SMPLest-X: {' '.join(cmd)}", ""]
 
-    # Strip gvhmr cross-compiler env vars so conda run -n smplestx starts clean
-    clean_env = {k: v for k, v in os.environ.items()
-                 if not k.startswith("CONDA_BACKUP_")}
-    for var in ["CXX", "CC", "GXX", "GCC", "CXX_FOR_BUILD", "CXXFLAGS", "DEBUG_CXXFLAGS"]:
-        clean_env.pop(var, None)
-
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -192,7 +188,6 @@ def _run_smplestx_subprocess(video_path: str, fps: float, output_dir: Path) -> t
         text=True,
         cwd=str(SMPLESTX_DIR),
         bufsize=1,
-        env=clean_env,
     )
 
     for line in proc.stdout:
@@ -419,7 +414,7 @@ def run_full_pipeline(
 
         if gvhmr_pt_path is None:
             full_log = "\n".join(log_lines)
-            return None, None, None, None, None, None, None, full_log
+            return None, None, None, None, None, None, None, None, full_log
 
         log_lines.append(f"\n[GVHMR] Output: {gvhmr_pt_path}")
         progress(0.25, desc="GVHMR complete. Running SMPLest-X for hands...")
@@ -436,7 +431,7 @@ def run_full_pipeline(
 
         if smplestx_pt_path is None:
             full_log = "\n".join(log_lines)
-            return None, None, None, None, None, None, None, full_log
+            return None, None, None, None, None, None, None, None, full_log
 
         log_lines.append(f"\n[SMPLest-X] Output: {smplestx_pt_path}")
         progress(0.45, desc="SMPLest-X complete. Merging...")
@@ -474,7 +469,7 @@ def run_full_pipeline(
         except Exception as e:
             log_lines.append(f"[Merge] ERROR: {e}")
             full_log = "\n".join(log_lines)
-            return None, None, None, None, None, None, None, full_log
+            return None, None, None, None, None, None, None, None, full_log
 
         progress(0.48, desc="Merge complete.")
 
@@ -495,7 +490,7 @@ def run_full_pipeline(
 
         if pt_path is None:
             full_log = "\n".join(log_lines)
-            return None, None, None, None, None, None, None, full_log
+            return None, None, None, None, None, None, None, None, full_log
 
         log_lines.append(f"\n[SMPLest-X] Output: {pt_path}")
         progress(0.45, desc="SMPLest-X complete.")
@@ -504,7 +499,7 @@ def run_full_pipeline(
         bboxes = _extract_bboxes_from_smplestx(smplestx_output_dir)
 
     # ── Stage 2d (optional): HaMeR Hand Capture ──
-    if "HaMeR" in hand_source and is_hybrid and merged_params is not None:
+    if "HaMeR" in hand_source and is_hybrid and merged_world_params is not None:
         progress(0.48, desc="Running HaMeR hand capture...")
         log_lines.append("")
         log_lines.append("=" * 60)
@@ -526,13 +521,14 @@ def run_full_pipeline(
                 person_bboxes=bboxes,
                 device="cuda",
             )
-            merged_params = merge_gvhmr_hamer_params(merged_params, hamer_result)
+            merged_world_params = merge_gvhmr_hamer_params(merged_world_params, hamer_result)
+            merged_camera_params = merge_gvhmr_hamer_params(merged_camera_params, hamer_result)
             log_lines.append(f"[HaMeR] Left hand: {(hamer_result['left_confidence'] > 0.5).sum()} confident frames")
             log_lines.append(f"[HaMeR] Right hand: {(hamer_result['right_confidence'] > 0.5).sum()} confident frames")
 
             # Re-save merged .pt with HaMeR hands
             merged_pt_path = str(output_base / f"{video_stem}_hybrid_smplx.pt")
-            _save_merged_pt(merged_params, merged_pt_path)
+            _save_merged_pt(merged_world_params, merged_pt_path)
             pt_path = merged_pt_path
         except Exception as e:
             log_lines.append(f"[HaMeR] ERROR: {e} — falling back to SMPLest-X hands")
@@ -694,7 +690,7 @@ def run_full_pipeline(
 
     # ── Stage 6: Skeleton Visualization ──
     skeleton_video = None
-    progress(0.93, desc="Rendering skeleton overlay...")
+    progress(0.90, desc="Rendering skeleton overlay...")
     log_lines.append("")
     log_lines.append("=" * 60)
     log_lines.append("[Stage 6] Skeleton Overlay Visualization")
@@ -703,7 +699,7 @@ def run_full_pipeline(
     skeleton_video = str(output_base / f"{video_stem}_skeleton.mp4")
     try:
         def viz_progress(frac, msg):
-            progress(0.93 + frac * 0.06, desc=msg)
+            progress(0.90 + frac * 0.04, desc=msg)
 
         if is_hybrid and merged_camera_params is not None:
             log_lines.append("[Viz] Rendering Hybrid-camera overlay (GVHMR body/root + SMPLest-X hands).")
@@ -732,6 +728,44 @@ def run_full_pipeline(
         log_lines.append(f"[Viz] ERROR: {e}")
         skeleton_video = None
 
+    # ── Stage 6b: Hand Overlay Visualization ──
+    hand_overlay_video = None
+    progress(0.94, desc="Rendering hand overlay...")
+    log_lines.append("")
+    log_lines.append("=" * 60)
+    log_lines.append("[Stage 6b] Hand Overlay Visualization")
+    log_lines.append("=" * 60)
+
+    hand_overlay_video = str(output_base / f"{video_stem}_hand_overlay.mp4")
+    try:
+        def hand_progress(frac, msg):
+            progress(0.94 + frac * 0.05, desc=msg)
+
+        if is_hybrid and merged_camera_params is not None:
+            render_hand_overlay_video(
+                video_path=video_path,
+                output_path=hand_overlay_video,
+                fps=fps,
+                progress_callback=hand_progress,
+                params=merged_camera_params,
+                coordinate_space="camera",
+                render_label="Hands (Hybrid)",
+            )
+        else:
+            render_hand_overlay_video(
+                pt_path=pt_path,
+                video_path=video_path,
+                output_path=hand_overlay_video,
+                fps=fps,
+                progress_callback=hand_progress,
+                coordinate_space="camera",
+                render_label="Hands (SMPLest-X)",
+            )
+        log_lines.append(f"[Hands] Hand overlay video: {hand_overlay_video}")
+    except Exception as e:
+        log_lines.append(f"[Hands] ERROR: {e}")
+        hand_overlay_video = None
+
     # ── Done ──
     progress(1.0, desc="Pipeline complete!")
     log_lines.append("")
@@ -744,10 +778,11 @@ def run_full_pipeline(
     log_lines.append(f"  Skeleton:  {skeleton_video or 'SKIPPED'}")
     log_lines.append(f"  FaceMesh:  {face_mesh_video or 'SKIPPED'}")
     log_lines.append(f"  WorldView: {world_view_video or 'SKIPPED'}")
+    log_lines.append(f"  HandOvl:   {hand_overlay_video or 'SKIPPED'}")
     log_lines.append("=" * 60)
 
     full_log = "\n".join(log_lines)
-    return skeleton_video, face_mesh_video, world_view_video, bvh_path, fbx_path, face_csv_path, pt_path, full_log
+    return skeleton_video, face_mesh_video, world_view_video, hand_overlay_video, bvh_path, fbx_path, face_csv_path, pt_path, full_log
 
 
 # ── Gradio UI ──
@@ -872,6 +907,7 @@ with gr.Blocks(title="Motion Capture Studio") as app:
                 skeleton_preview = gr.Video(label="Skeleton Overlay")
                 face_mesh_preview = gr.Video(label="Face Mesh")
                 world_view_preview = gr.Video(label="World View (Front + Side)")
+                hand_overlay_preview = gr.Video(label="Hand Overlay")
 
             gr.Markdown("### Downloads")
             with gr.Row():
@@ -904,7 +940,7 @@ with gr.Blocks(title="Motion Capture Studio") as app:
                     pipeline_mode, hybrid_static_cam, hybrid_use_dpvo, use_vitpose_face,
                     hand_source, body_smooth_preset,
                 ],
-                outputs=[skeleton_preview, face_mesh_preview, world_view_preview, bvh_download, fbx_download, face_csv_download, smplx_pt_download, perf_log],
+                outputs=[skeleton_preview, face_mesh_preview, world_view_preview, hand_overlay_preview, bvh_download, fbx_download, face_csv_download, smplx_pt_download, perf_log],
             )
 
 

@@ -6,8 +6,6 @@ when available for accurate shape-dependent joint positions, falling back to
 approximate FK with model-derived default offsets.
 """
 
-import subprocess
-import shutil
 from pathlib import Path
 
 import numpy as np
@@ -19,12 +17,16 @@ from smplx_to_bvh import (
     JOINT_PARENTS,
     DEFAULT_OFFSETS,
     extract_smplx_params,
+    activate_coordinate_space,
+    _root_translation_origin,
     _camera_to_world_orient,
     _correct_tilt,
     _smooth_rotations,
     _add_hand_mean_pose,
     _compute_root_from_contacts,
+    _normalize_world_space_motion,
 )
+from hmr4d.utils.video_io_utils import get_stream_writer
 
 # Try to import smplx for model-based FK
 try:
@@ -56,6 +58,19 @@ for wrist, start_idx in [(20, 22), (21, 37)]:
         BONE_CONNECTIONS.append((finger_base, finger_base + 1))
         BONE_CONNECTIONS.append((finger_base + 1, finger_base + 2))
 
+# ── Hand joint/bone subsets for zoomed overlay ──
+
+_LEFT_HAND_JOINT_INDICES = [20] + list(range(22, 37))   # wrist + 15 finger joints
+_RIGHT_HAND_JOINT_INDICES = [21] + list(range(37, 52))
+_LEFT_HAND_JOINTS_SET = set(_LEFT_HAND_JOINT_INDICES)
+_RIGHT_HAND_JOINTS_SET = set(_RIGHT_HAND_JOINT_INDICES)
+_LEFT_HAND_BONES = [(j1, j2) for j1, j2 in BONE_CONNECTIONS
+                     if j1 in _LEFT_HAND_JOINTS_SET or j2 in _LEFT_HAND_JOINTS_SET]
+_RIGHT_HAND_BONES = [(j1, j2) for j1, j2 in BONE_CONNECTIONS
+                      if j1 in _RIGHT_HAND_JOINTS_SET or j2 in _RIGHT_HAND_JOINTS_SET]
+_LEFT_FINGERTIPS = [24, 27, 30, 33, 36]
+_RIGHT_FINGERTIPS = [39, 42, 45, 48, 51]
+
 # ── Colors (BGR) ──
 
 _SPINE_COLOR = (255, 255, 255)
@@ -68,11 +83,13 @@ _HAND_R_COLOR = (0, 200, 255)  # yellow-ish
 _INTERNAL_FOCAL = 5000.0
 _INPUT_BODY_H = 256
 _INPUT_BODY_W = 192
-_BBOX_RATIO = 1.2
+_BBOX_RATIO = 1.25
 _TARGET_ASPECT = _INPUT_BODY_W / _INPUT_BODY_H  # 192/256 = 0.75
 
 # Search paths for SMPL-X model files
 _SMPLX_MODEL_DIRS = [
+    Path("F:/GVHMR/GVHMR/inputs/checkpoints/body_models"),
+    Path("F:/SMPLest-X/human_models/human_model_files"),
     Path("/mnt/f/SMPLest-X/human_models/human_model_files"),
     Path.home() / "human_model_files",
     Path.home() / "models",
@@ -85,12 +102,30 @@ _SMPLX_MODEL_DIRS = [
 _SMPLX_TO_OURS = list(range(22)) + list(range(25, 40)) + list(range(40, 55))
 
 
+def _has_smplx_neutral_model(model_dir: Path) -> bool:
+    """Return True if the directory contains the neutral SMPL-X model."""
+    try:
+        return (model_dir / "smplx" / "SMPLX_NEUTRAL.npz").is_file()
+    except OSError:
+        return False
+
+
 def _find_smplx_model_dir() -> Path | None:
     """Find directory containing SMPL-X model files."""
     for d in _SMPLX_MODEL_DIRS:
-        if (d / "smplx" / "SMPLX_NEUTRAL.npz").is_file():
+        if _has_smplx_neutral_model(d):
             return d
     return None
+
+
+def _smplx_fk_status() -> tuple[Path | None, str | None]:
+    """Report whether model-based SMPL-X FK is available."""
+    if not _HAS_SMPLX:
+        return None, "smplx package not installed in this Python environment"
+    model_dir = _find_smplx_model_dir()
+    if model_dir is None:
+        return None, "no readable SMPL-X model directory found"
+    return model_dir, None
 
 
 def _process_bbox(bbox_xyxy):
@@ -136,6 +171,23 @@ def _bone_color(j1, j2):
     return _SPINE_COLOR
 
 
+def _select_smplx_device():
+    if not _HAS_SMPLX:
+        return "cpu"
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def _smplx_batch_size(device: str) -> int:
+    if device != "cuda" or not torch.cuda.is_available():
+        return 64
+    total_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+    if total_gb >= 80:
+        return 512
+    if total_gb >= 40:
+        return 256
+    return 128
+
+
 def compute_all_joints_smplx(params: dict, model_dir: Path) -> np.ndarray | None:
     """Compute 3D joint positions for all frames using the actual SMPL-X model.
 
@@ -146,6 +198,7 @@ def compute_all_joints_smplx(params: dict, model_dir: Path) -> np.ndarray | None
 
     try:
         n_frames = params["num_frames"]
+        device = _select_smplx_device()
 
         model = smplx_lib.create(
             str(model_dir),
@@ -156,32 +209,31 @@ def compute_all_joints_smplx(params: dict, model_dir: Path) -> np.ndarray | None
             use_pca=False,
             flat_hand_mean=True,
             ext="npz",
-        )
+        ).to(device)
 
         # Prepare tensors — use torch directly to avoid numpy/torch conversion issues
-        global_orient = torch.as_tensor(params["global_orient"], dtype=torch.float32)
+        global_orient = torch.as_tensor(params["global_orient"], dtype=torch.float32, device=device)
         body_pose = torch.as_tensor(
-            params["body_pose"].reshape(n_frames, -1), dtype=torch.float32
+            params["body_pose"].reshape(n_frames, -1), dtype=torch.float32, device=device
         )
         lhand = torch.as_tensor(
-            params["left_hand_pose"].reshape(n_frames, -1), dtype=torch.float32
+            params["left_hand_pose"].reshape(n_frames, -1), dtype=torch.float32, device=device
         )
         rhand = torch.as_tensor(
-            params["right_hand_pose"].reshape(n_frames, -1), dtype=torch.float32
+            params["right_hand_pose"].reshape(n_frames, -1), dtype=torch.float32, device=device
         )
-        transl = torch.as_tensor(params["transl"], dtype=torch.float32)
+        transl = torch.as_tensor(params["transl"], dtype=torch.float32, device=device)
 
         # Use mean betas (per-frame estimation has noise), properly tiled
         if "betas" in params:
             mean_b = torch.as_tensor(
-                params["betas"], dtype=torch.float32
+                params["betas"], dtype=torch.float32, device=device
             ).mean(dim=0, keepdim=True)
             betas = mean_b.expand(n_frames, -1).contiguous()
         else:
-            betas = torch.zeros(n_frames, 10)
+            betas = torch.zeros(n_frames, 10, device=device)
 
-        # Run model — process in batches to manage memory
-        batch_size = 64
+        batch_size = _smplx_batch_size(device)
         all_joints = []
         for start in range(0, n_frames, batch_size):
             end = min(start + batch_size, n_frames)
@@ -192,16 +244,16 @@ def compute_all_joints_smplx(params: dict, model_dir: Path) -> np.ndarray | None
                     body_pose=body_pose[start:end],
                     left_hand_pose=lhand[start:end],
                     right_hand_pose=rhand[start:end],
-                    jaw_pose=torch.zeros(bs, 3),
-                    leye_pose=torch.zeros(bs, 3),
-                    reye_pose=torch.zeros(bs, 3),
-                    expression=torch.zeros(bs, 10),
+                    jaw_pose=torch.zeros(bs, 3, device=device),
+                    leye_pose=torch.zeros(bs, 3, device=device),
+                    reye_pose=torch.zeros(bs, 3, device=device),
+                    expression=torch.zeros(bs, 10, device=device),
                     betas=betas[start:end],
                     transl=transl[start:end],
                     return_verts=False,
                 )
             # Extract our 52 joints from model's 127
-            joints = output.joints[:, _SMPLX_TO_OURS, :].numpy()
+            joints = output.joints[:, _SMPLX_TO_OURS, :].detach().cpu().numpy()
             all_joints.append(joints)
 
         return np.concatenate(all_joints, axis=0)  # (N, 52, 3)
@@ -271,6 +323,34 @@ def project_to_2d(
     return np.hstack([u, v])
 
 
+def _get_projection_intrinsics(
+    params: dict,
+    frame_idx: int,
+    img_w: int,
+    img_h: int,
+) -> tuple[float, float, float, float, str]:
+    """Pick the right projection model for the current frame."""
+    if "K_fullimg" in params:
+        k_frame = np.asarray(params["K_fullimg"][frame_idx])
+        fx = float(k_frame[0, 0])
+        fy = float(k_frame[1, 1])
+        cx = float(k_frame[0, 2])
+        cy = float(k_frame[1, 2])
+        return fx, fy, cx, cy, "full-image K"
+
+    if "bbox" in params:
+        bbox_xyxy = params["bbox"][frame_idx]
+        bx, by, bw, bh = _process_bbox(bbox_xyxy)
+    else:
+        bx, by, bw, bh = 0, 0, img_w, img_h
+
+    fx = _INTERNAL_FOCAL / _INPUT_BODY_W * bw
+    fy = _INTERNAL_FOCAL / _INPUT_BODY_H * bh
+    cx = bx + bw / 2
+    cy = by + bh / 2
+    return fx, fy, cx, cy, "smplestx bbox camera"
+
+
 def render_skeleton_video(
     pt_path: str = None,
     video_path: str = "",
@@ -278,6 +358,9 @@ def render_skeleton_video(
     fps: float = 30.0,
     progress_callback=None,
     params: dict = None,
+    coordinate_space: str = "camera",
+    render_label: str = "Skeleton",
+    prefer_nvenc: bool = True,
 ) -> str:
     """Render skeleton overlay on video.
 
@@ -294,28 +377,43 @@ def render_skeleton_video(
     """
     if params is None:
         params = extract_smplx_params(pt_path)
+    params = activate_coordinate_space(params, coordinate_space, strict=True)
+    if params.get("coordinate_space") != coordinate_space:
+        raise ValueError(
+            f"render_skeleton_video requires {coordinate_space}-space params, "
+            f"got {params.get('coordinate_space')!r}"
+        )
+    if "_lh_mean" not in params:
+        params = _add_hand_mean_pose(params)
     n_frames = params["num_frames"]
     n_joints = len(JOINT_NAMES)
     has_bbox = "bbox" in params
 
     # Try model-based FK for accurate joint positions
-    model_dir = _find_smplx_model_dir()
+    model_dir, smplx_fk_error = _smplx_fk_status()
     all_joints_3d = None
     if model_dir is not None:
         all_joints_3d = compute_all_joints_smplx(params, model_dir)
         if all_joints_3d is not None:
             print(f"[skeleton] Using SMPL-X model FK ({model_dir})")
     if all_joints_3d is None:
+        if smplx_fk_error is not None:
+            print(f"[skeleton] SMPL-X model FK unavailable: {smplx_fk_error}")
         print("[skeleton] Using manual FK with default offsets")
+    projection_mode = params.get("camera_model", "smplestx_crop")
+    print(f"[skeleton] Projection mode: {projection_mode}")
 
     cap = cv2.VideoCapture(video_path)
     img_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     img_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-    # Temp directory for frames
-    out_dir = Path(output_path).parent
-    frames_dir = out_dir / "_skeleton_frames"
-    frames_dir.mkdir(parents=True, exist_ok=True)
+    writer = get_stream_writer(
+        output_path,
+        width=img_w,
+        height=img_h,
+        fps=fps,
+        crf=18,
+        prefer_nvenc=prefer_nvenc,
+    )
 
     for frame_idx in range(n_frames):
         ret, img = cap.read()
@@ -331,19 +429,12 @@ def render_skeleton_video(
         else:
             joints_3d = forward_kinematics(params, frame_idx)
 
-        # Per-frame camera intrinsics from PROCESSED bbox
-        # SMPLest-X's cam_trans is relative to the expanded/aspect-adjusted crop,
-        # not the raw YOLO bbox. We must replicate process_bbox to get correct projection.
-        if has_bbox:
-            bbox_xyxy = params["bbox"][frame_idx]
-            bx, by, bw, bh = _process_bbox(bbox_xyxy)
-        else:
-            bx, by, bw, bh = 0, 0, img_w, img_h
-
-        fx = _INTERNAL_FOCAL / _INPUT_BODY_W * bw
-        fy = _INTERNAL_FOCAL / _INPUT_BODY_H * bh
-        cx = bx + bw / 2
-        cy = by + bh / 2
+        fx, fy, cx, cy, intrinsics_label = _get_projection_intrinsics(
+            params,
+            frame_idx,
+            img_w,
+            img_h,
+        )
 
         # Project to 2D
         joints_2d = project_to_2d(joints_3d, fx, fy, cx, cy)
@@ -383,30 +474,27 @@ def render_skeleton_video(
 
         # Frame number
         cv2.putText(
-            img, f"F{frame_idx + 1}/{n_frames}",
+            img, f"{render_label} F{frame_idx + 1}/{n_frames}",
             (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1,
         )
+        if frame_idx == 0:
+            cv2.putText(
+                img,
+                intrinsics_label,
+                (10, 48),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (160, 200, 255),
+                1,
+            )
 
-        cv2.imwrite(str(frames_dir / f"{frame_idx + 1:06d}.jpg"), img)
+        writer.write_frame(img)
 
         if progress_callback and frame_idx % 30 == 0:
-            progress_callback(frame_idx / n_frames, f"Rendering skeleton {frame_idx + 1}/{n_frames}")
+            progress_callback(frame_idx / n_frames, f"Rendering {render_label} {frame_idx + 1}/{n_frames}")
 
     cap.release()
-
-    # Assemble video with ffmpeg
-    cmd = [
-        "ffmpeg", "-y",
-        "-r", str(fps),
-        "-i", str(frames_dir / "%06d.jpg"),
-        "-c:v", "libx264", "-crf", "18",
-        "-pix_fmt", "yuv420p",
-        str(output_path),
-    ]
-    subprocess.run(cmd, capture_output=True)
-
-    # Clean up temp frames
-    shutil.rmtree(str(frames_dir), ignore_errors=True)
+    writer.close()
 
     return str(output_path)
 
@@ -448,6 +536,7 @@ def render_world_views(
     progress_callback=None,
     params: dict = None,
     skip_world_grounding: bool = False,
+    prefer_nvenc: bool = True,
 ) -> str:
     """Render world-space front and side view skeleton video.
 
@@ -464,7 +553,8 @@ def render_world_views(
         progress_callback: Optional callable(frac, msg).
         params: Pre-processed SMPL-X params dict. If provided, skips extraction
                 and (optionally) world-grounding steps.
-        skip_world_grounding: If True and params is provided, use transl directly.
+        skip_world_grounding: If True and params is provided, preserve the incoming
+                world-space Y and only normalize X/Z plus heading.
 
     Returns:
         Path to the output video.
@@ -477,6 +567,7 @@ def render_world_views(
         params = _correct_tilt(params, pitch_adjust_deg=pitch_adjust_deg)
         params = _smooth_rotations(params, window=5)
         params["transl"] = _compute_root_from_contacts(params)
+        params["translation_origin"] = "pelvis"
     elif not skip_world_grounding:
         # params provided but still need world grounding
         params = _add_hand_mean_pose(params)
@@ -484,14 +575,27 @@ def render_world_views(
         params = _correct_tilt(params, pitch_adjust_deg=pitch_adjust_deg)
         params = _smooth_rotations(params, window=5)
         params["transl"] = _compute_root_from_contacts(params)
+        params["translation_origin"] = "pelvis"
+    else:
+        params = _add_hand_mean_pose(params)
+        params = _normalize_world_space_motion(params)
 
     n_frames = params["num_frames"]
     n_joints = len(JOINT_NAMES)
 
-    # Compute world-space joint positions for all frames using FK
-    all_joints = np.zeros((n_frames, n_joints, 3))
-    for f in range(n_frames):
-        all_joints[f] = forward_kinematics(params, f)
+    model_dir, smplx_fk_error = _smplx_fk_status()
+    all_joints = None
+    if model_dir is not None:
+        all_joints = compute_all_joints_smplx(params, model_dir)
+        if all_joints is not None:
+            print(f"[world] Using SMPL-X model FK ({model_dir})")
+    if all_joints is None:
+        if smplx_fk_error is not None:
+            print(f"[world] SMPL-X model FK unavailable: {smplx_fk_error}")
+        print("[world] Using manual FK with default offsets")
+        all_joints = np.zeros((n_frames, n_joints, 3))
+        for f in range(n_frames):
+            all_joints[f] = forward_kinematics(params, f)
 
     # Compute scale from bounding box of all joints across all frames
     all_flat = all_joints[:, :22, :].reshape(-1, 3)  # body joints only for framing
@@ -508,15 +612,18 @@ def render_world_views(
     # Ground line Y in screen coords
     ground_screen_y = int(height / 2 - (0.0 - center_y) * scale)
 
-    # Temp frames directory
-    out_dir = Path(output_path).parent
-    frames_dir = out_dir / "_worldview_frames"
-    frames_dir.mkdir(parents=True, exist_ok=True)
-
     panel_w = width
     total_w = panel_w * 2
     bg_color = (40, 40, 40)  # dark gray
     ground_color = (80, 80, 80)
+    writer = get_stream_writer(
+        output_path,
+        width=total_w,
+        height=height,
+        fps=fps,
+        crf=18,
+        prefer_nvenc=prefer_nvenc,
+    )
 
     for f in range(n_frames):
         frame_img = np.full((height, total_w, 3), bg_color, dtype=np.uint8)
@@ -560,23 +667,230 @@ def render_world_views(
         cv2.putText(frame_img, f"F{f + 1}/{n_frames}", (total_w - 130, height - 15),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
 
-        cv2.imwrite(str(frames_dir / f"{f + 1:06d}.jpg"), frame_img)
+        writer.write_frame(frame_img)
 
         if progress_callback and f % 30 == 0:
             progress_callback(f / n_frames, f"World view {f + 1}/{n_frames}")
 
-    # Assemble with ffmpeg
-    cmd = [
-        "ffmpeg", "-y",
-        "-r", str(fps),
-        "-i", str(frames_dir / "%06d.jpg"),
-        "-c:v", "libx264", "-crf", "18",
-        "-pix_fmt", "yuv420p",
-        str(output_path),
-    ]
-    subprocess.run(cmd, capture_output=True)
+    writer.close()
 
-    shutil.rmtree(str(frames_dir), ignore_errors=True)
+    return str(output_path)
+
+
+def render_hand_overlay_video(
+    pt_path: str = None,
+    video_path: str = "",
+    output_path: str = "",
+    fps: float = 30.0,
+    progress_callback=None,
+    params: dict = None,
+    coordinate_space: str = "camera",
+    output_size: int = 512,
+    render_label: str = "Hands",
+    prefer_nvenc: bool = True,
+) -> str:
+    """Render zoomed hand overlay video (left | right side-by-side).
+
+    Produces a 2*output_size x output_size video showing each hand zoomed in
+    with skeleton drawn on top of the cropped video frame.
+
+    Args:
+        pt_path: SMPL-X .pt file. Ignored if params is provided.
+        video_path: Original input video.
+        output_path: Output overlay video path.
+        fps: Frame rate.
+        progress_callback: Optional callable(frac, msg).
+        params: Pre-processed SMPL-X params dict.
+        coordinate_space: Coordinate space (default "camera").
+        output_size: Size of each hand panel (output is 2*output_size x output_size).
+        render_label: Label prefix for frame counter.
+        prefer_nvenc: Use NVENC if available.
+
+    Returns:
+        Path to output video.
+    """
+    if params is None:
+        params = extract_smplx_params(pt_path)
+    params = activate_coordinate_space(params, coordinate_space, strict=True)
+    if params.get("coordinate_space") != coordinate_space:
+        raise ValueError(
+            f"render_hand_overlay_video requires {coordinate_space}-space params, "
+            f"got {params.get('coordinate_space')!r}"
+        )
+    if "_lh_mean" not in params:
+        params = _add_hand_mean_pose(params)
+    n_frames = params["num_frames"]
+    n_joints = len(JOINT_NAMES)
+
+    # FK
+    model_dir, smplx_fk_error = _smplx_fk_status()
+    all_joints_3d = None
+    if model_dir is not None:
+        all_joints_3d = compute_all_joints_smplx(params, model_dir)
+        if all_joints_3d is not None:
+            print(f"[hands] Using SMPL-X model FK ({model_dir})")
+    if all_joints_3d is None:
+        if smplx_fk_error is not None:
+            print(f"[hands] SMPL-X model FK unavailable: {smplx_fk_error}")
+        print("[hands] Using manual FK with default offsets")
+
+    cap = cv2.VideoCapture(video_path)
+    img_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    img_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    total_w = output_size * 2
+    total_h = output_size
+
+    writer = get_stream_writer(
+        output_path,
+        width=total_w,
+        height=total_h,
+        fps=fps,
+        crf=18,
+        prefer_nvenc=prefer_nvenc,
+    )
+
+    # EMA state for bbox smoothing (cx, cy, size) per hand
+    bbox_ema = [None, None]  # [left, right]
+    ema_alpha = 0.7
+
+    hand_sides = [
+        (_LEFT_HAND_JOINT_INDICES, _LEFT_HAND_BONES, _HAND_L_COLOR, _LEFT_FINGERTIPS, "L", 20),
+        (_RIGHT_HAND_JOINT_INDICES, _RIGHT_HAND_BONES, _HAND_R_COLOR, _RIGHT_FINGERTIPS, "R", 21),
+    ]
+
+    for frame_idx in range(n_frames):
+        ret, img = cap.read()
+        if not ret:
+            img = np.zeros((img_h, img_w, 3), dtype=np.uint8)
+
+        # Dim once for all crops
+        dimmed = (img * 0.6).astype(np.uint8)
+
+        # 3D joints
+        if all_joints_3d is not None:
+            joints_3d = all_joints_3d[frame_idx]
+        else:
+            joints_3d = forward_kinematics(params, frame_idx)
+
+        # Project to 2D
+        fx, fy, cx, cy, _ = _get_projection_intrinsics(params, frame_idx, img_w, img_h)
+        joints_2d = project_to_2d(joints_3d, fx, fy, cx, cy)
+
+        out_frame = np.zeros((total_h, total_w, 3), dtype=np.uint8)
+
+        for side_idx, (joint_indices, bones, color, fingertips, label, wrist_idx) in enumerate(hand_sides):
+            panel_x_off = side_idx * output_size
+            hand_pts = joints_2d[joint_indices]  # (16, 2)
+
+            # Check if hand joints are reasonably on-screen
+            margin = max(img_w, img_h)
+            in_frame = (
+                (hand_pts[:, 0] > -margin) & (hand_pts[:, 0] < 2 * margin) &
+                (hand_pts[:, 1] > -margin) & (hand_pts[:, 1] < 2 * margin)
+            )
+            if not in_frame.any():
+                cv2.putText(
+                    out_frame, f"{label} (off-screen)",
+                    (panel_x_off + 10, output_size // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 100, 100), 1,
+                )
+                continue
+
+            # Tight bbox from valid hand joints
+            valid_pts = hand_pts[in_frame]
+            x_min, y_min = valid_pts.min(axis=0)
+            x_max, y_max = valid_pts.max(axis=0)
+            bbox_cx = (x_min + x_max) / 2
+            bbox_cy = (y_min + y_max) / 2
+            bbox_size = max(x_max - x_min, y_max - y_min)
+
+            # 50% margin, minimum 50px
+            bbox_size = max(bbox_size * 1.5, 50)
+
+            # EMA smoothing
+            if bbox_ema[side_idx] is None:
+                bbox_ema[side_idx] = (bbox_cx, bbox_cy, bbox_size)
+            else:
+                prev = bbox_ema[side_idx]
+                bbox_ema[side_idx] = (
+                    ema_alpha * bbox_cx + (1 - ema_alpha) * prev[0],
+                    ema_alpha * bbox_cy + (1 - ema_alpha) * prev[1],
+                    ema_alpha * bbox_size + (1 - ema_alpha) * prev[2],
+                )
+            s_cx, s_cy, s_size = bbox_ema[side_idx]
+
+            # Square crop region clipped to frame
+            half = s_size / 2
+            crop_x1 = int(max(0, s_cx - half))
+            crop_y1 = int(max(0, s_cy - half))
+            crop_x2 = int(min(img_w, s_cx + half))
+            crop_y2 = int(min(img_h, s_cy + half))
+
+            if crop_x2 <= crop_x1 or crop_y2 <= crop_y1:
+                continue
+
+            # Crop and resize with letterbox
+            crop = dimmed[crop_y1:crop_y2, crop_x1:crop_x2]
+            crop_h_actual, crop_w_actual = crop.shape[:2]
+            scale_factor = output_size / max(crop_h_actual, crop_w_actual, 1)
+            new_w = int(crop_w_actual * scale_factor)
+            new_h = int(crop_h_actual * scale_factor)
+            resized = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+            panel = np.zeros((output_size, output_size, 3), dtype=np.uint8)
+            pad_x = (output_size - new_w) // 2
+            pad_y = (output_size - new_h) // 2
+            panel[pad_y:pad_y + new_h, pad_x:pad_x + new_w] = resized
+
+            # Map full-frame joint coords → panel coords
+            def _to_panel(pt, _cx1=crop_x1, _cy1=crop_y1, _sf=scale_factor, _px=pad_x, _py=pad_y):
+                return (int((pt[0] - _cx1) * _sf + _px),
+                        int((pt[1] - _cy1) * _sf + _py))
+
+            # Draw bones
+            for j1, j2 in bones:
+                if j1 >= n_joints or j2 >= n_joints:
+                    continue
+                p1 = _to_panel(joints_2d[j1])
+                p2 = _to_panel(joints_2d[j2])
+                cv2.line(panel, p1, p2, color, 2, cv2.LINE_AA)
+
+            # Draw fingertip dots
+            for ft in fingertips:
+                if ft < n_joints:
+                    p = _to_panel(joints_2d[ft])
+                    if 0 <= p[0] < output_size and 0 <= p[1] < output_size:
+                        cv2.circle(panel, p, 5, (0, 255, 0), -1, cv2.LINE_AA)
+
+            # Wrist dot
+            wp = _to_panel(joints_2d[wrist_idx])
+            if 0 <= wp[0] < output_size and 0 <= wp[1] < output_size:
+                cv2.circle(panel, wp, 5, (255, 255, 255), -1, cv2.LINE_AA)
+
+            # Panel label
+            cv2.putText(panel, label, (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+
+            out_frame[:, panel_x_off:panel_x_off + output_size] = panel
+
+        # Divider between panels
+        cv2.line(out_frame, (output_size, 0), (output_size, total_h - 1), (100, 100, 100), 1)
+
+        # Frame counter
+        cv2.putText(
+            out_frame, f"{render_label} F{frame_idx + 1}/{n_frames}",
+            (total_w - 220, total_h - 10),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1,
+        )
+
+        writer.write_frame(out_frame)
+
+        if progress_callback and frame_idx % 30 == 0:
+            progress_callback(frame_idx / n_frames, f"Rendering {render_label} {frame_idx + 1}/{n_frames}")
+
+    cap.release()
+    writer.close()
 
     return str(output_path)
 
