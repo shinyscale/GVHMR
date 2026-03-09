@@ -131,25 +131,27 @@ def _make_hand_bbox(
     frame_h: int,
     elbow_x: float | None = None,
     elbow_y: float | None = None,
-    hand_size_frac: float = 0.15,
+    hand_size_frac: float = 0.22,
 ) -> np.ndarray:
     """Create an [x1, y1, x2, y2] bounding box for a hand.
 
     Centers the box slightly past the wrist (toward the fingers) using the
-    elbow→wrist direction vector.  This avoids clipping fingertips when the
-    hand is extended.
+    elbow→wrist direction vector.  The full wrist and spread fingers should
+    always be visible in the crop — HaMeR's rescale_factor=2.0 further
+    expands this during preprocessing.
     """
     hand_size = min(frame_w, frame_h) * hand_size_frac
     half = hand_size / 2
 
-    # Offset center from wrist toward fingers (~40% of hand_size along
-    # the forearm direction).  Falls back to wrist center if no elbow.
+    # Offset center from wrist toward fingers (~25% of hand_size along
+    # the forearm direction).  Modest offset keeps the wrist well inside
+    # the crop while still biasing toward fingers.
     cx, cy = wrist_x, wrist_y
     if elbow_x is not None and elbow_y is not None:
         dx = wrist_x - elbow_x
         dy = wrist_y - elbow_y
         length = max((dx**2 + dy**2) ** 0.5, 1e-6)
-        offset = hand_size * 0.4
+        offset = hand_size * 0.25
         cx += dx / length * offset
         cy += dy / length * offset
 
