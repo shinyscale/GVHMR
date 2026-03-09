@@ -797,16 +797,19 @@ def render_hand_overlay_video(
                 )
                 continue
 
-            # Tight bbox from valid hand joints
+            # Bbox from valid hand joints — include wrist with extra padding
+            # so the full hand, wrist, and a bit of forearm are always visible.
             valid_pts = hand_pts[in_frame]
-            x_min, y_min = valid_pts.min(axis=0)
-            x_max, y_max = valid_pts.max(axis=0)
+            wrist_pt = joints_2d[wrist_idx]  # always include wrist
+            all_pts = np.vstack([valid_pts, wrist_pt[np.newaxis]])
+            x_min, y_min = all_pts.min(axis=0)
+            x_max, y_max = all_pts.max(axis=0)
             bbox_cx = (x_min + x_max) / 2
             bbox_cy = (y_min + y_max) / 2
             bbox_size = max(x_max - x_min, y_max - y_min)
 
-            # 50% margin, minimum 50px
-            bbox_size = max(bbox_size * 1.5, 50)
+            # 150% margin — keeps full wrist and spread fingers in frame
+            bbox_size = max(bbox_size * 2.5, 80)
 
             # EMA smoothing
             if bbox_ema[side_idx] is None:
