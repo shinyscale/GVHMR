@@ -704,7 +704,24 @@ def _heading_align_matrix_y(global_orient: np.ndarray) -> np.ndarray:
 
 
 def _normalize_world_space_motion(params: dict) -> dict:
-    """Recenter and heading-align world-space motion without altering world Y."""
+    """Recenter, heading-align, reground, and drift-compensate world-space motion.
+
+    GVHMR's translation is calibrated for the SMPL model with estimated betas,
+    but our BVH skeleton uses fixed SMPL-X zero-betas offsets.  The pelvis-to-foot
+    distance can differ significantly (e.g. 145 cm vs 93 cm), causing the skeleton
+    to float.
+
+    Additionally, GVHMR's global translation accumulates drift over long clips
+    (the character slowly rises or sinks).  We remove the low-frequency drift
+    trend while preserving natural per-frame foot height variations (steps, jumps).
+
+    Pipeline:
+      1. Recenter X/Z at frame 0, heading-align to +Z.
+      2. Compute per-frame minimum foot Y via FK with our BVH offsets.
+      3. Heavy Gaussian smooth of that signal → drift curve.
+      4. Subtract drift from transl Y.
+      5. Final shift so global minimum foot Y = 0.
+    """
     params = activate_coordinate_space(params, "world", strict=True)
     params = dict(params)
 
@@ -720,6 +737,39 @@ def _normalize_world_space_motion(params: dict) -> dict:
     global_R = Rotation.from_rotvec(global_orient).as_matrix()
     global_R = np.einsum("ij,fjk->fik", align_R, global_R)
     global_orient = Rotation.from_matrix(global_R).as_rotvec()
+
+    # ── Compute per-frame minimum foot Y using BVH skeleton FK ──
+    n_frames = params["num_frames"]
+    temp_params = dict(params)
+    temp_params["transl"] = transl
+    temp_params["global_orient"] = global_orient
+
+    left_chain = [1, 4, 7, 10]     # L_Hip → L_Knee → L_Ankle → L_Foot
+    right_chain = [2, 5, 8, 11]    # R_Hip → R_Knee → R_Ankle → R_Foot
+
+    foot_y = np.zeros(n_frames)
+    for f in range(n_frames):
+        R_global = Rotation.from_rotvec(global_orient[f]).as_matrix()
+        l_local = _fk_chain_local(temp_params, f, left_chain)
+        r_local = _fk_chain_local(temp_params, f, right_chain)
+        l_world_y = transl[f, 1] + (R_global @ l_local)[1]
+        r_world_y = transl[f, 1] + (R_global @ r_local)[1]
+        foot_y[f] = min(l_world_y, r_world_y)
+
+    # ── Drift compensation ──
+    # Extract the slow drift trend from the foot-ground signal.
+    # Sigma scales with clip length: long enough to ignore steps/poses,
+    # short enough to track gradual drift.
+    fps = params.get("fps", 30.0)
+    sigma = max(fps * 3.0, n_frames * 0.15)
+    drift = gaussian_filter1d(foot_y, sigma=sigma, mode="nearest")
+
+    # Subtract drift from translation Y
+    transl[:, 1] -= drift
+
+    # Final global shift so absolute minimum foot Y = 0
+    foot_y_corrected = foot_y - drift
+    transl[:, 1] -= foot_y_corrected.min()
 
     normalized = dict(params)
     normalized["transl"] = transl
@@ -1383,7 +1433,8 @@ def _compute_root_from_contacts(params: dict, fps: float = 30.0) -> np.ndarray:
 _JOINT_SMOOTH_MULTIPLIER = {}
 # Body joints (indices 1-21 in body_pose, mapped to joint index - 1)
 _SPINE_HEAD_JOINTS = {2, 5, 8, 11, 14}  # Spine1(2), Spine2(5), Spine3(8), Neck(11), Head(14)
-_LIMB_JOINTS = {0, 1, 3, 4, 6, 7, 9, 10, 12, 13, 15, 16, 17, 18, 19, 20}
+_WRIST_JOINTS = {19, 20}  # L_Wrist, R_Wrist — smoothed via One Euro with hands
+_LIMB_JOINTS = {0, 1, 3, 4, 6, 7, 9, 10, 12, 13, 15, 16, 17, 18}  # no wrists
 for j in _SPINE_HEAD_JOINTS:
     _JOINT_SMOOTH_MULTIPLIER[j] = 1.5  # heavier smoothing
 for j in _LIMB_JOINTS:
@@ -1396,6 +1447,7 @@ def _smooth_rotations(
     keys: list | None = None,
     fps: float = 30.0,
     per_joint_strength: bool = True,
+    skip_joints: dict[str, set[int]] | None = None,
 ) -> dict:
     """Temporal smoothing of joint rotations via quaternion-space filtering.
 
@@ -1443,6 +1495,11 @@ def _smooth_rotations(
 
         smoothed = np.zeros_like(aa_3d)
         for j in range(n_joints):
+            # Pass through skipped joints unmodified
+            if skip_joints and key in skip_joints and j in skip_joints[key]:
+                smoothed[:, j, :] = aa_3d[:, j, :]
+                continue
+
             # Per-joint window size
             if per_joint_strength and key == "body_pose":
                 mult = _JOINT_SMOOTH_MULTIPLIER.get(j, 1.0)
@@ -1595,16 +1652,26 @@ def convert_params_to_bvh(
         adaptive_win = max(3, int(fps * 0.1 * smooth_mult) | 1)
         if adaptive_win % 2 == 0:
             adaptive_win += 1
-        params = _smooth_rotations(params, window=adaptive_win, keys=["global_orient", "body_pose"], fps=fps)
+        params = _smooth_rotations(params, window=adaptive_win, keys=["global_orient", "body_pose"], fps=fps,
+                                   skip_joints={"body_pose": _WRIST_JOINTS})
 
     # Quantize fingers to discrete curl states before temporal smoothing —
     # One Euro then cleans up transitions between quantized states
     if quantize_fingers:
         params = _quantize_finger_states(params)
 
-    # Smooth hands with One Euro (adaptive — kills jitter on held poses,
-    # preserves fast gestures)
+    # Smooth wrists + hands with One Euro (adaptive — kills jitter on held poses,
+    # preserves fast gestures). Wrists are excluded from Savgol above so they
+    # get the same responsive One Euro treatment as fingers.
     if smooth_hands:
+        wrist_data = params["body_pose"][:, [19, 20], :].copy()
+        temp = _smooth_rotations_one_euro(
+            {"_w": wrist_data}, keys=["_w"],
+            fps=fps, min_cutoff=0.5, beta=0.007,
+        )
+        params["body_pose"][:, 19, :] = temp["_w"][:, 0, :]
+        params["body_pose"][:, 20, :] = temp["_w"][:, 1, :]
+
         params = _smooth_rotations_one_euro(
             params,
             keys=["left_hand_pose", "right_hand_pose"],
