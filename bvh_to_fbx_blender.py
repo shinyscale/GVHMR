@@ -94,6 +94,8 @@ SMPLX_TO_MIXAMO = {
 }
 
 SMPLX_TO_UE5 = {
+    # Root locomotion bone
+    "Root": "root",
     # Body — UE5 Mannequin (Manny/Quinn) naming
     "Pelvis": "pelvis",
     "L_Hip": "thigh_l",

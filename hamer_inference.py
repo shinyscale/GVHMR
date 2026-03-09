@@ -16,6 +16,35 @@ import numpy as np
 import torch
 from scipy.spatial.transform import Rotation
 
+
+def _load_smplx_hand_mean():
+    """Load SMPL-X hand mean pose (15x3 axis-angle per hand).
+
+    Returns (left_mean, right_mean) numpy arrays, or (None, None) if unavailable.
+    """
+    try:
+        import smplx as _smplx
+        search_dirs = [
+            Path("F:/GVHMR/GVHMR/inputs/checkpoints/body_models"),
+            Path("F:/SMPLest-X/human_models/human_model_files"),
+            Path("/mnt/f/SMPLest-X/human_models/human_model_files"),
+            Path.home() / "human_model_files",
+        ]
+        for d in search_dirs:
+            npz = d / "smplx" / "SMPLX_NEUTRAL.npz"
+            if npz.exists():
+                model = _smplx.create(
+                    str(d), model_type="smplx", gender="neutral",
+                    use_pca=False, flat_hand_mean=False, ext="npz",
+                )
+                lh = model.left_hand_mean.detach().numpy().reshape(15, 3)
+                rh = model.right_hand_mean.detach().numpy().reshape(15, 3)
+                return lh, rh
+    except Exception:
+        pass
+    return None, None
+
+
 # ── HaMeR Setup ──
 
 HAMER_DIR = Path(__file__).parent / "third_party" / "hamer"
@@ -308,6 +337,18 @@ def run_hamer(
 
     cap.release()
     _flush_batch()
+
+    # HaMeR's MANO head outputs absolute rotations (mean pose baked in via IEF).
+    # Our BVH pipeline expects offsets-from-mean (SMPLest-X convention), with
+    # _add_hand_mean_pose() adding the mean later.  Subtract it here so all
+    # hand data enters the pipeline in the same space.
+    lh_mean, rh_mean = _load_smplx_hand_mean()
+    if lh_mean is not None:
+        for f in range(n_frames):
+            if left_conf[f] > 0:
+                left_poses[f] -= lh_mean
+            if right_conf[f] > 0:
+                right_poses[f] -= rh_mean
 
     return {
         "left_hand_pose": left_poses,

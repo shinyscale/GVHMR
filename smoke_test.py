@@ -150,6 +150,8 @@ def test_bvh_conversion():
         assert "HIERARCHY" in content, "Missing HIERARCHY"
         assert "MOTION" in content, "Missing MOTION"
         assert "Frames: 5" in content, "Wrong frame count"
+        assert "ROOT Root" in content, "Missing ROOT Root bone"
+        assert "JOINT Pelvis" in content, "Pelvis should be a JOINT, not ROOT"
     finally:
         os.unlink(path)
 

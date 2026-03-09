@@ -801,33 +801,29 @@ def _compute_ground_offset_cm() -> float:
 PELVIS_HEIGHT_CM = _compute_ground_offset_cm()
 
 
-def _build_hierarchy_string(joint_idx: int, depth: int, offsets: dict,
-                            pelvis_height_cm: float) -> str:
-    """Recursively build BVH HIERARCHY section."""
+def _build_hierarchy_string(joint_idx: int, depth: int, offsets: dict) -> str:
+    """Recursively build BVH HIERARCHY section.
+
+    All joints (including Pelvis at joint_idx==0) are emitted as JOINT nodes
+    with 3 rotation-only channels.  The Root locomotion bone is added by the
+    caller in convert_params_to_bvh().
+    """
     indent = "\t" * depth
     name = JOINT_NAMES[joint_idx]
     offset = offsets.get(name, [0.0, 0.0, 0.0])
     # Scale from meters to centimeters for BVH
     ox, oy, oz = [v * 100 for v in offset]
 
-    # Root motion now carries the pelvis position directly.
+    # Pelvis offset is zero — position comes from the Root bone above it.
     if joint_idx == 0:
         ox, oy, oz = 0.0, 0.0, 0.0
 
     children = [i for i, p in enumerate(JOINT_PARENTS) if p == joint_idx]
 
-    if joint_idx == 0:
-        lines = [f"{indent}ROOT {name}"]
-    else:
-        lines = [f"{indent}JOINT {name}"]
-
+    lines = [f"{indent}JOINT {name}"]
     lines.append(f"{indent}{{")
     lines.append(f"{indent}\tOFFSET {ox:.4f} {oy:.4f} {oz:.4f}")
-
-    if joint_idx == 0:
-        lines.append(f"{indent}\tCHANNELS 6 Xposition Yposition Zposition Zrotation Xrotation Yrotation")
-    else:
-        lines.append(f"{indent}\tCHANNELS 3 Zrotation Xrotation Yrotation")
+    lines.append(f"{indent}\tCHANNELS 3 Zrotation Xrotation Yrotation")
 
     if not children:
         if name == "Head" and "_Head_EndSite" in offsets:
@@ -844,8 +840,7 @@ def _build_hierarchy_string(joint_idx: int, depth: int, offsets: dict,
     else:
         for child in children:
             lines.extend(
-                _build_hierarchy_string(child, depth + 1, offsets,
-                                        pelvis_height_cm).split("\n"))
+                _build_hierarchy_string(child, depth + 1, offsets).split("\n"))
 
     lines.append(f"{indent}}}")
     return "\n".join(lines)
@@ -1692,8 +1687,18 @@ def convert_params_to_bvh(
 
     # Build hierarchy — use remapped offsets for DCC-compatible proportions
     bvh_offsets = _remap_offsets_for_bvh(dict(DEFAULT_OFFSETS))
-    pelvis_height_cm = _compute_ground_offset_cm()
-    hierarchy = _build_hierarchy_string(0, 0, bvh_offsets, pelvis_height_cm)
+    # Build Pelvis sub-hierarchy (all joints are JOINTs with 3 rotation channels)
+    pelvis_hierarchy = _build_hierarchy_string(0, 1, bvh_offsets)
+
+    # Wrap in a Root locomotion bone (6ch: pos + rot) that UE5 expects
+    hierarchy = (
+        "ROOT Root\n"
+        "{\n"
+        "\tOFFSET 0.0000 0.0000 0.0000\n"
+        "\tCHANNELS 6 Xposition Yposition Zposition Zrotation Xrotation Yrotation\n"
+        + pelvis_hierarchy + "\n"
+        "}"
+    )
 
     # Build motion data
     # CRITICAL: joint rotation order in MOTION must exactly match the depth-first
@@ -1706,11 +1711,12 @@ def convert_params_to_bvh(
     for frame in range(n_frames):
         values = []
 
-        # Root: 6 channels (Xpos Ypos Zpos Zrot Xrot Yrot)
+        # Root bone: 6 channels (Xpos Ypos Zpos Zrot Xrot Yrot)
+        # Translation lives on Root; rotation is always zero (pelvis owns rotation).
         tx, ty, tz = params["transl"][frame] * 100  # meters -> centimeters
-        values.extend([tx, ty, tz])
+        values.extend([tx, ty, tz, 0.0, 0.0, 0.0])
 
-        # All joints in hierarchy traversal order (root first, then depth-first)
+        # All joints in hierarchy traversal order (Pelvis first, then depth-first)
         for joint_idx in TRAVERSAL_ORDER:
             rot = _get_joint_rotation(params, frame, joint_idx)
             euler = axis_angle_to_euler_zxy(rot[np.newaxis])[0]
