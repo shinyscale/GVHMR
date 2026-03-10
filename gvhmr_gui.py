@@ -1,4 +1,4 @@
-"""Motion Capture Studio — GVHMR Body + Full Performance Capture GUI."""
+"""bodypipe — Body + Hand + Face Motion Capture GUI."""
 
 import os
 import subprocess
@@ -29,6 +29,43 @@ DEMO_SCRIPT = GVHMR_DIR / "tools" / "demo" / "demo.py"
 SMPLESTX_DIR = Path("/mnt/f/SMPLest-X")
 SMPLESTX_ENV = "smplestx"
 SMPLESTX_PYTHON = Path("/home/shinyscale/miniconda3/envs") / SMPLESTX_ENV / "bin" / "python"
+
+# ── Dark orange theme matching facepipe's visual style ──
+
+BODYPIPE_THEME = gr.themes.Default(
+    primary_hue="orange",
+    neutral_hue="slate",
+)
+
+BODYPIPE_CSS = """
+#bodypipe-header {
+    background: linear-gradient(135deg, #7C2D12 0%, #B45309 50%, #D97706 100%);
+    padding: 14px 28px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    position: relative;
+    left: 50%;
+    right: 50%;
+    margin-left: -50vw;
+    margin-right: -50vw;
+    width: 100vw;
+    margin-bottom: 16px;
+}
+"""
+
+BODYPIPE_HEADER = """
+<div id="bodypipe-header">
+    <h1 style="color:white; margin:0; font-size:1.5em; font-weight:800; letter-spacing:-0.02em;">bodypipe</h1>
+    <span style="color:rgba(255,255,255,0.85); font-size:0.85em;">Markerless Performance Capture Suite</span>
+</div>
+"""
+
+BODYPIPE_JS = """
+() => {
+    document.body.classList.add('dark');
+}
+"""
 
 # Pipeline stages for GVHMR tab
 STAGE_PATTERNS = [
@@ -787,8 +824,13 @@ def run_full_pipeline(
 
 # ── Gradio UI ──
 
-with gr.Blocks(title="Motion Capture Studio") as app:
-    gr.Markdown("# Motion Capture Studio")
+with gr.Blocks(
+    title="bodypipe",
+    theme=BODYPIPE_THEME,
+    css=BODYPIPE_CSS,
+    js=BODYPIPE_JS,
+) as app:
+    gr.HTML(BODYPIPE_HEADER)
 
     with gr.Tabs():
         # ── Tab 1: GVHMR Body ──
@@ -945,4 +987,4 @@ with gr.Blocks(title="Motion Capture Studio") as app:
 
 
 if __name__ == "__main__":
-    app.launch(server_name="0.0.0.0", server_port=7860, theme=gr.themes.Soft())
+    app.launch(server_name="0.0.0.0", server_port=7860)
