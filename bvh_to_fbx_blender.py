@@ -1,10 +1,11 @@
 """Blender Python script: import BVH, export FBX with DCC-compatible naming.
 
 Run via:
-  blender --background --python bvh_to_fbx_blender.py -- input.bvh output.fbx [--fps 30] [--naming mixamo|ue5]
+  blender --background --python bvh_to_fbx_blender.py -- input.bvh output.fbx [--fps 30] [--naming mixamo|ue5] [--target blender|maya|cascadeur|ue5]
 
 This script is executed inside Blender's Python environment.
 Bones are renamed to a standard convention so Cascadeur and other DCC tools auto-detect the rig.
+The --target flag selects axis/scale conventions for the destination DCC tool.
 """
 
 import sys
@@ -15,7 +16,7 @@ argv = sys.argv
 if "--" in argv:
     argv = argv[argv.index("--") + 1:]
 else:
-    print("Usage: blender --background --python bvh_to_fbx_blender.py -- input.bvh output.fbx [--fps 30] [--naming mixamo|ue5]")
+    print("Usage: blender --background --python bvh_to_fbx_blender.py -- input.bvh output.fbx [--fps 30] [--naming mixamo|ue5] [--target blender|maya|cascadeur|ue5]")
     sys.exit(1)
 
 bvh_path = argv[0]
@@ -32,6 +33,37 @@ if "--naming" in argv:
     naming_idx = argv.index("--naming")
     if naming_idx + 1 < len(argv):
         naming = argv[naming_idx + 1].lower()
+
+target = "cascadeur"
+if "--target" in argv:
+    target_idx = argv.index("--target")
+    if target_idx + 1 < len(argv):
+        target = argv[target_idx + 1].lower()
+
+# ── DCC target presets — axis/scale conventions ──
+
+TARGET_PRESETS = {
+    "blender": {
+        "axis_forward": '-Z', "axis_up": 'Y',
+        "primary_bone_axis": 'Y', "secondary_bone_axis": 'X',
+        "apply_scale_options": 'FBX_SCALE_NONE', "global_scale": 1.0,
+    },
+    "maya": {
+        "axis_forward": '-Z', "axis_up": 'Y',
+        "primary_bone_axis": 'Y', "secondary_bone_axis": 'X',
+        "apply_scale_options": 'FBX_SCALE_NONE', "global_scale": 1.0,
+    },
+    "cascadeur": {
+        "axis_forward": '-Z', "axis_up": 'Y',
+        "primary_bone_axis": 'Y', "secondary_bone_axis": 'X',
+        "apply_scale_options": 'FBX_SCALE_UNITS', "global_scale": 1.0,
+    },
+    "ue5": {
+        "axis_forward": 'X', "axis_up": 'Z',
+        "primary_bone_axis": 'Y', "secondary_bone_axis": 'X',
+        "apply_scale_options": 'FBX_SCALE_UNITS', "global_scale": 1.0,
+    },
+}
 
 # ── Bone naming conventions ──
 
@@ -238,8 +270,13 @@ print(f"[BVH→FBX] Frames: {bpy.context.scene.frame_start}-{bpy.context.scene.f
 print(f"[BVH→FBX] FPS: {fps}")
 print(f"[BVH→FBX] Naming: {naming}")
 
-# Export FBX — use FBX_SCALE_UNITS so the FBX file embeds the unit scale
-# (1 unit = 0.01m = 1cm). Cascadeur reads this and knows the data is in cm.
+# Resolve DCC target preset
+preset = TARGET_PRESETS.get(target, TARGET_PRESETS["cascadeur"])
+if target not in TARGET_PRESETS:
+    print(f"[BVH→FBX] WARNING: Unknown target '{target}', falling back to cascadeur")
+print(f"[BVH→FBX] Target: {target} → {preset}")
+
+# Export FBX with target-specific axis/scale settings
 bpy.ops.export_scene.fbx(
     filepath=fbx_path,
     use_selection=True,
@@ -250,12 +287,7 @@ bpy.ops.export_scene.fbx(
     bake_anim_use_nla_strips=False,
     bake_anim_use_all_actions=False,
     bake_anim_simplify_factor=0.0,  # No simplification — keep all keyframes
-    axis_forward='-Z',
-    axis_up='Y',
-    global_scale=1.0,
-    apply_scale_options='FBX_SCALE_UNITS',
-    primary_bone_axis='Y',
-    secondary_bone_axis='X',
+    **preset,
 )
 
 print(f"[BVH→FBX] Exported: {fbx_path}")
