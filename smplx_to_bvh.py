@@ -767,9 +767,10 @@ def _normalize_world_space_motion(params: dict) -> dict:
     # Subtract drift from translation Y
     transl[:, 1] -= drift
 
-    # Final global shift so absolute minimum foot Y = 0
+    # Final global shift so absolute minimum foot Y = ground clearance
     foot_y_corrected = foot_y - drift
     transl[:, 1] -= foot_y_corrected.min()
+    transl[:, 1] += GROUND_CLEARANCE_M
 
     normalized = dict(params)
     normalized["transl"] = transl
@@ -799,6 +800,11 @@ def _compute_ground_offset_cm() -> float:
 
 
 PELVIS_HEIGHT_CM = _compute_ground_offset_cm()
+
+# Ground clearance: FK places foot *joints* at Y=0, but the sole/heel mesh
+# extends below the joint center.  This lifts the skeleton so the mesh sole
+# rests on the floor instead of clipping through it.
+GROUND_CLEARANCE_M = 0.02  # 2 cm
 
 
 def _build_hierarchy_string(joint_idx: int, depth: int, offsets: dict) -> str:
@@ -1397,16 +1403,16 @@ def _compute_root_from_contacts(params: dict, fps: float = 30.0) -> np.ndarray:
     root = _propagate_root_xz(l_offset, r_offset, fulcrum_l, fulcrum_r, n,
                                adjusted_pelvis_y)
 
-    # Dynamic pelvis Y: contact foot at Y=0, preserve during airborne
+    # Dynamic pelvis Y: contact foot at Y=0 + ground clearance, preserve during airborne
     for f in range(n):
         if airborne[f]:
             # During airborne, interpolate Y from surrounding contact frames
             if f > 0:
                 root[f, 1] = root[f - 1, 1]
         elif fulcrum_l[f]:
-            root[f, 1] = -l_offset[f, 1]
+            root[f, 1] = -l_offset[f, 1] + GROUND_CLEARANCE_M
         elif fulcrum_r[f]:
-            root[f, 1] = -r_offset[f, 1]
+            root[f, 1] = -r_offset[f, 1] + GROUND_CLEARANCE_M
 
     # FPS-adaptive smoothing on X and Z
     adaptive_win = max(3, int(fps * 0.1) | 1)  # ~100ms of frames, ensure odd
@@ -1658,11 +1664,13 @@ def convert_params_to_bvh(
     # Smooth wrists + hands with One Euro (adaptive — kills jitter on held poses,
     # preserves fast gestures). Wrists are excluded from Savgol above so they
     # get the same responsive One Euro treatment as fingers.
+    # Wrists use lower min_cutoff (heavier smoothing on slow/static motion)
+    # because body-model wrist estimation is noisier than HaMeR finger data.
     if smooth_hands:
         wrist_data = params["body_pose"][:, [19, 20], :].copy()
         temp = _smooth_rotations_one_euro(
             {"_w": wrist_data}, keys=["_w"],
-            fps=fps, min_cutoff=0.5, beta=0.007,
+            fps=fps, min_cutoff=0.15, beta=0.01,
         )
         params["body_pose"][:, 19, :] = temp["_w"][:, 0, :]
         params["body_pose"][:, 20, :] = temp["_w"][:, 1, :]
@@ -1671,7 +1679,7 @@ def convert_params_to_bvh(
             params,
             keys=["left_hand_pose", "right_hand_pose"],
             fps=fps,
-            min_cutoff=0.5,
+            min_cutoff=0.3,
             beta=0.007,
         )
 

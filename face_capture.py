@@ -593,6 +593,7 @@ def render_face_mesh_video(
     head_fraction: float = 0.30,
     margin: float = 0.20,
     target_size: int = 256,
+    output_size: int = 512,
     progress_callback=None,
     vitpose_path: str | None = None,
     use_vitpose_crops: bool = False,
@@ -650,8 +651,8 @@ def render_face_mesh_video(
 
     writer = get_stream_writer(
         output_path,
-        width=frame_w,
-        height=frame_h,
+        width=output_size,
+        height=output_size,
         fps=fps,
         crf=18,
         prefer_nvenc=True,
@@ -719,39 +720,53 @@ def render_face_mesh_video(
             cy2 = int(min(frame_h, head_cy + half))
             has_crop = True
 
+        # Output canvas — zoomed face crop with mesh overlay
+        out_canvas = np.zeros((output_size, output_size, 3), dtype=np.uint8)
+
         if has_crop:
             face_crop = frame[cy1:cy2, cx1:cx2]
 
             if face_crop.size > 0:
-                # Resize to target_size for MediaPipe
-                h, w = face_crop.shape[:2]
-                scale = target_size / max(h, w)
-                new_w, new_h = int(w * scale), int(h * scale)
-                resized = cv2.resize(face_crop, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+                # Resize crop to fill output canvas (letterbox)
+                crop_h, crop_w = face_crop.shape[:2]
+                out_scale = output_size / max(crop_h, crop_w)
+                out_w, out_h = int(crop_w * out_scale), int(crop_h * out_scale)
+                out_resized = cv2.resize(face_crop, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+                out_y_off = (output_size - out_h) // 2
+                out_x_off = (output_size - out_w) // 2
+                out_canvas[out_y_off:out_y_off + out_h, out_x_off:out_x_off + out_w] = out_resized
 
-                canvas = np.zeros((target_size, target_size, 3), dtype=np.uint8)
-                y_off = (target_size - new_h) // 2
-                x_off = (target_size - new_w) // 2
-                canvas[y_off:y_off + new_h, x_off:x_off + new_w] = resized
+                # Resize to target_size for MediaPipe detection
+                mp_scale = target_size / max(crop_h, crop_w)
+                mp_w, mp_h = int(crop_w * mp_scale), int(crop_h * mp_scale)
+                mp_resized = cv2.resize(face_crop, (mp_w, mp_h), interpolation=cv2.INTER_LINEAR)
+
+                mp_canvas = np.zeros((target_size, target_size, 3), dtype=np.uint8)
+                mp_y_off = (target_size - mp_h) // 2
+                mp_x_off = (target_size - mp_w) // 2
+                mp_canvas[mp_y_off:mp_y_off + mp_h, mp_x_off:mp_x_off + mp_w] = mp_resized
 
                 # Run MediaPipe
-                rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
+                rgb = cv2.cvtColor(mp_canvas, cv2.COLOR_BGR2RGB)
                 mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
                 detection = landmarker.detect(mp_image)
 
                 if detection.face_landmarks and len(detection.face_landmarks) > 0:
                     landmarks = detection.face_landmarks[0]
 
-                    # Map landmarks from crop-normalized (0-1) to original frame pixels
+                    # Map landmarks from MediaPipe crop space to output canvas
                     pts = []
                     for lm in landmarks:
-                        # 0-1 normalized -> crop pixel space
+                        # 0-1 normalized -> MediaPipe crop pixel space
                         px = lm.x * target_size
                         py = lm.y * target_size
-                        # crop pixel space -> original frame
-                        orig_x = (px - x_off) / scale + cx1
-                        orig_y = (py - y_off) / scale + cy1
-                        pts.append((orig_x, orig_y))
+                        # MediaPipe crop -> original crop pixel space
+                        crop_x = (px - mp_x_off) / mp_scale
+                        crop_y = (py - mp_y_off) / mp_scale
+                        # Original crop -> output canvas
+                        canvas_x = crop_x * out_scale + out_x_off
+                        canvas_y = crop_y * out_scale + out_y_off
+                        pts.append((canvas_x, canvas_y))
 
                     # Draw tesselation (subtle mesh)
                     for conn in FACEMESH_TESSELATION:
@@ -759,7 +774,7 @@ def render_face_mesh_video(
                         if i1 < len(pts) and i2 < len(pts):
                             p1 = (int(pts[i1][0]), int(pts[i1][1]))
                             p2 = (int(pts[i2][0]), int(pts[i2][1]))
-                            cv2.line(frame, p1, p2, (100, 100, 100), 1, cv2.LINE_AA)
+                            cv2.line(out_canvas, p1, p2, (100, 100, 100), 1, cv2.LINE_AA)
 
                     # Draw contours (eyes, lips, brows, oval) in brighter colors
                     for conn in FACEMESH_CONTOURS:
@@ -767,7 +782,7 @@ def render_face_mesh_video(
                         if i1 < len(pts) and i2 < len(pts):
                             p1 = (int(pts[i1][0]), int(pts[i1][1]))
                             p2 = (int(pts[i2][0]), int(pts[i2][1]))
-                            cv2.line(frame, p1, p2, (0, 128, 255), 1, cv2.LINE_AA)
+                            cv2.line(out_canvas, p1, p2, (0, 128, 255), 1, cv2.LINE_AA)
 
                     # Draw iris landmarks
                     for conn in FACEMESH_IRISES:
@@ -775,15 +790,17 @@ def render_face_mesh_video(
                         if i1 < len(pts) and i2 < len(pts):
                             p1 = (int(pts[i1][0]), int(pts[i1][1]))
                             p2 = (int(pts[i2][0]), int(pts[i2][1]))
-                            cv2.line(frame, p1, p2, (0, 255, 0), 1, cv2.LINE_AA)
+                            cv2.line(out_canvas, p1, p2, (0, 255, 0), 1, cv2.LINE_AA)
 
-        # Frame number
+        # Frame number (scaled font for output_size)
+        font_scale = output_size / 800.0
         cv2.putText(
-            frame, f"F{frame_idx + 1}",
-            (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1,
+            out_canvas, f"F{frame_idx + 1}",
+            (8, int(20 * max(font_scale, 0.4) / 0.4)),
+            cv2.FONT_HERSHEY_SIMPLEX, max(font_scale, 0.4), (200, 200, 200), 1,
         )
 
-        writer.write_frame(frame)
+        writer.write_frame(out_canvas)
 
         if progress_callback and frame_idx % 30 == 0:
             total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or len(person_bboxes)

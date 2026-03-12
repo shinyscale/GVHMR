@@ -29,7 +29,7 @@ from human_models.human_models import SMPLX
 from ultralytics import YOLO
 from main.base import Tester
 from main.config import Config
-from utils.data_utils import load_img, process_bbox, generate_patch_image
+from utils.data_utils import process_bbox, generate_patch_image
 from utils.inference_utils import non_max_suppression
 
 # Lazy import — pyrender needs OpenGL which may not be available in headless WSL2
@@ -55,35 +55,36 @@ def parse_args():
     return parser.parse_args()
 
 
-def extract_frames(video_path: str, output_dir: str, fps: float = 0) -> tuple[int, float]:
-    """Extract video frames to JPGs. Returns (frame_count, actual_fps)."""
-    os.makedirs(output_dir, exist_ok=True)
+def load_frames_from_video(video_path: str, fps: float = 0) -> tuple[list[np.ndarray], int, float]:
+    """Read frames directly from video into memory. Returns (frames, count, effective_fps).
 
-    # Get native FPS if not specified
-    if fps <= 0:
-        cap = cv2.VideoCapture(video_path)
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        cap.release()
+    Replaces ffmpeg extraction + JPG disk round-trip. Handles VFR videos correctly
+    by reading every frame and subsampling if needed.
+    """
+    cap = cv2.VideoCapture(video_path)
+    native_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
 
-    cmd = [
-        "ffmpeg", "-y", "-i", video_path,
-        "-f", "image2", "-vf", f"fps={fps}/1",
-        "-qscale", "0",
-        os.path.join(output_dir, "%06d.jpg"),
-    ]
-    subprocess.run(cmd, capture_output=True, check=True)
+    # Determine subsampling step
+    if fps > 0 and abs(native_fps - fps) > 0.5:
+        step = max(1, round(native_fps / fps))
+        effective_fps = native_fps / step
+    else:
+        step = 1
+        effective_fps = native_fps
 
-    frame_count = len(list(Path(output_dir).glob("*.jpg")))
-    return frame_count, fps
-
-
-def load_all_frames(frames_dir: Path, frame_count: int) -> list[np.ndarray]:
-    """Pre-load all frames into memory."""
     frames = []
-    for i in range(1, frame_count + 1):
-        img_path = str(frames_dir / f"{i:06d}.jpg")
-        frames.append(load_img(img_path))
-    return frames
+    raw_idx = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if raw_idx % step == 0:
+            # Convert BGR → RGB and cast to float32 (matches load_img behavior)
+            frames.append(frame[:, :, ::-1].copy().astype(np.float32))
+        raw_idx += 1
+    cap.release()
+
+    return frames, len(frames), effective_fps
 
 
 def batch_yolo_detect(detector, frames: list[np.ndarray], batch_size: int, conf: float) -> list[np.ndarray | None]:
@@ -167,14 +168,13 @@ def main():
         output_dir = SMPLESTX_ROOT / "demo" / "output" / video_stem
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Extract frames
-    frames_dir = output_dir / "frames"
-    print(f"[SMPLest-X] Extracting frames from {video_path}...")
-    frame_count, fps = extract_frames(str(video_path), str(frames_dir), args.fps)
-    print(f"[SMPLest-X] Extracted {frame_count} frames at {fps:.1f} FPS")
+    # ── Phase 1: Load all frames directly from video ──
+    print(f"[SMPLest-X] Reading frames from {video_path}...")
+    frames, frame_count, fps = load_frames_from_video(str(video_path), args.fps)
+    print(f"[SMPLest-X] Loaded {frame_count} frames at {fps:.1f} FPS")
 
     if frame_count == 0:
-        print("[SMPLest-X] ERROR: No frames extracted.")
+        print("[SMPLest-X] ERROR: No frames read from video.")
         sys.exit(1)
 
     # Init config
@@ -194,7 +194,11 @@ def main():
     cfg.update_config(new_config)
     cfg.prepare_log()
 
-    # Init human model
+    # Init human model — resolve relative path against SMPLest-X root
+    hm_path = Path(cfg.model.human_model_path)
+    if not hm_path.is_absolute():
+        hm_path = (SMPLESTX_ROOT / hm_path).resolve()
+    cfg.model.human_model_path = str(hm_path)
     smpl_x = SMPLX(cfg.model.human_model_path)
 
     # Init model
@@ -207,11 +211,6 @@ def main():
     detector = YOLO(bbox_model)
 
     transform = transforms.ToTensor()
-
-    # ── Phase 1: Load all frames into memory ──
-    print(f"[SMPLest-X] Loading {frame_count} frames into memory...")
-    frames = load_all_frames(frames_dir, frame_count)
-    print(f"[SMPLest-X] Frames loaded ({len(frames)} frames)")
 
     # ── Phase 2: Batch YOLO detection ──
     det_conf = getattr(cfg.inference.detection, "conf", 0.5)
