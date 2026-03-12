@@ -23,8 +23,9 @@ from smplx_to_bvh import (
 from hamer_inference import run_hamer, merge_gvhmr_hamer_params
 from bvh_to_fbx import convert_bvh_to_fbx
 from visualize_skeleton import render_skeleton_video, render_world_views, render_hand_overlay_video
+from multi_person_split import split_multi_person_video, MultiPersonResult
 
-GVHMR_DIR = Path("/mnt/f/GVHMR/GVHMR")
+GVHMR_DIR = Path(__file__).resolve().parent
 DEMO_SCRIPT = GVHMR_DIR / "tools" / "demo" / "demo.py"
 SMPLESTX_DIR = Path("/mnt/f/SMPLest-X")
 SMPLESTX_ENV = "smplestx"
@@ -822,6 +823,107 @@ def run_full_pipeline(
     return skeleton_video, face_mesh_video, world_view_video, hand_overlay_video, bvh_path, fbx_path, face_csv_path, pt_path, full_log
 
 
+# ── Multi-Person Pipeline ──
+
+def run_multi_person_pipeline(
+    video_upload,
+    video_path_text: str,
+    target_fps: str,
+    fbx_naming: str,
+    multi_static_cam: bool,
+    multi_use_dpvo: bool,
+    max_persons: int,
+    progress=gr.Progress(track_tqdm=False),
+):
+    """Run the multi-person capture pipeline."""
+
+    source_video_path = resolve_video_path(video_upload, video_path_text)
+    log_lines = []
+
+    # Parse FPS
+    try:
+        fps = float(target_fps.strip()) if target_fps and target_fps.strip() else 30.0
+    except ValueError:
+        fps = 30.0
+
+    source_stem = Path(source_video_path).stem
+
+    # Preprocess
+    progress(0.02, desc="Preprocessing video...")
+    video_path, preprocess_msg = preprocess_video(
+        source_video_path,
+        output_dir=str(GVHMR_DIR / "outputs" / "multi_person" / source_stem / "preprocess"),
+        target_fps=fps if fps > 0 else None,
+    )
+    log_lines.append(f"[Preprocess] {preprocess_msg}")
+
+    output_dir = GVHMR_DIR / "outputs" / "multi_person" / source_stem
+
+    def mp_progress(frac, msg):
+        progress(0.05 + frac * 0.85, desc=msg)
+        log_lines.append(f"[MultiPerson] {msg}")
+
+    try:
+        result = split_multi_person_video(
+            video_path=video_path,
+            output_dir=str(output_dir),
+            min_track_duration=30,
+            static_cam=multi_static_cam,
+            use_dpvo=multi_use_dpvo,
+            max_persons=int(max_persons) if max_persons else 0,
+            progress_callback=mp_progress,
+        )
+    except Exception as e:
+        import traceback
+        log_lines.append(f"[MultiPerson] ERROR: {e}")
+        log_lines.append(traceback.format_exc())
+        full_log = "\n".join(log_lines)
+        return None, None, 0, None, None, None, full_log
+
+    # Collect outputs
+    track_viz = None
+    detection_dir = output_dir / "detection"
+    track_viz_path = detection_dir / "track_visualization.mp4"
+    if track_viz_path.exists():
+        track_viz = str(track_viz_path)
+
+    scene_preview = None
+    assembly_dir = output_dir / "assembly"
+    scene_preview_path = assembly_dir / "scene_preview.mp4"
+    if scene_preview_path.exists():
+        scene_preview = str(scene_preview_path)
+
+    # Collect per-person BVH/FBX files
+    bvh_files = []
+    fbx_files = []
+    for person_dir in result.person_dirs:
+        person_dir = Path(person_dir)
+        bvh = list(person_dir.rglob("*.bvh"))
+        fbx = list(person_dir.rglob("*.fbx"))
+        if bvh:
+            bvh_files.append(str(bvh[0]))
+        if fbx:
+            fbx_files.append(str(fbx[0]))
+
+    manifest_path = output_dir / "session_manifest.json"
+    manifest = str(manifest_path) if manifest_path.exists() else None
+
+    progress(1.0, desc=f"Complete! {result.num_persons} people processed.")
+    log_lines.append(f"\n[Done] {result.num_persons} people processed.")
+    log_lines.append(f"  Output: {output_dir}")
+    full_log = "\n".join(log_lines)
+
+    return (
+        track_viz,
+        scene_preview,
+        result.num_persons,
+        bvh_files if bvh_files else None,
+        fbx_files if fbx_files else None,
+        manifest,
+        full_log,
+    )
+
+
 # ── Gradio UI ──
 
 with gr.Blocks(
@@ -983,6 +1085,88 @@ with gr.Blocks(
                     hand_source, body_smooth_preset,
                 ],
                 outputs=[skeleton_preview, face_mesh_preview, world_view_preview, hand_overlay_preview, bvh_download, fbx_download, face_csv_download, smplx_pt_download, perf_log],
+            )
+
+        # ── Tab 3: Multi-Person Capture ──
+        with gr.TabItem("Multi-Person"):
+            gr.Markdown(
+                "**Multi-Person Motion Capture** from a single monocular video.\n\n"
+                "Detects and tracks N people, isolates each into a clean single-person video "
+                "(using segmentation + inpainting when people overlap), then runs the full "
+                "pipeline per person. Results are assembled in shared world coordinates.\n\n"
+                "Requires: `segment-anything-2` (SAM2), `ProPainter` (optional, for occlusion handling)."
+            )
+
+            with gr.Row():
+                with gr.Column(scale=1):
+                    mp_video_upload = gr.Video(label="Upload Video", sources=["upload"])
+                    mp_video_path = gr.Textbox(
+                        label="Or enter WSL2 file path",
+                        placeholder="/mnt/f/Videos/two_people_scene.mp4",
+                    )
+
+                with gr.Column(scale=1):
+                    with gr.Row():
+                        mp_static_cam = gr.Checkbox(
+                            label="Static Camera", value=False,
+                            info="Check if camera is fixed/tripod",
+                        )
+                        mp_use_dpvo = gr.Checkbox(
+                            label="Use DPVO", value=False,
+                            info="Better camera estimation, slower",
+                        )
+                    mp_max_persons = gr.Number(
+                        label="Max Persons (0 = all)",
+                        value=0,
+                        precision=0,
+                        info="Limit to N largest people by bbox area",
+                    )
+                    mp_fps = gr.Textbox(
+                        label="Target FPS",
+                        value="30",
+                        placeholder="30",
+                    )
+                    mp_fbx_naming = gr.Dropdown(
+                        label="FBX Bone Naming",
+                        choices=["Mixamo (Cascadeur)", "UE5 Mannequin"],
+                        value="Mixamo (Cascadeur)",
+                    )
+                    mp_run_btn = gr.Button(
+                        "Run Multi-Person Pipeline",
+                        variant="primary",
+                        size="lg",
+                    )
+
+            gr.Markdown("### Detection & Tracking")
+            with gr.Row():
+                mp_track_viz = gr.Video(label="Track Visualization")
+                mp_person_count = gr.Number(label="People Detected", precision=0)
+
+            gr.Markdown("### Results")
+            with gr.Row():
+                mp_scene_preview = gr.Video(label="Scene Preview")
+
+            with gr.Row():
+                mp_bvh_downloads = gr.File(label="Per-Person BVH Files", file_count="multiple")
+                mp_fbx_downloads = gr.File(label="Per-Person FBX Files", file_count="multiple")
+                mp_manifest = gr.File(label="Session Manifest")
+
+            with gr.Accordion("Pipeline Log", open=False):
+                mp_log = gr.Textbox(
+                    label="Log Output", lines=25, max_lines=100,
+                    interactive=False,
+                )
+
+            mp_run_btn.click(
+                fn=run_multi_person_pipeline,
+                inputs=[
+                    mp_video_upload, mp_video_path, mp_fps, mp_fbx_naming,
+                    mp_static_cam, mp_use_dpvo, mp_max_persons,
+                ],
+                outputs=[
+                    mp_track_viz, mp_scene_preview, mp_person_count,
+                    mp_bvh_downloads, mp_fbx_downloads, mp_manifest, mp_log,
+                ],
             )
 
 

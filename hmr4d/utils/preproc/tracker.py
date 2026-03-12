@@ -93,3 +93,74 @@ class Tracker:
         bbx_xyxy_one_track = moving_average_smooth(bbx_xyxy_one_track, window_size=5, dim=0)
 
         return bbx_xyxy_one_track
+
+    @staticmethod
+    def _interpolate_and_smooth(frame_ids_list, bbx_xyxys_np, total_frames):
+        """Interpolate missing frames and smooth a single track's bboxes.
+
+        Same processing as get_one_track but factored out for reuse.
+        Returns (bbx_xyxy_track, detection_mask) where bbx_xyxy_track is (F, 4)
+        and detection_mask is (F,) bool indicating real vs interpolated frames.
+        """
+        frame_ids = torch.tensor(frame_ids_list)
+        bbx_xyxys = torch.tensor(bbx_xyxys_np)
+
+        mask = frame_id_to_mask(frame_ids, total_frames)
+        bbx_xyxy_track = rearrange_by_mask(bbx_xyxys, mask)
+        missing_frame_id_list = get_frame_id_list_from_mask(~mask)
+        bbx_xyxy_track = linear_interpolate_frame_ids(bbx_xyxy_track, missing_frame_id_list)
+
+        # For tracks that don't span the full video, some leading/trailing frames
+        # may still be zero. Clamp them to the nearest valid bbox.
+        nonzero = bbx_xyxy_track.sum(1) != 0
+        if nonzero.any() and not nonzero.all():
+            first_valid = nonzero.nonzero(as_tuple=True)[0][0].item()
+            last_valid = nonzero.nonzero(as_tuple=True)[0][-1].item()
+            if first_valid > 0:
+                bbx_xyxy_track[:first_valid] = bbx_xyxy_track[first_valid]
+            if last_valid < total_frames - 1:
+                bbx_xyxy_track[last_valid + 1:] = bbx_xyxy_track[last_valid]
+
+        bbx_xyxy_track = moving_average_smooth(bbx_xyxy_track, window_size=5, dim=0)
+        bbx_xyxy_track = moving_average_smooth(bbx_xyxy_track, window_size=5, dim=0)
+
+        return bbx_xyxy_track, mask
+
+    def get_all_tracks(self, video_path, min_track_frames=30):
+        """Track all people and return interpolated/smoothed bboxes for each.
+
+        Args:
+            video_path: Path to input video.
+            min_track_frames: Minimum number of detected frames to keep a track.
+
+        Returns:
+            list of dicts, sorted by area (largest first). Each dict has:
+                - track_id: int
+                - bbx_xyxy: Tensor (F, 4) — interpolated & smoothed, full video length
+                - detection_mask: Tensor (F,) bool — True for frames with real detections
+        """
+        track_history = self.track(video_path)
+        total_frames = get_video_lwh(video_path)[0]
+
+        id_to_frame_ids, id_to_bbx_xyxys, id_sorted = self.sort_track_length(
+            track_history, video_path
+        )
+
+        results = []
+        for track_id in id_sorted:
+            if len(id_to_frame_ids[track_id]) < min_track_frames:
+                continue
+
+            bbx_xyxy_track, det_mask = self._interpolate_and_smooth(
+                id_to_frame_ids[track_id],
+                id_to_bbx_xyxys[track_id],
+                total_frames,
+            )
+
+            results.append({
+                "track_id": track_id,
+                "bbx_xyxy": bbx_xyxy_track.float(),
+                "detection_mask": det_mask,
+            })
+
+        return results

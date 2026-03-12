@@ -52,6 +52,12 @@ def parse_args_to_cfg():
         "If the camera zoom in a lot, you can try 135, 200 or even larger values.",
     )
     parser.add_argument("--verbose", action="store_true", help="If true, draw intermediate results")
+    parser.add_argument(
+        "--slam_override",
+        type=str,
+        default=None,
+        help="Path to pre-computed SLAM results (.pt). Skips SLAM computation when provided.",
+    )
     args = parser.parse_args()
 
     # Input
@@ -81,6 +87,12 @@ def parse_args_to_cfg():
     Log.info(f"[Output Dir]: {cfg.output_dir}")
     Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
     Path(cfg.preprocess_dir).mkdir(parents=True, exist_ok=True)
+
+    # Attach slam_override as a runtime attribute (not in Hydra schema)
+    from omegaconf import OmegaConf
+    OmegaConf.set_struct(cfg, False)
+    cfg.slam_override = args.slam_override
+    OmegaConf.set_struct(cfg, True)
 
     # Copy raw-input-video to video_path
     Log.info(f"[Copy Video] {video_path} -> {cfg.video_path}")
@@ -144,8 +156,15 @@ def run_preprocess(cfg):
         Log.info(f"[Preprocess] vit_features from {paths.vit_features}")
 
     # Get visual odometry results
+    slam_override = getattr(cfg, "slam_override", None)
     if not static_cam:  # use slam to get cam rotation
-        if not Path(paths.slam).exists():
+        if slam_override and Path(slam_override).exists():
+            # Use pre-computed SLAM from multi-person shared pass
+            import shutil
+            if str(Path(slam_override).resolve()) != str(Path(paths.slam).resolve()):
+                shutil.copy2(slam_override, paths.slam)
+            Log.info(f"[Preprocess] slam override from {slam_override}")
+        elif not Path(paths.slam).exists():
             if not cfg.use_dpvo:
                 simple_vo = SimpleVO(cfg.video_path, scale=0.5, step=8, method="sift", f_mm=cfg.f_mm)
                 vo_results = simple_vo.compute()  # (L, 4, 4), numpy
