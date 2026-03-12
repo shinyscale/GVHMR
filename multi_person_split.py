@@ -33,6 +33,8 @@ class MultiPersonResult:
     masks: dict = field(default_factory=dict)
     num_persons: int = 0
     output_dir: str = ""
+    identity_tracks: list = field(default_factory=list)  # IdentityTrack per person
+    bridging_summaries: list = field(default_factory=list)
 
 
 def compute_shared_slam(
@@ -417,6 +419,104 @@ def split_multi_person_video(
                 f"Person {i} GVHMR FAILED",
             )
 
+    # ── Step 5.5: Identity verification & occlusion bridging ──
+    _progress(0.82, "Running identity verification...")
+
+    try:
+        from identity_confidence import compute_all_confidences, confidence_to_array, export_confidence_csv
+        from identity_tracking import IdentityTrack, auto_generate_keyframes
+        from identity_reid import ShapeReIdentifier
+        from identity_bridge import OcclusionBridge, summarize_bridging
+        from smplx_to_bvh import extract_gvhmr_params
+
+        identity_tracks = []
+        bridging_summaries = []
+
+        for i, person_dir in enumerate(person_dirs):
+            if i >= len(all_tracks):
+                break
+
+            track = all_tracks[i]
+            tid = track["track_id"]
+
+            # Load GVHMR results for this person
+            pt_files = list(person_dir.rglob("hmr4d_results.pt"))
+            if not pt_files:
+                continue
+
+            params = extract_gvhmr_params(str(pt_files[0]))
+            per_frame_betas = params["betas"]  # (N, 10)
+            num_person_frames = params["num_frames"]
+
+            # Compute confidence scores
+            confidences = compute_all_confidences(
+                track_idx=i,
+                all_tracks=all_tracks,
+                num_frames=num_person_frames,
+                per_frame_betas=per_frame_betas,
+            )
+
+            # Create identity track and auto-generate keyframes
+            id_track = IdentityTrack(person_id=tid)
+            bboxes = track["bbx_xyxy"].numpy() if hasattr(track["bbx_xyxy"], "numpy") else track["bbx_xyxy"]
+            bboxes = bboxes[:num_person_frames]
+
+            auto_generate_keyframes(
+                track=id_track,
+                confidences=confidences,
+                per_frame_betas=per_frame_betas,
+                per_frame_bboxes=bboxes,
+                per_frame_poses=params.get("body_pose", params.get("body_pose_world")),
+            )
+            id_track.establish_identity()
+
+            # Bridge low-confidence spans
+            bridge = OcclusionBridge(id_track)
+            body_pose = params.get("body_pose_world", params.get("body_pose"))
+            global_orient = params.get("global_orient_world", params.get("global_orient"))
+            transl = params.get("transl_world", params.get("transl"))
+
+            if body_pose is not None and global_orient is not None and transl is not None:
+                bridge_result = bridge.bake(body_pose, global_orient, transl, confidences)
+                bridged_frames = bridge_result["bridged_frames"]
+                summary = summarize_bridging(confidences, bridged_frames)
+                bridging_summaries.append(summary)
+
+                _progress(0.82 + i / max(len(person_dirs), 1) * 0.03,
+                          f"Person {i}: {summary['bridged_frames']} frames bridged, "
+                          f"mean conf {summary['confidence_mean']:.2f}")
+            else:
+                bridged_frames = set()
+                bridging_summaries.append({})
+
+            # Save identity track and confidence CSV
+            id_track.save_json(person_dir / "identity_track.json")
+            export_confidence_csv(
+                confidences, tid,
+                str(person_dir / "confidence.csv"),
+                bridged_frames=bridged_frames,
+            )
+
+            identity_tracks.append(id_track)
+
+        result.identity_tracks = identity_tracks
+        result.bridging_summaries = bridging_summaries
+
+        # Shape re-identification (detect swaps)
+        if len(identity_tracks) >= 2:
+            reid = ShapeReIdentifier(identity_tracks)
+            per_person_mean_betas = {
+                t.person_id: t.established_betas
+                for t in identity_tracks
+                if t.established_betas is not None
+            }
+            swaps = reid.detect_swap(0, per_person_mean_betas)
+            if swaps:
+                _progress(0.84, f"WARNING: Possible identity swaps detected: {swaps}")
+
+    except Exception as e:
+        _progress(0.84, f"Identity verification skipped: {e}")
+
     # ── Step 6: World-space assembly ──
     _progress(0.85, "Assembling world-space results...")
 
@@ -446,6 +546,220 @@ def split_multi_person_video(
     )
 
     _progress(1.0, f"Multi-person pipeline complete. {result.num_persons} people processed.")
+
+    return result
+
+
+def reprocess_person(
+    video_path: str,
+    person_index: int,
+    person_dir: str,
+    updated_bboxes: np.ndarray,
+    all_tracks: list[dict],
+    slam_path: str,
+    masks_dir: str,
+    static_cam: bool = False,
+    use_dpvo: bool = False,
+    progress_callback=None,
+) -> dict:
+    """Re-run isolation + GVHMR for a single person after bbox corrections.
+
+    Caches shared SLAM and SAM2 masks. Only re-runs isolation + pipeline.
+
+    Returns dict with keys: identity_track, confidences, pt_path (or empty on failure).
+    """
+    person_dir = Path(person_dir)
+    person_dir.mkdir(parents=True, exist_ok=True)
+
+    track = all_tracks[person_index]
+    tid = track.get("track_id", person_index)
+
+    # 1. Update track bboxes in-place
+    track["bbx_xyxy"] = torch.from_numpy(updated_bboxes)
+
+    # 2. Delete stale outputs
+    isolated_video = person_dir / "isolated_video.mp4"
+    demo_dir = person_dir / "demo"
+    if isolated_video.exists():
+        isolated_video.unlink()
+    if demo_dir.exists():
+        shutil.rmtree(str(demo_dir))
+
+    # 3. Re-isolate person
+    if progress_callback:
+        progress_callback(0.1, f"Re-isolating person {person_index}...")
+
+    masks = {}
+    masks_dir_path = Path(masks_dir)
+    mask_file = masks_dir_path / f"person_{tid}_masks.npz"
+    if mask_file.exists():
+        mask_data = np.load(str(mask_file))
+        masks[tid] = mask_data["masks"]
+
+    if len(all_tracks) == 1:
+        shutil.copy2(video_path, str(isolated_video))
+    elif masks:
+        try:
+            from propainter_inpaint import isolate_person
+
+            isolate_person(
+                video_path=video_path,
+                target_person_id=tid,
+                target_track_bboxes=updated_bboxes,
+                all_masks=masks,
+                output_path=str(isolated_video),
+            )
+        except ImportError:
+            _crop_person_video(video_path, updated_bboxes, str(isolated_video))
+    else:
+        _crop_person_video(video_path, updated_bboxes, str(isolated_video))
+
+    if not isolated_video.exists():
+        return {}
+
+    # 4. Re-run GVHMR pipeline
+    if progress_callback:
+        progress_callback(0.4, f"Running GVHMR for person {person_index}...")
+
+    pt_path, _ = run_person_pipeline(
+        video_path=str(isolated_video),
+        person_id=tid,
+        output_dir=person_dir,
+        slam_override_path=slam_path if not static_cam else None,
+        static_cam=static_cam,
+        use_dpvo=use_dpvo,
+    )
+
+    if pt_path is None:
+        return {}
+
+    # 5. Re-compute confidence & identity
+    if progress_callback:
+        progress_callback(0.8, f"Verifying person {person_index}...")
+
+    result = {"pt_path": pt_path}
+
+    try:
+        from identity_confidence import compute_all_confidences, export_confidence_csv
+        from identity_tracking import IdentityTrack, auto_generate_keyframes
+        from identity_bridge import OcclusionBridge, summarize_bridging
+        from smplx_to_bvh import extract_gvhmr_params
+
+        params = extract_gvhmr_params(pt_path)
+        per_frame_betas = params["betas"]
+        num_person_frames = params["num_frames"]
+
+        confidences = compute_all_confidences(
+            track_idx=person_index,
+            all_tracks=all_tracks,
+            num_frames=num_person_frames,
+            per_frame_betas=per_frame_betas,
+        )
+
+        id_track = IdentityTrack(person_id=tid)
+        bboxes = updated_bboxes[:num_person_frames]
+
+        auto_generate_keyframes(
+            track=id_track,
+            confidences=confidences,
+            per_frame_betas=per_frame_betas,
+            per_frame_bboxes=bboxes,
+            per_frame_poses=params.get("body_pose", params.get("body_pose_world")),
+        )
+        id_track.establish_identity()
+
+        # Bridge low-confidence spans
+        bridge = OcclusionBridge(id_track)
+        body_pose = params.get("body_pose_world", params.get("body_pose"))
+        global_orient = params.get("global_orient_world", params.get("global_orient"))
+        transl = params.get("transl_world", params.get("transl"))
+
+        bridged_frames = set()
+        if body_pose is not None and global_orient is not None and transl is not None:
+            bridge_result = bridge.bake(body_pose, global_orient, transl, confidences)
+            bridged_frames = bridge_result["bridged_frames"]
+
+        # Save
+        id_track.save_json(person_dir / "identity_track.json")
+        export_confidence_csv(
+            confidences, tid,
+            str(person_dir / "confidence.csv"),
+            bridged_frames=bridged_frames,
+        )
+
+        result["identity_track"] = id_track
+        result["confidences"] = confidences
+
+    except Exception as e:
+        print(f"[reprocess_person] Identity verification failed for person {person_index}: {e}")
+
+    if progress_callback:
+        progress_callback(1.0, f"Person {person_index} reprocess complete")
+
+    return result
+
+
+def interpolate_bbox_corrections(
+    original_bboxes: np.ndarray,
+    corrections: dict[int, np.ndarray],
+) -> np.ndarray:
+    """Interpolate bbox corrections between edited keyframes.
+
+    Between two corrected frames, linearly interpolates the delta from original.
+    Before first / after last correction: constant extrapolation of nearest delta.
+
+    Args:
+        original_bboxes: (N, 4) original bbox array.
+        corrections: sparse {frame_idx: np.array([x1,y1,x2,y2])} of overrides.
+
+    Returns:
+        (N, 4) array with interpolated corrections applied.
+    """
+    result = original_bboxes.copy()
+    if not corrections:
+        return result
+
+    sorted_frames = sorted(corrections.keys())
+
+    # Compute deltas at correction frames
+    deltas = {}
+    for f in sorted_frames:
+        if f < len(original_bboxes):
+            deltas[f] = corrections[f] - original_bboxes[f]
+
+    if not deltas:
+        return result
+
+    sorted_frames = [f for f in sorted_frames if f in deltas]
+    if not sorted_frames:
+        return result
+
+    # Before first correction: constant extrapolation
+    first_f = sorted_frames[0]
+    first_delta = deltas[first_f]
+    for f in range(first_f):
+        result[f] = original_bboxes[f] + first_delta
+
+    # At correction frames: apply directly
+    for f in sorted_frames:
+        result[f] = corrections[f]
+
+    # Between corrections: linear interpolation of delta
+    for i in range(len(sorted_frames) - 1):
+        f_a = sorted_frames[i]
+        f_b = sorted_frames[i + 1]
+        delta_a = deltas[f_a]
+        delta_b = deltas[f_b]
+        span = f_b - f_a
+        for f in range(f_a + 1, f_b):
+            t = (f - f_a) / span
+            result[f] = original_bboxes[f] + (1 - t) * delta_a + t * delta_b
+
+    # After last correction: constant extrapolation
+    last_f = sorted_frames[-1]
+    last_delta = deltas[last_f]
+    for f in range(last_f + 1, len(original_bboxes)):
+        result[f] = original_bboxes[f] + last_delta
 
     return result
 

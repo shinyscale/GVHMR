@@ -24,6 +24,7 @@ from hamer_inference import run_hamer, merge_gvhmr_hamer_params
 from bvh_to_fbx import convert_bvh_to_fbx
 from visualize_skeleton import render_skeleton_video, render_world_views, render_hand_overlay_video
 from multi_person_split import split_multi_person_video, MultiPersonResult
+from identity_panel import build_identity_panel, init_panel_state, populate_panel
 
 GVHMR_DIR = Path(__file__).resolve().parent
 DEMO_SCRIPT = GVHMR_DIR / "tools" / "demo" / "demo.py"
@@ -39,6 +40,10 @@ BODYPIPE_THEME = gr.themes.Default(
 )
 
 BODYPIPE_CSS = """
+.gradio-container {
+    padding-top: 0 !important;
+    margin-top: 0 !important;
+}
 #bodypipe-header {
     background: linear-gradient(135deg, #7C2D12 0%, #B45309 50%, #D97706 100%);
     padding: 14px 28px;
@@ -51,14 +56,15 @@ BODYPIPE_CSS = """
     margin-left: -50vw;
     margin-right: -50vw;
     width: 100vw;
+    margin-top: calc(-1 * var(--layout-gap, 16px));
     margin-bottom: 16px;
 }
 """
 
 BODYPIPE_HEADER = """
 <div id="bodypipe-header">
-    <h1 style="color:white; margin:0; font-size:1.5em; font-weight:800; letter-spacing:-0.02em;">bodypipe</h1>
-    <span style="color:rgba(255,255,255,0.85); font-size:0.85em;">Markerless Performance Capture Suite</span>
+    <h1 style="color:white; margin:0; font-size:24px; font-weight:700; font-family:Roboto,Inter,system-ui,sans-serif;">bodypipe</h1>
+    <span style="color:rgba(255,255,255,0.70); font-size:14px; font-family:Roboto,Inter,system-ui,sans-serif;">Markerless Performance Capture Suite</span>
 </div>
 """
 
@@ -878,7 +884,7 @@ def run_multi_person_pipeline(
         log_lines.append(f"[MultiPerson] ERROR: {e}")
         log_lines.append(traceback.format_exc())
         full_log = "\n".join(log_lines)
-        return None, None, 0, None, None, None, full_log
+        return None, None, 0, None, None, None, None, None, full_log
 
     # Collect outputs
     track_viz = None
@@ -908,6 +914,33 @@ def run_multi_person_pipeline(
     manifest_path = output_dir / "session_manifest.json"
     manifest = str(manifest_path) if manifest_path.exists() else None
 
+    # Collect confidence CSVs
+    confidence_csv_files = []
+    for i, person_dir in enumerate(result.person_dirs):
+        person_dir = Path(person_dir)
+        csv_path = person_dir / "confidence.csv"
+        if csv_path.exists():
+            confidence_csv_files.append(str(csv_path))
+
+    # Initialize identity panel state
+    panel_state_dict = None
+    if result.identity_tracks:
+        try:
+            panel_state_dict = init_panel_state(
+                video_path=video_path,
+                identity_tracks=result.identity_tracks,
+                all_tracks=result.all_tracks,
+                person_dirs=result.person_dirs,
+                fps=fps if fps > 0 else 30.0,
+                output_dir=str(output_dir),
+                pipeline_params={
+                    "static_cam": multi_static_cam,
+                    "use_dpvo": multi_use_dpvo,
+                },
+            )
+        except Exception as e:
+            log_lines.append(f"[Identity Panel] Init warning: {e}")
+
     progress(1.0, desc=f"Complete! {result.num_persons} people processed.")
     log_lines.append(f"\n[Done] {result.num_persons} people processed.")
     log_lines.append(f"  Output: {output_dir}")
@@ -920,6 +953,8 @@ def run_multi_person_pipeline(
         bvh_files if bvh_files else None,
         fbx_files if fbx_files else None,
         manifest,
+        panel_state_dict,
+        confidence_csv_files if confidence_csv_files else None,
         full_log,
     )
 
@@ -1151,6 +1186,18 @@ with gr.Blocks(
                 mp_fbx_downloads = gr.File(label="Per-Person FBX Files", file_count="multiple")
                 mp_manifest = gr.File(label="Session Manifest")
 
+            gr.Markdown(
+                "*Use the **Pose Corrector** inside Identity Inspector below to fix bad poses "
+                "and re-export corrected BVH/FBX.*"
+            )
+
+            with gr.Accordion("Identity Inspector", open=False) as id_inspector_accordion:
+                id_panel = build_identity_panel()
+                mp_confidence_files = gr.File(
+                    label="Confidence CSVs",
+                    file_count="multiple",
+                )
+
             with gr.Accordion("Pipeline Log", open=False):
                 mp_log = gr.Textbox(
                     label="Log Output", lines=25, max_lines=100,
@@ -1165,7 +1212,25 @@ with gr.Blocks(
                 ],
                 outputs=[
                     mp_track_viz, mp_scene_preview, mp_person_count,
-                    mp_bvh_downloads, mp_fbx_downloads, mp_manifest, mp_log,
+                    mp_bvh_downloads, mp_fbx_downloads, mp_manifest,
+                    id_panel["state"], mp_confidence_files, mp_log,
+                ],
+            ).then(
+                fn=populate_panel,
+                inputs=[id_panel["state"]],
+                outputs=[
+                    id_panel["state"],
+                    id_panel["person_dropdown"],
+                    id_panel["swap_target"],
+                    id_panel["frame_slider"],
+                    id_panel["frame_label"],
+                    # display_outputs (9 components from update_frame_display):
+                    id_panel["frame_image"],
+                    id_panel["conf_detection"], id_panel["conf_visibility"],
+                    id_panel["conf_overlap"], id_panel["conf_shape"],
+                    id_panel["conf_motion"], id_panel["conf_overall"],
+                    id_panel["confidence_plot"],
+                    id_panel["kf_dataframe"],
                 ],
             )
 

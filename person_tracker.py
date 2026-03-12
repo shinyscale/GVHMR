@@ -153,7 +153,8 @@ class PersonTracker:
             if online_targets is not None and len(online_targets) > 0:
                 for t in online_targets:
                     frame_detections.append(
-                        {"id": int(t[4]), "bbx_xyxy": t[:4].astype(np.float32)}
+                        {"id": int(t[4]), "bbx_xyxy": t[:4].astype(np.float32),
+                         "conf": float(t[5]) if len(t) > 5 else 1.0}
                     )
             track_history.append(frame_detections)
 
@@ -175,8 +176,9 @@ class PersonTracker:
             if result.boxes.id is not None:
                 track_ids = result.boxes.id.int().cpu().tolist()
                 bbx_xyxy = result.boxes.xyxy.cpu().numpy()
+                confs = result.boxes.conf.cpu().tolist()
                 frame_detections = [
-                    {"id": track_ids[i], "bbx_xyxy": bbx_xyxy[i]}
+                    {"id": track_ids[i], "bbx_xyxy": bbx_xyxy[i], "conf": confs[i]}
                     for i in range(len(track_ids))
                 ]
             else:
@@ -193,18 +195,20 @@ class PersonTracker:
     @staticmethod
     def _parse_track_history(
         track_history: list[list[dict]],
-    ) -> tuple[dict[int, list[int]], dict[int, np.ndarray]]:
+    ) -> tuple[dict[int, list[int]], dict[int, np.ndarray], dict[int, list[float]]]:
         id_to_frame_ids: dict[int, list[int]] = defaultdict(list)
         id_to_bbx_lists: dict[int, list[np.ndarray]] = defaultdict(list)
+        id_to_conf_lists: dict[int, list[float]] = defaultdict(list)
 
         for frame_id, frame in enumerate(track_history):
             for det in frame:
                 tid = det["id"]
                 id_to_frame_ids[tid].append(frame_id)
                 id_to_bbx_lists[tid].append(det["bbx_xyxy"])
+                id_to_conf_lists[tid].append(det.get("conf", 1.0))
 
         id_to_bbx_xyxys = {tid: np.array(bboxes) for tid, bboxes in id_to_bbx_lists.items()}
-        return id_to_frame_ids, id_to_bbx_xyxys
+        return id_to_frame_ids, id_to_bbx_xyxys, id_to_conf_lists
 
     @staticmethod
     def _sort_ids_by_area(
@@ -273,7 +277,7 @@ class PersonTracker:
 
         num_frames, video_w, video_h = get_video_lwh(video_path)
         track_history = self._raw_track(video_path)
-        id_to_frame_ids, id_to_bbx_xyxys = self._parse_track_history(track_history)
+        id_to_frame_ids, id_to_bbx_xyxys, id_to_confs = self._parse_track_history(track_history)
         sorted_ids = self._sort_ids_by_area(id_to_bbx_xyxys, video_w, video_h)
 
         tracks = []
@@ -284,10 +288,17 @@ class PersonTracker:
             if result is None:
                 continue
             bbx_xyxy, frame_mask = result
+
+            # Build per-frame detection confidence (0.0 for interpolated frames)
+            det_conf = torch.zeros(num_frames, dtype=torch.float32)
+            for fi, c in zip(id_to_frame_ids[tid], id_to_confs[tid]):
+                det_conf[fi] = c
+
             tracks.append({
                 "track_id": tid,
                 "bbx_xyxy": bbx_xyxy.float(),
                 "detection_mask": frame_mask,
+                "detection_conf": det_conf,
             })
 
         if min_track_frames is not None:

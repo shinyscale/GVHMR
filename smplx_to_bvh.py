@@ -1604,6 +1604,83 @@ def _smooth_rotations_one_euro(
     return params
 
 
+def _apply_space_overrides(params: dict, corrections, reference_params: dict | None = None) -> dict:
+    """Apply frame-space overrides from a CorrectionTrack.
+
+    For "camera" frames: use camera-space body pose + root orient, interpolate root Y
+    from nearest world-grounded frames.
+    For "carried" frames: use camera-space body pose, derive root position from
+    reference person's world root + y_offset.
+
+    Args:
+        params: SMPL-X params dict (must contain *_cam keys for camera-space data).
+        corrections: CorrectionTrack with space_overrides.
+        reference_params: {person_id: params_dict} for carrier persons (carried mode).
+    """
+    from pose_correction import CorrectionTrack
+    if not isinstance(corrections, CorrectionTrack) or not corrections.space_overrides:
+        return params
+
+    params = dict(params)
+    params["global_orient"] = params["global_orient"].copy()
+    params["body_pose"] = params["body_pose"].copy()
+    params["transl"] = params["transl"].copy()
+
+    n = params["num_frames"]
+    has_cam = "global_orient_cam" in params and "transl_cam" in params
+
+    for override in corrections.space_overrides:
+        f_start = max(0, override.frame_start)
+        f_end = min(n - 1, override.frame_end)
+
+        if override.space == "world":
+            continue  # default, no change
+
+        if override.space == "camera" and has_cam:
+            # Use camera-space body pose and root orient
+            for f in range(f_start, f_end + 1):
+                params["global_orient"][f] = params["global_orient_cam"][f].copy()
+                if "body_pose_cam" in params:
+                    params["body_pose"][f] = params["body_pose_cam"][f].copy()
+
+            # Interpolate root translation Y from surrounding world frames
+            # Find nearest world-grounded frame before and after the span
+            y_before = params["transl"][max(0, f_start - 1), 1] if f_start > 0 else 0.0
+            y_after = params["transl"][min(n - 1, f_end + 1), 1] if f_end < n - 1 else y_before
+
+            for f in range(f_start, f_end + 1):
+                t = (f - f_start) / max(1, f_end - f_start)
+                cam_transl = params["transl_cam"][f].copy()
+                # Keep camera-space X/Z but interpolate Y from world
+                params["transl"][f, 0] = cam_transl[0]
+                params["transl"][f, 1] = (1 - t) * y_before + t * y_after
+                params["transl"][f, 2] = cam_transl[2]
+
+        elif override.space == "carried" and has_cam:
+            ref_pid = override.reference_person
+            ref_p = reference_params.get(ref_pid) if reference_params else None
+
+            for f in range(f_start, f_end + 1):
+                # Use camera-space body pose
+                params["global_orient"][f] = params["global_orient_cam"][f].copy()
+                if "body_pose_cam" in params:
+                    params["body_pose"][f] = params["body_pose_cam"][f].copy()
+
+                # Derive root from carrier's world root + offset
+                if ref_p is not None and f < ref_p["num_frames"]:
+                    carrier_root = ref_p["transl"][f].copy()
+                    params["transl"][f, 0] = carrier_root[0]
+                    params["transl"][f, 1] = carrier_root[1] + override.y_offset
+                    params["transl"][f, 2] = carrier_root[2]
+                else:
+                    # Fallback: interpolate Y like camera mode
+                    y_before = params["transl"][max(0, f_start - 1), 1] if f_start > 0 else 0.0
+                    t = (f - f_start) / max(1, f_end - f_start)
+                    params["transl"][f, 1] = y_before + override.y_offset
+
+    return params
+
+
 def convert_params_to_bvh(
     params: dict,
     output_path: str,
@@ -1615,6 +1692,8 @@ def convert_params_to_bvh(
     smooth_hands: bool = True,
     quantize_fingers: bool = True,
     body_smooth_preset: str = "moderate",
+    corrections=None,
+    reference_params: dict | None = None,
 ) -> str:
     """Convert SMPL-X params dict to BVH file.
 
@@ -1632,12 +1711,27 @@ def convert_params_to_bvh(
         smooth_hands: Whether to smooth hand rotations.
         quantize_fingers: Whether to snap finger rotations to discrete curl states
             for cleaner, more recognizable hand gestures.
+        corrections: Optional CorrectionTrack with pose corrections to apply
+            before smoothing. SLERP-interpolated corrections are baked into
+            the params before the smoothing pipeline runs.
+        reference_params: Optional {person_id: params_dict} for "carried" space
+            overrides — provides carrier person's world root for deriving position.
 
     Returns:
         Path to the written BVH file.
     """
     # Add SMPL-X hand mean pose — safe even with zero hands (adds natural curl)
     params = _add_hand_mean_pose(params)
+
+    # Apply frame-space overrides (camera/carried) before corrections and smoothing
+    if corrections is not None:
+        params = _apply_space_overrides(params, corrections, reference_params)
+
+    # Apply pose corrections before smoothing (corrections get smoothed along
+    # with the rest of the data for natural blending)
+    if corrections is not None:
+        from pose_correction import apply_corrections
+        params = apply_corrections(params, corrections)
 
     if not skip_world_grounding:
         # SMPLest-X path: camera→world transform + tilt correction + contact root

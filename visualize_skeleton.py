@@ -898,6 +898,97 @@ def render_hand_overlay_video(
     return str(output_path)
 
 
+def render_skeleton_frame(
+    params: dict,
+    frame_idx: int,
+    video_frame: np.ndarray,
+    selected_joint: int | None = None,
+    corrections=None,
+    dim_factor: float = 0.6,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Render skeleton overlay on a single video frame for interactive use.
+
+    Args:
+        params: SMPL-X params dict (camera-space).
+        frame_idx: Frame index to render.
+        video_frame: RGB video frame (H, W, 3).
+        selected_joint: If set, highlight this joint index with a yellow ring.
+        corrections: Optional CorrectionTrack — applied before FK.
+        dim_factor: Darken the background frame (0-1).
+
+    Returns:
+        (annotated_image, joints_2d) where annotated_image is RGB (H, W, 3)
+        and joints_2d is (N_joints, 2) pixel coordinates.
+    """
+    if corrections is not None:
+        from pose_correction import apply_corrections
+        params = apply_corrections(params, corrections)
+
+    n_joints = len(JOINT_NAMES)
+    img_h, img_w = video_frame.shape[:2]
+
+    # Dim background
+    img = (video_frame.astype(np.float32) * dim_factor).astype(np.uint8).copy()
+
+    # FK
+    joints_3d = forward_kinematics(params, frame_idx)
+
+    # Project
+    fx, fy, cx, cy, _ = _get_projection_intrinsics(params, frame_idx, img_w, img_h)
+    joints_2d = project_to_2d(joints_3d, fx, fy, cx, cy)
+
+    # Draw bones (BGR for cv2)
+    margin = max(img_w, img_h)
+    for j1, j2 in BONE_CONNECTIONS:
+        if j1 >= n_joints or j2 >= n_joints:
+            continue
+        # Skip hand bones for clarity in interactive mode
+        if j1 >= 22 or j2 >= 22:
+            continue
+        p1 = (int(joints_2d[j1, 0]), int(joints_2d[j1, 1]))
+        p2 = (int(joints_2d[j2, 0]), int(joints_2d[j2, 1]))
+        if not (-margin < p1[0] < 2 * margin and -margin < p1[1] < 2 * margin):
+            continue
+        if not (-margin < p2[0] < 2 * margin and -margin < p2[1] < 2 * margin):
+            continue
+        color = _bone_color(j1, j2)
+        # Convert BGR bone color to RGB for the output
+        color_rgb = (color[2], color[1], color[0])
+        cv2.line(img, p1, p2, color_rgb, 2, cv2.LINE_AA)
+
+    # Draw body joint dots
+    for j in range(min(22, n_joints)):
+        p = (int(joints_2d[j, 0]), int(joints_2d[j, 1]))
+        if not (0 <= p[0] < img_w and 0 <= p[1] < img_h):
+            continue
+
+        # Color by region
+        name = JOINT_NAMES[j] if j < len(JOINT_NAMES) else ""
+        if "L_" in name:
+            dot_color = (255, 128, 0)  # orange (RGB)
+        elif "R_" in name:
+            dot_color = (0, 128, 255)  # blue (RGB)
+        else:
+            dot_color = (0, 255, 0)    # green (RGB)
+
+        radius = 6
+        cv2.circle(img, p, radius, dot_color, -1, cv2.LINE_AA)
+
+        # Selected joint highlight
+        if j == selected_joint:
+            cv2.circle(img, p, 10, (255, 255, 0), 2, cv2.LINE_AA)  # yellow ring
+            cv2.circle(img, p, 14, (255, 255, 0), 1, cv2.LINE_AA)  # outer ring
+            # Label
+            label = JOINT_NAMES[j] if j < len(JOINT_NAMES) else f"J{j}"
+            cv2.putText(
+                img, label,
+                (p[0] + 16, p[1] - 4),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1, cv2.LINE_AA,
+            )
+
+    return img, joints_2d
+
+
 if __name__ == "__main__":
     import sys
     if len(sys.argv) < 3:
