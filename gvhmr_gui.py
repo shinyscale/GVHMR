@@ -125,6 +125,34 @@ def find_file(output_dir: Path, pattern: str) -> str | None:
     return str(matches[0]) if matches else None
 
 
+def save_solve_config(output_dir: Path, tab: str, **params) -> Path:
+    """Save UI parameters alongside solve results so they can be restored."""
+    config = {"tab": tab, **params}
+    output_dir.mkdir(parents=True, exist_ok=True)
+    config_path = output_dir / "solve_config.json"
+    with open(config_path, "w") as f:
+        json.dump(config, f, indent=2)
+    return config_path
+
+
+def load_solve_config(video_path: str, tab: str) -> dict | None:
+    """Load saved UI parameters for a previously-solved video, if they exist."""
+    stem = Path(video_path).stem
+    tab_dirs = {
+        "gvhmr": "demo",
+        "perfcap": "perfcap",
+        "multi_person": "multi_person",
+    }
+    subdir = tab_dirs.get(tab)
+    if not subdir:
+        return None
+    config_path = GVHMR_DIR / "outputs" / subdir / stem / "solve_config.json"
+    if config_path.is_file():
+        with open(config_path) as f:
+            return json.load(f)
+    return None
+
+
 # ── Tab 1: GVHMR Body Pipeline ──
 
 def run_gvhmr(
@@ -138,6 +166,16 @@ def run_gvhmr(
     """Run GVHMR demo.py on the input video (body-only, world-grounded)."""
 
     video_path = resolve_video_path(video_upload, video_path_text)
+
+    # Save solve config for session restore
+    stem = Path(video_path).stem
+    save_solve_config(
+        GVHMR_DIR / "outputs" / "demo" / stem,
+        tab="gvhmr",
+        static_cam=bool(static_cam),
+        use_dpvo=bool(use_dpvo),
+        focal_length=focal_length or "",
+    )
 
     # Portrait video fix
     progress(0.01, desc="Checking video rotation...")
@@ -416,6 +454,21 @@ def run_full_pipeline(
     # Set up output directory early so shared preprocessing artifacts land with the run.
     output_base = GVHMR_DIR / "outputs" / "perfcap" / source_stem
     output_base.mkdir(parents=True, exist_ok=True)
+
+    # Save solve config for session restore
+    save_solve_config(
+        output_base,
+        tab="perfcap",
+        target_fps=target_fps or "30",
+        fbx_naming=fbx_naming,
+        pitch_adjust=float(pitch_adjust),
+        pipeline_mode=pipeline_mode,
+        static_cam=bool(hybrid_static_cam),
+        use_dpvo=bool(hybrid_use_dpvo),
+        use_vitpose_face=bool(use_vitpose_face),
+        hand_source=hand_source,
+        body_smooth_preset=body_smooth_preset,
+    )
 
     # ── Stage 1: Preprocess (portrait fix) ──
     progress(0.02, desc="Preprocessing video...")
@@ -854,6 +907,17 @@ def run_multi_person_pipeline(
 
     source_stem = Path(source_video_path).stem
 
+    # Save solve config for session restore
+    save_solve_config(
+        GVHMR_DIR / "outputs" / "multi_person" / source_stem,
+        tab="multi_person",
+        target_fps=target_fps or "30",
+        fbx_naming=fbx_naming,
+        static_cam=bool(multi_static_cam),
+        use_dpvo=bool(multi_use_dpvo),
+        max_persons=int(max_persons) if max_persons else 0,
+    )
+
     # Preprocess
     progress(0.02, desc="Preprocessing video...")
     video_path, preprocess_msg = preprocess_video(
@@ -1011,6 +1075,30 @@ with gr.Blocks(
                 outputs=[vid_sbs, vid_incam, vid_global, gvhmr_pt_download, gvhmr_log],
             )
 
+            # Restore saved params when a video path is entered
+            def _restore_gvhmr_config(video_path_text):
+                if not video_path_text or not video_path_text.strip():
+                    return gr.update(), gr.update(), gr.update()
+                cfg = load_solve_config(video_path_text.strip(), "gvhmr")
+                if cfg is None:
+                    return gr.update(), gr.update(), gr.update()
+                return (
+                    gr.update(value=cfg.get("static_cam", False)),
+                    gr.update(value=cfg.get("use_dpvo", False)),
+                    gr.update(value=cfg.get("focal_length", "")),
+                )
+
+            gvhmr_video_path.change(
+                fn=_restore_gvhmr_config,
+                inputs=[gvhmr_video_path],
+                outputs=[static_cam, use_dpvo, focal_length],
+            )
+            gvhmr_video_upload.upload(
+                fn=lambda v: _restore_gvhmr_config(v),
+                inputs=[gvhmr_video_upload],
+                outputs=[static_cam, use_dpvo, focal_length],
+            )
+
         # ── Tab 2: Full Performance Capture ──
         with gr.TabItem("Full Performance Capture"):
             gr.Markdown(
@@ -1120,6 +1208,44 @@ with gr.Blocks(
                     hand_source, body_smooth_preset,
                 ],
                 outputs=[skeleton_preview, face_mesh_preview, world_view_preview, hand_overlay_preview, bvh_download, fbx_download, face_csv_download, smplx_pt_download, perf_log],
+            )
+
+            # Restore saved params when a video path is entered
+            def _restore_perfcap_config(video_path_text):
+                if not video_path_text or not video_path_text.strip():
+                    return (gr.update(),) * 9
+                cfg = load_solve_config(video_path_text.strip(), "perfcap")
+                if cfg is None:
+                    return (gr.update(),) * 9
+                return (
+                    gr.update(value=cfg.get("target_fps", "30")),
+                    gr.update(value=cfg.get("fbx_naming", "Mixamo (Cascadeur)")),
+                    gr.update(value=cfg.get("pitch_adjust", 0)),
+                    gr.update(value=cfg.get("pipeline_mode", "Hybrid: GVHMR Body + SMPLest-X Hands")),
+                    gr.update(value=cfg.get("static_cam", False)),
+                    gr.update(value=cfg.get("use_dpvo", False)),
+                    gr.update(value=cfg.get("use_vitpose_face", True)),
+                    gr.update(value=cfg.get("hand_source", "SMPLest-X (default)")),
+                    gr.update(value=cfg.get("body_smooth_preset", "Moderate (default)")),
+                )
+
+            perf_video_path.change(
+                fn=_restore_perfcap_config,
+                inputs=[perf_video_path],
+                outputs=[
+                    perf_fps, fbx_naming, pitch_adjust, pipeline_mode,
+                    hybrid_static_cam, hybrid_use_dpvo, use_vitpose_face,
+                    hand_source, body_smooth_preset,
+                ],
+            )
+            perf_video_upload.upload(
+                fn=lambda v: _restore_perfcap_config(v),
+                inputs=[perf_video_upload],
+                outputs=[
+                    perf_fps, fbx_naming, pitch_adjust, pipeline_mode,
+                    hybrid_static_cam, hybrid_use_dpvo, use_vitpose_face,
+                    hand_source, body_smooth_preset,
+                ],
             )
 
         # ── Tab 3: Multi-Person Capture ──
@@ -1232,6 +1358,32 @@ with gr.Blocks(
                     id_panel["confidence_plot"],
                     id_panel["kf_dataframe"],
                 ],
+            )
+
+            # Restore saved params when a video path is entered
+            def _restore_mp_config(video_path_text):
+                if not video_path_text or not video_path_text.strip():
+                    return (gr.update(),) * 5
+                cfg = load_solve_config(video_path_text.strip(), "multi_person")
+                if cfg is None:
+                    return (gr.update(),) * 5
+                return (
+                    gr.update(value=cfg.get("static_cam", False)),
+                    gr.update(value=cfg.get("use_dpvo", False)),
+                    gr.update(value=cfg.get("max_persons", 0)),
+                    gr.update(value=cfg.get("target_fps", "30")),
+                    gr.update(value=cfg.get("fbx_naming", "Mixamo (Cascadeur)")),
+                )
+
+            mp_video_path.change(
+                fn=_restore_mp_config,
+                inputs=[mp_video_path],
+                outputs=[mp_static_cam, mp_use_dpvo, mp_max_persons, mp_fps, mp_fbx_naming],
+            )
+            mp_video_upload.upload(
+                fn=lambda v: _restore_mp_config(v),
+                inputs=[mp_video_upload],
+                outputs=[mp_static_cam, mp_use_dpvo, mp_max_persons, mp_fps, mp_fbx_naming],
             )
 
 

@@ -577,13 +577,15 @@ def reprocess_person(
     # 1. Update track bboxes in-place
     track["bbx_xyxy"] = torch.from_numpy(updated_bboxes)
 
-    # 2. Delete stale outputs
+    # 2. Back up stale outputs (restore on failure, delete on success)
     isolated_video = person_dir / "isolated_video.mp4"
     demo_dir = person_dir / "demo"
+    bak_video = person_dir / "isolated_video.mp4.bak"
+    bak_demo = person_dir / "demo.bak"
     if isolated_video.exists():
-        isolated_video.unlink()
+        isolated_video.rename(bak_video)
     if demo_dir.exists():
-        shutil.rmtree(str(demo_dir))
+        demo_dir.rename(bak_demo)
 
     # 3. Re-isolate person
     if progress_callback:
@@ -615,23 +617,46 @@ def reprocess_person(
         _crop_person_video(video_path, updated_bboxes, str(isolated_video))
 
     if not isolated_video.exists():
+        # Restore backups — isolation failed
+        if bak_video.exists():
+            bak_video.rename(isolated_video)
+        if bak_demo.exists():
+            bak_demo.rename(demo_dir)
         return {}
 
     # 4. Re-run GVHMR pipeline
     if progress_callback:
         progress_callback(0.4, f"Running GVHMR for person {person_index}...")
 
-    pt_path, _ = run_person_pipeline(
-        video_path=str(isolated_video),
-        person_id=tid,
-        output_dir=person_dir,
-        slam_override_path=slam_path if not static_cam else None,
-        static_cam=static_cam,
-        use_dpvo=use_dpvo,
-    )
+    try:
+        pt_path, _ = run_person_pipeline(
+            video_path=str(isolated_video),
+            person_id=tid,
+            output_dir=person_dir,
+            slam_override_path=slam_path if not static_cam else None,
+            static_cam=static_cam,
+            use_dpvo=use_dpvo,
+        )
+    except Exception as e:
+        print(f"[reprocess_person] Pipeline crashed for person {person_index}: {e}")
+        # Restore backups
+        if bak_video.exists() and not isolated_video.exists():
+            bak_video.rename(isolated_video)
+        if bak_demo.exists() and not demo_dir.exists():
+            bak_demo.rename(demo_dir)
+        return {}
 
     if pt_path is None:
+        # Pipeline failed — restore backups
+        if bak_video.exists() and not isolated_video.exists():
+            bak_video.rename(isolated_video)
+        if bak_demo.exists() and not demo_dir.exists():
+            bak_demo.rename(demo_dir)
         return {}
+
+    # Pipeline succeeded — clean up backups
+    bak_video.unlink(missing_ok=True)
+    shutil.rmtree(str(bak_demo), ignore_errors=True)
 
     # 5. Re-compute confidence & identity
     if progress_callback:

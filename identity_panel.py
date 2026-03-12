@@ -151,9 +151,13 @@ def _render_frame_with_bboxes(
                 and bbox_edit_state.get("corner") == corner_idx
             )
             if is_active:
-                cv2.circle(img, (cx, cy), 6, (0, 255, 255), -1)  # filled yellow
+                cv2.circle(img, (cx, cy), 12, (0, 255, 255), -1)  # filled yellow
             else:
-                cv2.circle(img, (cx, cy), 6, color, 2)  # hollow
+                cv2.circle(img, (cx, cy), 12, color, 2)  # hollow outline
+                # Semi-transparent hit-zone ring
+                overlay = img.copy()
+                cv2.circle(overlay, (cx, cy), 12, color, -1)
+                cv2.addWeighted(overlay, 0.25, img, 0.75, 0, img)
 
         # Confidence badge + label
         conf = confidences.get(pid)
@@ -228,9 +232,9 @@ def _save_bbox_corrections(session_id: str, pid: int) -> None:
     """Persist bbox corrections for a person to JSON."""
     sd = _SESSION_DATA.get(session_id, {})
     corrections = sd.get("bbox_corrections", {}).get(pid, {})
-    person_dirs = sd.get("person_dirs", [])
-    if pid < len(person_dirs):
-        out_path = Path(person_dirs[pid]) / "bbox_corrections.json"
+    person_dir = sd.get("pid_to_dir", {}).get(pid)
+    if person_dir is not None:
+        out_path = Path(person_dir) / "bbox_corrections.json"
         data = {
             "person_id": pid,
             "corrections": {str(f): bbox.tolist() for f, bbox in corrections.items()},
@@ -383,6 +387,15 @@ def init_panel_state(
                 confs.append(TrackConfidence())
         all_confidences[pid] = confs
 
+    # Build pid → directory and pid → index mappings (track_id may != array index)
+    pid_to_dir = {}
+    pid_to_index = {}
+    for i, track in enumerate(all_tracks):
+        pid = track.get("track_id", i)
+        if i < len(str_person_dirs):
+            pid_to_dir[pid] = str_person_dirs[i]
+        pid_to_index[pid] = i
+
     _SESSION_DATA[session_id] = {
         "video_path": video_path,
         "identity_tracks": identity_tracks,
@@ -400,6 +413,8 @@ def init_panel_state(
         "pipeline_params": pipeline_params or {},
         "img_width": img_width,
         "img_height": img_height,
+        "pid_to_dir": pid_to_dir,
+        "pid_to_index": pid_to_index,
     }
 
     # Load per-person SMPL params and correction tracks for pose correction
@@ -440,6 +455,7 @@ def init_panel_state(
         video_path=video_path,
         num_frames=num_frames,
         fps=fps,
+        pid_to_dir=pid_to_dir,
     )
 
     return {
@@ -471,6 +487,13 @@ def _load_confidence_csv(csv_path: str, num_frames: int) -> list[TrackConfidence
     while len(confs) < num_frames:
         confs.append(TrackConfidence())
     return confs[:num_frames]
+
+
+def _reprocess_btn_label(session_id: str) -> str:
+    """Dynamic label for the reprocess button showing dirty count."""
+    sd = _SESSION_DATA.get(session_id, {})
+    n = len(sd.get("dirty_persons", set()))
+    return f"Reprocess All ({n} dirty)"
 
 
 # ── Callback Functions ──
@@ -642,7 +665,7 @@ def on_remove_keyframe(frame_idx, state):
 def on_swap_ids(frame_idx, person_a_str, person_b_str, state):
     """Swap person_id assignments between two people from current frame onward."""
     if state is None:
-        return state, *update_frame_display(0, state)
+        return state, gr.update(), *update_frame_display(0, state)
 
     session_id = state["session_id"]
     frame_idx = int(frame_idx)
@@ -651,15 +674,15 @@ def on_swap_ids(frame_idx, person_a_str, person_b_str, state):
         pid_a = int(person_a_str.split()[-1])
         pid_b = int(person_b_str.split()[-1])
     except (ValueError, IndexError):
-        return state, *update_frame_display(frame_idx, state)
+        return state, gr.update(), *update_frame_display(frame_idx, state)
 
     if pid_a == pid_b:
-        return state, *update_frame_display(frame_idx, state)
+        return state, gr.update(), *update_frame_display(frame_idx, state)
 
     track_a = _get_identity_track(session_id, pid_a)
     track_b = _get_identity_track(session_id, pid_b)
     if track_a is None or track_b is None:
-        return state, *update_frame_display(frame_idx, state)
+        return state, gr.update(), *update_frame_display(frame_idx, state)
 
     sd = _SESSION_DATA[session_id]
 
@@ -692,9 +715,13 @@ def on_swap_ids(frame_idx, person_a_str, person_b_str, state):
             metadata={"swap_with": pid_b if pid == pid_a else pid_a},
         )
 
+    # Mark both persons as dirty — SMPL params need reprocessing to match swapped bboxes
+    sd.setdefault("dirty_persons", set()).update({pid_a, pid_b})
+
     _save_identity_track(session_id, pid_a)
     _save_identity_track(session_id, pid_b)
-    return (state, *update_frame_display(frame_idx, state))
+    return (state, gr.update(value=_reprocess_btn_label(session_id)),
+            *update_frame_display(frame_idx, state))
 
 
 def on_prev_keyframe(frame_idx, state):
@@ -749,12 +776,12 @@ def on_df_select(evt: gr.SelectData, state):
 def on_frame_click(evt: gr.SelectData, frame_idx, state):
     """Two-click bbox corner editing: first click selects corner, second moves it."""
     if state is None or evt is None:
-        return None, "", state
+        return None, "", state, gr.update()
 
     session_id = state.get("session_id", "")
     sd = _SESSION_DATA.get(session_id)
     if sd is None:
-        return None, "", state
+        return None, "", state, gr.update()
 
     frame_idx = int(frame_idx)
     click_x, click_y = evt.index[0], evt.index[1]
@@ -764,7 +791,7 @@ def on_frame_click(evt: gr.SelectData, frame_idx, state):
     if bbox_edit_state is None:
         # First click: find nearest corner handle across all visible bboxes
         bboxes = _get_bboxes_at_frame(session_id, frame_idx)
-        best_dist = 15.0  # threshold in pixels
+        best_dist = 40.0  # threshold in pixels
         best_pid = None
         best_corner = None
 
@@ -849,7 +876,7 @@ def on_frame_click(evt: gr.SelectData, frame_idx, state):
     else:
         img = None
 
-    return img, status, state
+    return img, status, state, gr.update(value=_reprocess_btn_label(session_id))
 
 
 def on_cancel_bbox_edit(state):
@@ -862,19 +889,19 @@ def on_cancel_bbox_edit(state):
 def on_interpolate_bboxes(state):
     """Interpolate bbox corrections between edited keyframes for selected person."""
     if state is None:
-        return "", state
+        return "", state, gr.update()
 
     session_id = state.get("session_id", "")
     sd = _SESSION_DATA.get(session_id)
     if sd is None:
-        return "No session data", state
+        return "No session data", state, gr.update()
 
     pid = state.get("selected_person", 0)
     corrections = sd.get("bbox_corrections", {}).get(pid, {})
     original = sd.get("original_bboxes", {}).get(pid)
 
     if not corrections or original is None:
-        return "No corrections to interpolate", state
+        return "No corrections to interpolate", state, gr.update()
 
     from multi_person_split import interpolate_bbox_corrections
     updated = interpolate_bbox_corrections(original, corrections)
@@ -897,23 +924,25 @@ def on_interpolate_bboxes(state):
     sd.setdefault("dirty_persons", set()).add(pid)
     _save_bbox_corrections(session_id, pid)
     n_total = len(sd.get("bbox_corrections", {}).get(pid, {}))
-    return f"Interpolated: {n_total} frames corrected for Person {pid}", state
+    return (f"Interpolated: {n_total} frames corrected for Person {pid}", state,
+            gr.update(value=_reprocess_btn_label(session_id)))
 
 
 def on_reprocess_all_dirty(state, progress=gr.Progress(track_tqdm=False)):
     """Reprocess all persons with pending bbox edits."""
     if state is None:
-        return state, "No session", *update_frame_display(0, state)
+        return state, "No session", gr.update(), *update_frame_display(0, state)
 
     session_id = state.get("session_id", "")
     sd = _SESSION_DATA.get(session_id)
     if sd is None:
-        return state, "No session data", *update_frame_display(0, state)
+        return state, "No session data", gr.update(), *update_frame_display(0, state)
 
     dirty = sd.get("dirty_persons", set())
     if not dirty:
-        return state, "No dirty persons", *update_frame_display(
-            state.get("current_frame", 0), state)
+        return (state, "No dirty persons",
+                gr.update(value=_reprocess_btn_label(session_id)),
+                *update_frame_display(state.get("current_frame", 0), state))
 
     from multi_person_split import reprocess_person
 
@@ -921,7 +950,8 @@ def on_reprocess_all_dirty(state, progress=gr.Progress(track_tqdm=False)):
     slam_path = str(Path(sd["output_dir"]) / "shared_slam.pt")
     masks_dir = str(Path(sd["output_dir"]) / "masks")
     pp = sd.get("pipeline_params", {})
-    person_dirs = sd.get("person_dirs", [])
+    pid_to_dir = sd.get("pid_to_dir", {})
+    pid_to_index = sd.get("pid_to_index", {})
 
     dirty_list = sorted(dirty)
     total = len(dirty_list)
@@ -930,7 +960,9 @@ def on_reprocess_all_dirty(state, progress=gr.Progress(track_tqdm=False)):
     for idx, pid in enumerate(dirty_list):
         progress((idx) / total, desc=f"Reprocessing person {pid} ({idx + 1}/{total})...")
 
-        if pid >= len(person_dirs) or pid >= len(all_tracks):
+        person_dir = pid_to_dir.get(pid)
+        p_index = pid_to_index.get(pid)
+        if person_dir is None or p_index is None:
             status_lines.append(f"Person {pid}: skipped (invalid index)")
             continue
 
@@ -943,8 +975,8 @@ def on_reprocess_all_dirty(state, progress=gr.Progress(track_tqdm=False)):
         try:
             result = reprocess_person(
                 video_path=sd["video_path"],
-                person_index=pid,
-                person_dir=person_dirs[pid],
+                person_index=p_index,
+                person_dir=person_dir,
                 updated_bboxes=updated_bboxes,
                 all_tracks=all_tracks,
                 slam_path=slam_path,
@@ -991,7 +1023,8 @@ def on_reprocess_all_dirty(state, progress=gr.Progress(track_tqdm=False)):
 
     frame_idx = state.get("current_frame", 0)
     status = "\n".join(status_lines)
-    return state, status, *update_frame_display(frame_idx, state)
+    return (state, status, gr.update(value=_reprocess_btn_label(session_id)),
+            *update_frame_display(frame_idx, state))
 
 
 # ── Transport helpers ──
@@ -1056,10 +1089,22 @@ def build_identity_panel() -> dict[str, Any]:
     with gr.Row():
         # Left: Frame preview
         with gr.Column(scale=2):
+            # CSS to prevent native browser image drag (otherwise misclicks
+            # drag a thumbnail of the video frame around instead of editing)
+            gr.HTML(
+                "<style>"
+                "#bbox_frame_preview img { "
+                "  -webkit-user-drag: none; "
+                "  user-select: none; "
+                "  pointer-events: auto; "
+                "}"
+                "</style>"
+            )
             frame_image = gr.Image(
                 label="Frame Preview (click bbox corner to edit)",
                 interactive=False,
                 type="numpy",
+                elem_id="bbox_frame_preview",
             )
 
         # Right: Info panel
@@ -1198,7 +1243,7 @@ def build_identity_panel() -> dict[str, Any]:
     swap_btn.click(
         fn=on_swap_ids,
         inputs=[frame_slider, person_dropdown, swap_target, panel_state],
-        outputs=[panel_state] + display_outputs,
+        outputs=[panel_state, reprocess_btn] + display_outputs,
     )
 
     # Keyframe DataFrame click → navigate
@@ -1212,7 +1257,7 @@ def build_identity_panel() -> dict[str, Any]:
     frame_image.select(
         fn=on_frame_click,
         inputs=[frame_slider, panel_state],
-        outputs=[frame_image, bbox_edit_status, panel_state],
+        outputs=[frame_image, bbox_edit_status, panel_state, reprocess_btn],
     )
 
     cancel_edit_btn.click(
@@ -1224,13 +1269,13 @@ def build_identity_panel() -> dict[str, Any]:
     interpolate_btn.click(
         fn=on_interpolate_bboxes,
         inputs=[panel_state],
-        outputs=[bbox_edit_status, panel_state],
+        outputs=[bbox_edit_status, panel_state, reprocess_btn],
     )
 
     reprocess_btn.click(
         fn=on_reprocess_all_dirty,
         inputs=[panel_state],
-        outputs=[panel_state, reprocess_status] + display_outputs,
+        outputs=[panel_state, reprocess_status, reprocess_btn] + display_outputs,
     )
 
     return {

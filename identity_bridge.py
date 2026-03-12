@@ -43,6 +43,37 @@ class OcclusionBridge:
         t = np.clip(distance / r, 0.0, 1.0)
         return 0.5 * (1.0 + np.cos(np.pi * t))
 
+    def _crossfade_boundaries(self, original, output, start, end):
+        """Blend bridged data with original at span boundaries using cosine falloff.
+
+        For 3D arrays (N,J,3 rotations): SLERP per joint.
+        For 2D arrays (N,3 translations): linear blend.
+        Modifies output in-place.
+        """
+        span_len = end - start + 1
+        fade = min(self.influence_radius, span_len // 2)
+        if fade <= 0:
+            return
+
+        use_slerp = original.ndim == 3
+
+        for boundary, direction in [(start, 1), (end, -1)]:
+            for i in range(fade):
+                f = boundary + i * direction
+                # Scale so full cosine curve fits within fade frames
+                d = (fade - i) / fade * self.influence_radius
+                blend = self._alpha(d)  # 0 at boundary, ~1 at interior
+
+                if use_slerp:
+                    for j in range(original.shape[1]):
+                        r_orig = Rotation.from_rotvec(original[f, j])
+                        r_brdg = Rotation.from_rotvec(output[f, j])
+                        slerp_fn = Slerp([0.0, 1.0],
+                                         Rotation.concatenate([r_orig, r_brdg]))
+                        output[f, j] = slerp_fn([blend]).as_rotvec()[0]
+                else:
+                    output[f] = blend * output[f] + (1.0 - blend) * original[f]
+
     def bridge_translations(
         self,
         translations: np.ndarray,
@@ -83,6 +114,8 @@ class OcclusionBridge:
                 # Linear interpolation of translation
                 output[f] = (1 - t) * translations[prev_frame] + t * translations[next_frame]
                 bridged_frames.add(f)
+
+            self._crossfade_boundaries(translations, output, start, end)
 
         return output, bridged_frames
 
@@ -141,6 +174,8 @@ class OcclusionBridge:
                     interp_rot = slerp([t])
                     output[f, j] = interp_rot.as_rotvec()[0]
                     bridged_frames.add(f)
+
+            self._crossfade_boundaries(rotations, output, start, end)
 
         return output, bridged_frames
 
@@ -217,6 +252,8 @@ def classify_occlusion(
 
     if duration_seconds < 0.5:
         return "brief"
+    elif duration_seconds < 1.5:
+        return "partial"
     elif duration_seconds < 3.0:
         return "full"
     else:

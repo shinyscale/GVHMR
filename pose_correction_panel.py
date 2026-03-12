@@ -14,7 +14,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-import cv2
 import numpy as np
 import gradio as gr
 
@@ -63,6 +62,7 @@ def init_pose_session(
     video_path: str,
     num_frames: int,
     fps: float,
+    pid_to_dir: dict[int, str] | None = None,
 ) -> None:
     """Initialize pose correction session data."""
     _POSE_SESSION[session_id] = {
@@ -72,21 +72,17 @@ def init_pose_session(
         "video_path": video_path,
         "num_frames": num_frames,
         "fps": fps,
+        "pid_to_dir": pid_to_dir or {},
     }
 
 
-# ── Frame extraction (reuse identity_panel's cache or direct) ──
+# ── Frame extraction (reuse identity_panel's LRU cache) ──
 
 
-def _extract_frame_direct(video_path: str, frame_idx: int) -> np.ndarray | None:
-    """Extract a single RGB frame from video."""
-    cap = cv2.VideoCapture(video_path)
-    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-    ret, frame = cap.read()
-    cap.release()
-    if not ret:
-        return None
-    return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+def _extract_frame_cached(video_path: str, frame_idx: int, session_id: str) -> np.ndarray | None:
+    """Extract frame using identity_panel's LRU cache (lazy import to avoid circular)."""
+    from identity_panel import _extract_frame
+    return _extract_frame(video_path, frame_idx, session_id)
 
 
 # ── Core rendering callback ──
@@ -111,7 +107,7 @@ def _render_skeleton_preview(
         return None, None
 
     video_path = sd["video_path"]
-    frame = _extract_frame_direct(video_path, frame_idx)
+    frame = _extract_frame_cached(video_path, frame_idx, session_id)
     if frame is None:
         return None, None
 
@@ -168,13 +164,9 @@ def _save_correction_track(session_id: str, person_id: int) -> None:
     ct = sd["correction_tracks"].get(person_id)
     if ct is None:
         return
-    person_dirs = sd.get("person_dirs", [])
-    # Find the right person dir
-    for i, pdir in enumerate(person_dirs):
-        # Person dirs are ordered by person_id
-        if i == person_id:
-            ct.save_json(Path(pdir) / "pose_corrections.json")
-            break
+    person_dir = sd.get("pid_to_dir", {}).get(person_id)
+    if person_dir is not None:
+        ct.save_json(Path(person_dir) / "pose_corrections.json")
 
 
 def _corrections_dataframe(session_id: str, person_id: int) -> list[list]:
@@ -646,9 +638,9 @@ def on_reexport_bvh(frame_idx, state, progress=gr.Progress(track_tqdm=False)):
     # Import BVH converter
     from smplx_to_bvh import convert_params_to_bvh
 
-    person_dirs = sd.get("person_dirs", [])
-    if person_id < len(person_dirs):
-        out_path = str(Path(person_dirs[person_id]) / "corrected_body.bvh")
+    person_dir = sd.get("pid_to_dir", {}).get(person_id)
+    if person_dir is not None:
+        out_path = str(Path(person_dir) / "corrected_body.bvh")
     else:
         return None
 
