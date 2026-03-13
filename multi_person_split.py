@@ -22,6 +22,146 @@ GVHMR_DIR = Path(__file__).resolve().parent
 DEMO_SCRIPT = GVHMR_DIR / "tools" / "demo" / "demo.py"
 
 
+def _transform_crop_verts_to_fullframe(verts, K_crop, K_full, crop_x1, crop_y1):
+    """Transform 3D vertices from cropped camera space to full-frame camera space.
+
+    When a person's video was cropped, GVHMR estimates K from the crop dimensions
+    and solves incam params in that space.  To render on the original full-frame
+    video we need to re-express the vertices so they project correctly with K_full.
+    """
+    X, Y, Z = verts[..., 0], verts[..., 1], verts[..., 2]
+
+    fx_c, cx_c = K_crop[0, 0], K_crop[0, 2]
+    fy_c, cy_c = K_crop[1, 1], K_crop[1, 2]
+    fx_f, cx_f = K_full[0, 0], K_full[0, 2]
+    fy_f, cy_f = K_full[1, 1], K_full[1, 2]
+
+    # 2D in full frame: u = fx_c * X/Z + cx_c + crop_x1
+    # Want:             u = fx_f * X'/Z + cx_f
+    # => X' = (fx_c * X + (cx_c + crop_x1 - cx_f) * Z) / fx_f
+    X_new = (fx_c * X + (cx_c + crop_x1 - cx_f) * Z) / fx_f
+    Y_new = (fy_c * Y + (cy_c + crop_y1 - cy_f) * Z) / fy_f
+
+    return torch.stack([X_new, Y_new, Z], dim=-1)
+
+
+def render_multi_person_incam(
+    video_path: str,
+    person_dirs: list,
+    all_tracks: list,
+    output_path: str,
+    fps: float = 30.0,
+    person_colors: list | None = None,
+    progress_callback=None,
+):
+    """Render all tracked people's mesh overlays on the original video.
+
+    For each frame: reads original image, then composites each person's
+    SMPL mesh on top using render_mesh() sequentially.
+
+    Handles cropped isolation: if a person's isolated video was smaller than the
+    original, their incam vertices are transformed back to full-frame camera space.
+
+    Args:
+        video_path: path to original multi-person video
+        person_dirs: list of per-person output directories (matches all_tracks order)
+        all_tracks: list of track dicts with 'bbx_xyxy' tensors
+        output_path: where to write scene_preview.mp4
+        fps: output video fps
+        person_colors: list of [R, G, B] per person (0-1). Auto-assigned if None.
+        progress_callback: fn(frac, msg)
+    """
+    from hmr4d.utils.video_io_utils import get_video_reader, get_writer
+    from hmr4d.utils.vis.renderer import Renderer
+    from hmr4d.utils.smplx_utils import make_smplx
+    from hmr4d.utils.net_utils import to_cuda
+
+    # Default distinct colors per person
+    DEFAULT_COLORS = [
+        [0.53, 0.81, 0.92],  # light blue
+        [0.98, 0.50, 0.45],  # salmon
+        [0.56, 0.93, 0.56],  # light green
+        [0.93, 0.79, 0.47],  # gold
+        [0.80, 0.60, 0.87],  # lavender
+    ]
+
+    # Original video dimensions and K
+    length, width, height = get_video_lwh(video_path)
+    K_full = estimate_K(width, height)
+
+    # Load SMPL model + conversion matrix once
+    smplx_model = make_smplx("supermotion").cuda()
+    smplx2smpl = torch.load(
+        "hmr4d/utils/body_model/smplx2smpl_sparse.pt",
+        weights_only=False,
+    ).cuda()
+    faces_smpl = make_smplx("smpl").faces
+
+    # Load per-person results
+    CROP_PADDING = 40  # must match _crop_person_video default
+    person_data = []
+    for i, pdir in enumerate(person_dirs):
+        pdir = Path(pdir)
+        pt_files = list(pdir.rglob("hmr4d_results.pt"))
+        if not pt_files:
+            continue
+        pred = torch.load(pt_files[0], map_location="cpu", weights_only=False)
+        if "smpl_params_incam" not in pred:
+            continue
+
+        # Compute SMPL vertices in camera space
+        smplx_out = smplx_model(**to_cuda(pred["smpl_params_incam"]))
+        verts = torch.stack([
+            torch.matmul(smplx2smpl, v) for v in smplx_out.vertices
+        ])  # (L, 6890, 3)
+
+        K_person = pred["K_fullimg"][0]  # (3, 3)
+
+        # Check if this person's K differs from the original video's K
+        # (means their isolated video was cropped, not full-frame inpainted)
+        if not torch.allclose(K_person, K_full, atol=1.0):
+            # Recover crop offset from track bboxes (mirrors _crop_person_video)
+            if i < len(all_tracks):
+                bboxes = all_tracks[i]["bbx_xyxy"]
+                if isinstance(bboxes, torch.Tensor):
+                    bboxes = bboxes.cpu().numpy()
+                crop_x1 = max(0, int(bboxes[:, 0].min()) - CROP_PADDING)
+                crop_y1 = max(0, int(bboxes[:, 1].min()) - CROP_PADDING)
+                verts = _transform_crop_verts_to_fullframe(
+                    verts, K_person, K_full, crop_x1, crop_y1,
+                )
+
+        color = (person_colors[i] if person_colors and i < len(person_colors)
+                 else DEFAULT_COLORS[i % len(DEFAULT_COLORS)])
+        person_data.append({"verts": verts, "color": color, "index": i})
+
+    if not person_data:
+        return
+
+    # Setup video I/O
+    reader = get_video_reader(video_path)
+    renderer = Renderer(width, height, device="cuda", faces=faces_smpl, K=K_full)
+    writer = get_writer(output_path, fps=fps, crf=23)
+
+    for frame_idx, img in enumerate(reader):
+        # Composite each person onto this frame
+        for pd in person_data:
+            if frame_idx < len(pd["verts"]):
+                img = renderer.render_mesh(
+                    pd["verts"][frame_idx].cuda(),
+                    img,
+                    pd["color"],
+                )
+
+        writer.write_frame(img)
+
+        if progress_callback and frame_idx % 30 == 0:
+            progress_callback(frame_idx / length, f"Rendering frame {frame_idx}/{length}")
+
+    writer.close()
+    reader.close()
+
+
 @dataclass
 class MultiPersonResult:
     """Results from the multi-person splitting pipeline."""
@@ -589,6 +729,23 @@ def split_multi_person_video(
         person_dirs=person_dirs,
         slam_path=str(slam_path),
     )
+
+    # ── Step 7: Render combined incam overlay ──
+    _progress(0.92, "Rendering scene preview...")
+    try:
+        assembly_dir = output_dir / "assembly"
+        assembly_dir.mkdir(parents=True, exist_ok=True)
+        scene_preview_path = str(assembly_dir / "scene_preview.mp4")
+        render_multi_person_incam(
+            video_path=video_path,
+            person_dirs=person_dirs,
+            all_tracks=all_tracks,
+            output_path=scene_preview_path,
+            fps=30.0,
+            progress_callback=lambda f, m: _progress(0.92 + f * 0.07, m),
+        )
+    except Exception as e:
+        _progress(0.99, f"Scene preview failed: {e}")
 
     _progress(1.0, f"Multi-person pipeline complete. {result.num_persons} people processed.")
 

@@ -1232,7 +1232,6 @@ def build_identity_panel() -> dict[str, Any]:
         interpolate_btn = gr.Button("Interpolate Bboxes", size="sm", scale=0, min_width=140)
         apply_kf_btn = gr.Button(
             "Apply Keyframes", size="sm", scale=0, min_width=140,
-            info="Use identity keyframe bboxes as corrections for all persons",
         )
         reprocess_btn = gr.Button(
             "Reprocess All (0 dirty)", variant="primary", size="sm", scale=0, min_width=180,
