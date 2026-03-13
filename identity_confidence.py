@@ -70,8 +70,12 @@ def compute_detection_confidence(
     if "detection_conf" in track:
         conf = track["detection_conf"]
         if isinstance(conf, torch.Tensor):
-            return conf.numpy().astype(np.float32)
-        return np.array(conf, dtype=np.float32)
+            conf = conf.numpy().astype(np.float32)
+        else:
+            conf = np.array(conf, dtype=np.float32)
+        # Guard against stale cache with all-zero conf despite detections
+        if conf.sum() > 0:
+            return conf
 
     # Fallback: use detection_mask as binary confidence
     mask = track["detection_mask"]

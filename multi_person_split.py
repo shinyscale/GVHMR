@@ -448,11 +448,22 @@ def split_multi_person_video(
             per_frame_betas = params["betas"]  # (N, 10)
             num_person_frames = params["num_frames"]
 
+            # Load per-person ViTPose if available
+            vitpose_files = list(person_dir.rglob("vitpose.pt"))
+            vitpose = None
+            if vitpose_files:
+                vp = torch.load(str(vitpose_files[0]), map_location="cpu", weights_only=False)
+                if isinstance(vp, torch.Tensor):
+                    vitpose = vp.numpy()
+                elif isinstance(vp, np.ndarray):
+                    vitpose = vp
+
             # Compute confidence scores
             confidences = compute_all_confidences(
                 track_idx=i,
                 all_tracks=all_tracks,
                 num_frames=num_person_frames,
+                vitpose=vitpose,
                 per_frame_betas=per_frame_betas,
             )
 
@@ -674,10 +685,21 @@ def reprocess_person(
         per_frame_betas = params["betas"]
         num_person_frames = params["num_frames"]
 
+        # Load per-person ViTPose if available
+        vitpose_files = list(person_dir.rglob("vitpose.pt"))
+        vitpose = None
+        if vitpose_files:
+            vp = torch.load(str(vitpose_files[0]), map_location="cpu", weights_only=False)
+            if isinstance(vp, torch.Tensor):
+                vitpose = vp.numpy()
+            elif isinstance(vp, np.ndarray):
+                vitpose = vp
+
         confidences = compute_all_confidences(
             track_idx=person_index,
             all_tracks=all_tracks,
             num_frames=num_person_frames,
+            vitpose=vitpose,
             per_frame_betas=per_frame_betas,
         )
 
