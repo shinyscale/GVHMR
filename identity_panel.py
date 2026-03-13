@@ -928,6 +928,73 @@ def on_interpolate_bboxes(state):
             gr.update(value=_reprocess_btn_label(session_id)))
 
 
+def on_apply_keyframes(state):
+    """Apply identity keyframe bboxes as corrections and mark all persons dirty.
+
+    Takes the bboxes stored in each person's identity keyframes, writes them
+    as bbox corrections, interpolates between them, and marks each person
+    dirty for reprocessing. This is the bridge between "I keyframed the right
+    person at these frames" and "re-run the solve with corrected assignments".
+    """
+    if state is None:
+        return "", state, gr.update()
+
+    session_id = state.get("session_id", "")
+    sd = _SESSION_DATA.get(session_id)
+    if sd is None:
+        return "No session data", state, gr.update()
+
+    from multi_person_split import interpolate_bbox_corrections
+
+    status_parts = []
+    identity_tracks = sd.get("identity_tracks", [])
+
+    for id_track in identity_tracks:
+        pid = id_track.person_id
+        original = sd.get("original_bboxes", {}).get(pid)
+        if original is None:
+            continue
+
+        # Extract bbox corrections from identity keyframes
+        kf_corrections = {}
+        for kf in id_track.keyframes:
+            f = kf.frame_index
+            if f < len(original) and kf.bbox is not None:
+                kf_corrections[f] = np.array(kf.bbox, dtype=np.float32)
+
+        if not kf_corrections:
+            continue
+
+        # Store as bbox corrections
+        sd.setdefault("bbox_corrections", {}).setdefault(pid, {}).update(kf_corrections)
+
+        # Interpolate between keyframes
+        all_corrections = sd["bbox_corrections"][pid]
+        updated = interpolate_bbox_corrections(original, all_corrections)
+        sd["all_bboxes"][pid] = updated
+
+        # Expand interpolated frames into corrections
+        sorted_frames = sorted(all_corrections.keys())
+        if len(sorted_frames) >= 2:
+            first_f = sorted_frames[0]
+            last_f = sorted_frames[-1]
+            for f in range(first_f, last_f + 1):
+                if f not in all_corrections and f < len(original):
+                    if not np.allclose(updated[f], original[f], atol=0.5):
+                        all_corrections[f] = updated[f].copy()
+
+        sd.setdefault("dirty_persons", set()).add(pid)
+        _save_bbox_corrections(session_id, pid)
+        n = len(all_corrections)
+        status_parts.append(f"Person {pid}: {n} frames from {len(kf_corrections)} keyframes")
+
+    if not status_parts:
+        return "No keyframes with bboxes found", state, gr.update()
+
+    status = "Applied keyframes:\n" + "\n".join(status_parts)
+    return status, state, gr.update(value=_reprocess_btn_label(session_id))
+
+
 def on_reprocess_all_dirty(state, progress=gr.Progress(track_tqdm=False)):
     """Reprocess all persons with pending bbox edits."""
     if state is None:
@@ -1163,6 +1230,10 @@ def build_identity_panel() -> dict[str, Any]:
         )
         cancel_edit_btn = gr.Button("Cancel Edit", size="sm", scale=0, min_width=100)
         interpolate_btn = gr.Button("Interpolate Bboxes", size="sm", scale=0, min_width=140)
+        apply_kf_btn = gr.Button(
+            "Apply Keyframes", size="sm", scale=0, min_width=140,
+            info="Use identity keyframe bboxes as corrections for all persons",
+        )
         reprocess_btn = gr.Button(
             "Reprocess All (0 dirty)", variant="primary", size="sm", scale=0, min_width=180,
         )
@@ -1262,6 +1333,12 @@ def build_identity_panel() -> dict[str, Any]:
 
     interpolate_btn.click(
         fn=on_interpolate_bboxes,
+        inputs=[panel_state],
+        outputs=[bbox_edit_status, panel_state, reprocess_btn],
+    )
+
+    apply_kf_btn.click(
+        fn=on_apply_keyframes,
         inputs=[panel_state],
         outputs=[bbox_edit_status, panel_state, reprocess_btn],
     )

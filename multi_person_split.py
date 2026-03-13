@@ -539,8 +539,31 @@ def split_multi_person_video(
     except Exception as e:
         _progress(0.84, f"Identity verification skipped: {e}")
 
+    # ── Step 5.7: Generate per-person BVH ──
+    _progress(0.85, "Generating BVH files...")
+
+    try:
+        from smplx_to_bvh import convert_params_to_bvh
+
+        for i, person_dir in enumerate(person_dirs):
+            pt_files = list(person_dir.rglob("hmr4d_results.pt"))
+            if not pt_files:
+                continue
+            bvh_path = person_dir / "body.bvh"
+            if bvh_path.exists():
+                continue
+            try:
+                convert_params_to_bvh(str(pt_files[0]), str(bvh_path))
+                _progress(0.85 + (i + 1) / len(person_dirs) * 0.05,
+                          f"Person {i} BVH exported")
+            except Exception as e:
+                _progress(0.85 + (i + 1) / len(person_dirs) * 0.05,
+                          f"Person {i} BVH failed: {e}")
+    except Exception as e:
+        _progress(0.90, f"BVH generation skipped: {e}")
+
     # ── Step 6: World-space assembly ──
-    _progress(0.85, "Assembling world-space results...")
+    _progress(0.90, "Assembling world-space results...")
 
     from world_assembly import assemble_scene, save_session_manifest
 
