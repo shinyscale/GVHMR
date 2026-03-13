@@ -892,6 +892,7 @@ def run_multi_person_pipeline(
     multi_static_cam: bool,
     multi_use_dpvo: bool,
     max_persons: int,
+    render_overlays: bool = False,
     progress=gr.Progress(track_tqdm=False),
 ):
     """Run the multi-person capture pipeline."""
@@ -941,6 +942,7 @@ def run_multi_person_pipeline(
             static_cam=multi_static_cam,
             use_dpvo=multi_use_dpvo,
             max_persons=int(max_persons) if max_persons else 0,
+            render_overlays=render_overlays,
             progress_callback=mp_progress,
         )
     except Exception as e:
@@ -963,17 +965,28 @@ def run_multi_person_pipeline(
     if scene_preview_path.exists():
         scene_preview = str(scene_preview_path)
 
-    # Collect per-person BVH/FBX files
+    # Collect per-person BVH files and convert to FBX
     bvh_files = []
     fbx_files = []
-    for person_dir in result.person_dirs:
+    naming_key = "ue5" if "ue5" in fbx_naming.lower() else "mixamo"
+    for i, person_dir in enumerate(result.person_dirs):
         person_dir = Path(person_dir)
         bvh = list(person_dir.rglob("*.bvh"))
-        fbx = list(person_dir.rglob("*.fbx"))
         if bvh:
-            bvh_files.append(str(bvh[0]))
-        if fbx:
-            fbx_files.append(str(fbx[0]))
+            bvh_path = str(bvh[0])
+            bvh_files.append(bvh_path)
+            fbx_path = str(Path(bvh_path).with_suffix(".fbx"))
+            if not Path(fbx_path).exists():
+                progress(0.92 + i * 0.02, desc=f"Converting person {i} BVH to FBX...")
+                fbx_log = convert_bvh_to_fbx(bvh_path, fbx_path, fps=fps, naming=naming_key)
+                log_lines.append(f"[FBX] Person {i}: {fbx_log}")
+                if "ERROR" in fbx_log:
+                    continue
+            fbx_files.append(fbx_path)
+        else:
+            fbx = list(person_dir.rglob("*.fbx"))
+            if fbx:
+                fbx_files.append(str(fbx[0]))
 
     manifest_path = output_dir / "session_manifest.json"
     manifest = str(manifest_path) if manifest_path.exists() else None
@@ -1049,6 +1062,10 @@ with gr.Blocks(
                 with gr.Column(scale=1):
                     static_cam = gr.Checkbox(label="Static Camera", value=False)
                     use_dpvo = gr.Checkbox(label="Use DPVO (better camera, slower)", value=False)
+                    static_cam.change(
+                        fn=lambda s: gr.update(interactive=not s, value=False if s else gr.update()),
+                        inputs=[static_cam], outputs=[use_dpvo],
+                    )
                     focal_length = gr.Textbox(
                         label="Focal Length (mm, leave blank for auto)",
                         placeholder="auto",
@@ -1131,6 +1148,10 @@ with gr.Blocks(
                             label="Use DPVO", value=False,
                             info="GVHMR option: better camera estimation, slower",
                         )
+                    hybrid_static_cam.change(
+                        fn=lambda s: gr.update(interactive=not s, value=False if s else gr.update()),
+                        inputs=[hybrid_static_cam], outputs=[hybrid_use_dpvo],
+                    )
                     perf_fps = gr.Textbox(
                         label="Target FPS",
                         value="30",
@@ -1276,6 +1297,10 @@ with gr.Blocks(
                             label="Use DPVO", value=False,
                             info="Better camera estimation, slower",
                         )
+                    mp_static_cam.change(
+                        fn=lambda s: gr.update(interactive=not s, value=False if s else gr.update()),
+                        inputs=[mp_static_cam], outputs=[mp_use_dpvo],
+                    )
                     mp_max_persons = gr.Number(
                         label="Max Persons (0 = all)",
                         value=0,
@@ -1291,6 +1316,11 @@ with gr.Blocks(
                         label="FBX Bone Naming",
                         choices=["Mixamo (Cascadeur)", "UE5 Mannequin"],
                         value="Mixamo (Cascadeur)",
+                    )
+                    mp_render_overlays = gr.Checkbox(
+                        label="Render per-person overlays",
+                        value=False,
+                        info="Render in-camera mesh overlay per person (slower)",
                     )
                     mp_run_btn = gr.Button(
                         "Run Multi-Person Pipeline",
@@ -1334,7 +1364,7 @@ with gr.Blocks(
                 fn=run_multi_person_pipeline,
                 inputs=[
                     mp_video_upload, mp_video_path, mp_fps, mp_fbx_naming,
-                    mp_static_cam, mp_use_dpvo, mp_max_persons,
+                    mp_static_cam, mp_use_dpvo, mp_max_persons, mp_render_overlays,
                 ],
                 outputs=[
                     mp_track_viz, mp_scene_preview, mp_person_count,

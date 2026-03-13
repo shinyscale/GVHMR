@@ -52,6 +52,8 @@ def parse_args_to_cfg():
         "If the camera zoom in a lot, you can try 135, 200 or even larger values.",
     )
     parser.add_argument("--verbose", action="store_true", help="If true, draw intermediate results")
+    parser.add_argument("--skip_render", action="store_true", help="Skip all video rendering (solve only)")
+    parser.add_argument("--render_incam_only", action="store_true", help="Render in-camera overlay only (skip global)")
     parser.add_argument(
         "--slam_override",
         type=str,
@@ -88,10 +90,12 @@ def parse_args_to_cfg():
     Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
     Path(cfg.preprocess_dir).mkdir(parents=True, exist_ok=True)
 
-    # Attach slam_override as a runtime attribute (not in Hydra schema)
+    # Attach runtime args (not in Hydra schema)
     from omegaconf import OmegaConf
     OmegaConf.set_struct(cfg, False)
     cfg.slam_override = args.slam_override
+    cfg.skip_render = args.skip_render
+    cfg.render_incam_only = args.render_incam_only
     OmegaConf.set_struct(cfg, True)
 
     # Copy raw-input-video to video_path
@@ -346,8 +350,10 @@ if __name__ == "__main__":
         torch.save(pred, paths.hmr4d_results)
 
     # ===== Render ===== #
-    render_incam(cfg)
-    render_global(cfg)
-    if not Path(paths.incam_global_horiz_video).exists():
-        Log.info("[Merge Videos]")
-        merge_videos_horizontal([paths.incam_video, paths.global_video], paths.incam_global_horiz_video)
+    if not getattr(cfg, "skip_render", False):
+        render_incam(cfg)
+        if not getattr(cfg, "render_incam_only", False):
+            render_global(cfg)
+            if not Path(paths.incam_global_horiz_video).exists():
+                Log.info("[Merge Videos]")
+                merge_videos_horizontal([paths.incam_video, paths.global_video], paths.incam_global_horiz_video)

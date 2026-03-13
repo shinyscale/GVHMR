@@ -107,6 +107,8 @@ def run_person_pipeline(
     static_cam=False,
     use_dpvo=False,
     f_mm=None,
+    skip_render=False,
+    render_incam_only=False,
 ):
     """Run the existing single-person GVHMR pipeline on an isolated person video.
 
@@ -118,6 +120,8 @@ def run_person_pipeline(
         static_cam: whether camera is static
         use_dpvo: whether to use DPVO (ignored if slam_override provided)
         f_mm: focal length override
+        skip_render: skip all video rendering (solve only)
+        render_incam_only: render in-camera overlay only (skip global)
 
     Returns:
         (pt_path, log_lines) tuple
@@ -137,6 +141,10 @@ def run_person_pipeline(
         cmd.append(f"--f_mm={f_mm}")
     if slam_override_path:
         cmd.append(f"--slam_override={slam_override_path}")
+    if skip_render:
+        cmd.append("--skip_render")
+    elif render_incam_only:
+        cmd.append("--render_incam_only")
 
     log_lines = [f"[Person {person_id}] Running GVHMR: {' '.join(cmd)}", ""]
 
@@ -178,6 +186,7 @@ def split_multi_person_video(
     use_dpvo=False,
     f_mm=None,
     max_persons=0,
+    render_overlays=False,
     progress_callback=None,
 ):
     """Full multi-person isolation pipeline.
@@ -410,6 +419,8 @@ def split_multi_person_video(
             static_cam=static_cam,
             use_dpvo=use_dpvo,
             f_mm=f_mm,
+            skip_render=not render_overlays,
+            render_incam_only=render_overlays,
         )
 
         if pt_path is None:
@@ -647,6 +658,7 @@ def reprocess_person(
             slam_override_path=slam_path if not static_cam else None,
             static_cam=static_cam,
             use_dpvo=use_dpvo,
+            skip_render=True,
         )
     except Exception as e:
         print(f"[reprocess_person] Pipeline crashed for person {person_index}: {e}")

@@ -1086,69 +1086,27 @@ def build_identity_panel() -> dict[str, Any]:
             visible=True,
         )
 
-    with gr.Row():
-        # Left: Frame preview
-        with gr.Column(scale=2):
-            # CSS to prevent native browser image drag (otherwise misclicks
-            # drag a thumbnail of the video frame around instead of editing)
-            gr.HTML(
-                "<style>"
-                "#bbox_frame_preview img { "
-                "  -webkit-user-drag: none; "
-                "  user-select: none; "
-                "  pointer-events: auto; "
-                "}"
-                "</style>"
-            )
-            frame_image = gr.Image(
-                label="Frame Preview (click bbox corner to edit)",
-                interactive=False,
-                type="numpy",
-                elem_id="bbox_frame_preview",
-            )
+    # CSS to prevent native browser image drag (otherwise misclicks
+    # drag a thumbnail of the video frame around instead of editing)
+    gr.HTML(
+        "<style>"
+        "#bbox_frame_preview img { "
+        "  -webkit-user-drag: none; "
+        "  user-select: none; "
+        "  pointer-events: auto; "
+        "}"
+        "</style>"
+    )
 
-        # Right: Info panel
-        with gr.Column(scale=1):
-            gr.Markdown("**Confidence Breakdown**")
-            with gr.Row():
-                conf_detection = gr.Textbox(label="Detection", interactive=False, scale=1)
-                conf_visibility = gr.Textbox(label="Visibility", interactive=False, scale=1)
-            with gr.Row():
-                conf_overlap = gr.Textbox(label="Overlap", interactive=False, scale=1)
-                conf_shape = gr.Textbox(label="Shape", interactive=False, scale=1)
-            with gr.Row():
-                conf_motion = gr.Textbox(label="Motion", interactive=False, scale=1)
-                conf_overall = gr.Textbox(label="Overall", interactive=False, scale=1)
+    # Frame preview (full width)
+    frame_image = gr.Image(
+        label="Frame Preview (click bbox corner to edit)",
+        interactive=False,
+        type="numpy",
+        elem_id="bbox_frame_preview",
+    )
 
-            gr.Markdown("**Bbox Corrections**")
-            bbox_edit_status = gr.Textbox(
-                label="Status", value="", interactive=False,
-            )
-            with gr.Row():
-                cancel_edit_btn = gr.Button("Cancel Edit", size="sm", min_width=100)
-                interpolate_btn = gr.Button("Interpolate Bboxes", size="sm", min_width=140)
-            with gr.Row():
-                reprocess_btn = gr.Button(
-                    "Reprocess All (0 dirty)", variant="primary", size="sm",
-                )
-            reprocess_status = gr.Textbox(
-                label="Reprocess Status", value="", interactive=False, lines=3,
-            )
-
-            gr.Markdown("**Keyframes**")
-            kf_dataframe = gr.DataFrame(
-                headers=["Frame", "Time", "Confidence", "Verified"],
-                datatype=["number", "str", "str", "str"],
-                interactive=False,
-                row_count=(5, "dynamic"),
-            )
-
-    # ── Pose Corrector sub-panel ──
-    # Uses shared frame_slider and panel_state (wired after slider is created below)
-    # We need to create the slider first, then build the pose panel
-
-    # Timeline
-    gr.Markdown("**Timeline**")
+    # Timeline controls right under the frame
     with gr.Row():
         first_btn = gr.Button("|<", size="sm", scale=0, min_width=40)
         back10_btn = gr.Button("<<", size="sm", scale=0, min_width=40)
@@ -1175,6 +1133,42 @@ def build_identity_panel() -> dict[str, Any]:
     )
 
     confidence_plot = gr.Plot(label="Confidence Timeline")
+
+    # Keyframes + confidence breakdown side by side
+    with gr.Row():
+        with gr.Column(scale=2):
+            kf_dataframe = gr.DataFrame(
+                headers=["Frame", "Time", "Confidence", "Verified"],
+                datatype=["number", "str", "str", "str"],
+                interactive=False,
+                row_count=(5, "dynamic"),
+            )
+
+        with gr.Column(scale=1):
+            gr.Markdown("**Confidence Breakdown**")
+            with gr.Row():
+                conf_detection = gr.Textbox(label="Detection", interactive=False, scale=1)
+                conf_visibility = gr.Textbox(label="Visibility", interactive=False, scale=1)
+            with gr.Row():
+                conf_overlap = gr.Textbox(label="Overlap", interactive=False, scale=1)
+                conf_shape = gr.Textbox(label="Shape", interactive=False, scale=1)
+            with gr.Row():
+                conf_motion = gr.Textbox(label="Motion", interactive=False, scale=1)
+                conf_overall = gr.Textbox(label="Overall", interactive=False, scale=1)
+
+    # Bbox corrections
+    with gr.Row():
+        bbox_edit_status = gr.Textbox(
+            label="Bbox Edit Status", value="", interactive=False, scale=2,
+        )
+        cancel_edit_btn = gr.Button("Cancel Edit", size="sm", scale=0, min_width=100)
+        interpolate_btn = gr.Button("Interpolate Bboxes", size="sm", scale=0, min_width=140)
+        reprocess_btn = gr.Button(
+            "Reprocess All (0 dirty)", variant="primary", size="sm", scale=0, min_width=180,
+        )
+    reprocess_status = gr.Textbox(
+        label="Reprocess Status", value="", interactive=False, lines=2,
+    )
 
     # ── Pose Corrector sub-panel (embedded below timeline) ──
     pose_panel = build_pose_correction_panel(frame_slider, panel_state)
