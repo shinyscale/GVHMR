@@ -13,6 +13,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
+from PIL import Image
 from tqdm import tqdm
 
 from hmr4d.utils.video_io_utils import get_video_lwh
@@ -77,7 +78,12 @@ def should_inpaint_frame(
 
 
 class ProPainterInpainter:
-    """ProPainter video inpainting wrapper."""
+    """ProPainter video inpainting wrapper using the full 4-stage pipeline:
+    1. Optical flow estimation (RAFT)
+    2. Flow completion (RecurrentFlowCompleteNet)
+    3. Image propagation (fill from temporal neighbors)
+    4. Transformer-based inpainting (InpaintGenerator)
+    """
 
     def __init__(self, model_path: str | None = None, device: str = "cuda"):
         if not PROPAINTER_AVAILABLE and model_path is None:
@@ -95,108 +101,247 @@ class ProPainterInpainter:
         if pp_path not in sys.path:
             sys.path.insert(0, pp_path)
 
+        self._raft = None
+        self._flow_complete = None
         self._model = None
 
     def _ensure_loaded(self):
-        """Lazy-load ProPainter model."""
+        """Lazy-load all ProPainter models (RAFT, flow completion, inpainter)."""
         if self._model is not None:
             return
 
-        from inference_propainter import InpaintGenerator
-        from core.utils import to_tensors
+        from model.modules.flow_comp_raft import RAFT_bi
+        from model.recurrent_flow_completion import RecurrentFlowCompleteNet
+        from model.propainter import InpaintGenerator
+        from utils.download_util import load_file_from_url
 
-        # Load model weights
-        ckpt_path = Path(self.model_path) / "weights" / "ProPainter.pth"
-        if not ckpt_path.exists():
-            ckpt_path = Path(self.model_path) / "pretrained_models" / "ProPainter.pth"
-        if not ckpt_path.exists():
-            raise FileNotFoundError(
-                f"ProPainter weights not found at {ckpt_path}. "
-                "Download from https://github.com/sczhou/ProPainter"
-            )
+        weights_dir = Path(self.model_path) / "weights"
+        weights_dir.mkdir(exist_ok=True)
+        pretrain_url = "https://github.com/sczhou/ProPainter/releases/download/v0.1.0/"
 
-        model = InpaintGenerator().to(self.device)
-        data = torch.load(str(ckpt_path), map_location=self.device, weights_only=False)
-        model.load_state_dict(data, strict=False)
-        model.eval()
-        self._model = model
+        # RAFT optical flow
+        raft_path = load_file_from_url(
+            url=pretrain_url + "raft-things.pth",
+            model_dir=str(weights_dir), progress=True,
+        )
+        self._raft = RAFT_bi(raft_path, self.device)
+
+        # Flow completion
+        fc_path = load_file_from_url(
+            url=pretrain_url + "recurrent_flow_completion.pth",
+            model_dir=str(weights_dir), progress=True,
+        )
+        self._flow_complete = RecurrentFlowCompleteNet(fc_path)
+        for p in self._flow_complete.parameters():
+            p.requires_grad = False
+        self._flow_complete.to(self.device)
+        self._flow_complete.eval()
+
+        # InpaintGenerator
+        pp_path = load_file_from_url(
+            url=pretrain_url + "ProPainter.pth",
+            model_dir=str(weights_dir), progress=True,
+        )
+        self._model = InpaintGenerator(model_path=pp_path).to(self.device)
+        self._model.eval()
 
     def inpaint_video(
         self,
         frames: np.ndarray,
         masks: np.ndarray,
-        chunk_size: int = 80,
-        chunk_overlap: int = 10,
+        subvideo_length: int = 80,
+        neighbor_length: int = 10,
+        ref_stride: int = 10,
+        raft_iter: int = 20,
+        mask_dilation: int = 4,
     ) -> np.ndarray:
-        """Inpaint masked regions in video frames.
+        """Inpaint masked regions in video frames using full ProPainter pipeline.
 
         Args:
             frames: (N, H, W, 3) uint8 RGB frames
             masks: (N, H, W) bool — True where inpainting is needed
-            chunk_size: process video in chunks of this many frames
-            chunk_overlap: overlap between chunks for temporal consistency
+            subvideo_length: chunk size for long video processing
+            neighbor_length: local temporal window for transformer
+            ref_stride: stride for reference frame selection
+            raft_iter: RAFT optical flow iterations
+            mask_dilation: dilation applied to masks for flow/inpainting
 
         Returns:
             (N, H, W, 3) uint8 inpainted frames
         """
         self._ensure_loaded()
 
-        n_frames = len(frames)
+        from core.utils import to_tensors
+        from inference_propainter import get_ref_index
+
+        n_frames, h, w, _ = frames.shape
         output = frames.copy()
 
-        # Process in chunks
-        start = 0
-        while start < n_frames:
-            end = min(start + chunk_size, n_frames)
-            chunk_frames = frames[start:end]
-            chunk_masks = masks[start:end]
+        # Convert frames to PIL Images for to_tensors()
+        pil_frames = [Image.fromarray(f) for f in frames]
 
-            # Skip chunk if no masks
-            if not chunk_masks.any():
-                start = end - chunk_overlap
-                if start >= end:
-                    break
-                continue
+        # Dilate masks for flow and inpainting
+        kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+        masks_dilated_pil = []
+        flow_masks_pil = []
+        for i in range(n_frames):
+            m = masks[i].astype(np.uint8) * 255
+            # Flow mask: smaller dilation
+            fm = cv2.dilate(m, kernel, iterations=mask_dilation // 2)
+            flow_masks_pil.append(Image.fromarray(fm))
+            # Inpainting mask: full dilation
+            md = cv2.dilate(m, kernel, iterations=mask_dilation)
+            masks_dilated_pil.append(Image.fromarray(md))
 
-            inpainted = self._inpaint_chunk(chunk_frames, chunk_masks)
-
-            # Blend overlap region
-            if start > 0 and chunk_overlap > 0:
-                overlap_start = 0
-                overlap_end = min(chunk_overlap, len(inpainted))
-                for i in range(overlap_start, overlap_end):
-                    alpha = i / chunk_overlap
-                    frame_idx = start + i
-                    output[frame_idx] = (
-                        output[frame_idx] * (1 - alpha) + inpainted[i] * alpha
-                    ).astype(np.uint8)
-                output[start + overlap_end:end] = inpainted[overlap_end:]
-            else:
-                output[start:end] = inpainted
-
-            start = end - chunk_overlap
-            if start >= end:
-                break
-
-        return output
-
-    def _inpaint_chunk(self, frames: np.ndarray, masks: np.ndarray) -> np.ndarray:
-        """Inpaint a single chunk using ProPainter."""
-        # Convert to tensors
-        frames_t = torch.from_numpy(frames).float().permute(0, 3, 1, 2) / 255.0  # (N,3,H,W)
-        masks_t = torch.from_numpy(masks.astype(np.float32)).unsqueeze(1)  # (N,1,H,W)
+        # Convert to tensors: (1, T, C, H, W) in [-1, 1]
+        frames_t = to_tensors()(pil_frames).unsqueeze(0) * 2 - 1
+        flow_masks_t = to_tensors()(flow_masks_pil).unsqueeze(0)
+        masks_dilated_t = to_tensors()(masks_dilated_pil).unsqueeze(0)
 
         frames_t = frames_t.to(self.device)
-        masks_t = masks_t.to(self.device)
+        flow_masks_t = flow_masks_t.to(self.device)
+        masks_dilated_t = masks_dilated_t.to(self.device)
+
+        video_length = frames_t.size(1)
 
         with torch.no_grad():
-            result = self._model(frames_t, masks_t)
+            # Stage 1: Compute optical flow with RAFT
+            if w <= 640:
+                short_clip_len = 12
+            elif w <= 720:
+                short_clip_len = 8
+            elif w <= 1280:
+                short_clip_len = 4
+            else:
+                short_clip_len = 2
 
-        # Composite: keep original where no mask, use inpainted where masked
-        result_np = (result.permute(0, 2, 3, 1).cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-        masks_3ch = np.repeat(masks[:, :, :, np.newaxis], 3, axis=3)
-        output = np.where(masks_3ch, result_np, frames)
+            if video_length > short_clip_len:
+                gt_flows_f_list, gt_flows_b_list = [], []
+                for f in range(0, video_length, short_clip_len):
+                    end_f = min(video_length, f + short_clip_len)
+                    if f == 0:
+                        flows_f, flows_b = self._raft(frames_t[:, f:end_f], iters=raft_iter)
+                    else:
+                        flows_f, flows_b = self._raft(frames_t[:, f - 1:end_f], iters=raft_iter)
+                    gt_flows_f_list.append(flows_f)
+                    gt_flows_b_list.append(flows_b)
+                    torch.cuda.empty_cache()
+                gt_flows_bi = (torch.cat(gt_flows_f_list, dim=1), torch.cat(gt_flows_b_list, dim=1))
+            else:
+                gt_flows_bi = self._raft(frames_t, iters=raft_iter)
+                torch.cuda.empty_cache()
 
+            # Stage 2: Complete flow in masked regions
+            flow_length = gt_flows_bi[0].size(1)
+            if flow_length > subvideo_length:
+                pred_flows_f, pred_flows_b = [], []
+                pad_len = 5
+                for f in range(0, flow_length, subvideo_length):
+                    s_f = max(0, f - pad_len)
+                    e_f = min(flow_length, f + subvideo_length + pad_len)
+                    pad_len_s = max(0, f) - s_f
+                    pad_len_e = e_f - min(flow_length, f + subvideo_length)
+                    pred_flows_bi_sub, _ = self._flow_complete.forward_bidirect_flow(
+                        (gt_flows_bi[0][:, s_f:e_f], gt_flows_bi[1][:, s_f:e_f]),
+                        flow_masks_t[:, s_f:e_f + 1])
+                    pred_flows_bi_sub = self._flow_complete.combine_flow(
+                        (gt_flows_bi[0][:, s_f:e_f], gt_flows_bi[1][:, s_f:e_f]),
+                        pred_flows_bi_sub,
+                        flow_masks_t[:, s_f:e_f + 1])
+                    pred_flows_f.append(pred_flows_bi_sub[0][:, pad_len_s:e_f - s_f - pad_len_e])
+                    pred_flows_b.append(pred_flows_bi_sub[1][:, pad_len_s:e_f - s_f - pad_len_e])
+                    torch.cuda.empty_cache()
+                pred_flows_bi = (torch.cat(pred_flows_f, dim=1), torch.cat(pred_flows_b, dim=1))
+            else:
+                pred_flows_bi, _ = self._flow_complete.forward_bidirect_flow(gt_flows_bi, flow_masks_t)
+                pred_flows_bi = self._flow_complete.combine_flow(gt_flows_bi, pred_flows_bi, flow_masks_t)
+                torch.cuda.empty_cache()
+
+            # Free flow memory
+            del gt_flows_bi
+
+            # Stage 3: Image propagation (fill from temporal neighbors)
+            masked_frames = frames_t * (1 - masks_dilated_t)
+            subvideo_length_prop = min(100, subvideo_length)
+            if video_length > subvideo_length_prop:
+                updated_frames, updated_masks = [], []
+                pad_len = 10
+                for f in range(0, video_length, subvideo_length_prop):
+                    s_f = max(0, f - pad_len)
+                    e_f = min(video_length, f + subvideo_length_prop + pad_len)
+                    pad_len_s = max(0, f) - s_f
+                    pad_len_e = e_f - min(video_length, f + subvideo_length_prop)
+
+                    b, t, _, _, _ = masks_dilated_t[:, s_f:e_f].size()
+                    pred_flows_bi_sub = (pred_flows_bi[0][:, s_f:e_f - 1], pred_flows_bi[1][:, s_f:e_f - 1])
+                    prop_imgs_sub, updated_local_masks_sub = self._model.img_propagation(
+                        masked_frames[:, s_f:e_f], pred_flows_bi_sub,
+                        masks_dilated_t[:, s_f:e_f], 'nearest')
+                    updated_frames_sub = frames_t[:, s_f:e_f] * (1 - masks_dilated_t[:, s_f:e_f]) + \
+                        prop_imgs_sub.view(b, t, 3, h, w) * masks_dilated_t[:, s_f:e_f]
+                    updated_masks_sub = updated_local_masks_sub.view(b, t, 1, h, w)
+                    updated_frames.append(updated_frames_sub[:, pad_len_s:e_f - s_f - pad_len_e])
+                    updated_masks.append(updated_masks_sub[:, pad_len_s:e_f - s_f - pad_len_e])
+                    torch.cuda.empty_cache()
+                updated_frames = torch.cat(updated_frames, dim=1)
+                updated_masks = torch.cat(updated_masks, dim=1)
+            else:
+                b, t, _, _, _ = masks_dilated_t.size()
+                prop_imgs, updated_local_masks = self._model.img_propagation(
+                    masked_frames, pred_flows_bi, masks_dilated_t, 'nearest')
+                updated_frames = frames_t * (1 - masks_dilated_t) + prop_imgs.view(b, t, 3, h, w) * masks_dilated_t
+                updated_masks = updated_local_masks.view(b, t, 1, h, w)
+                torch.cuda.empty_cache()
+
+        # Stage 4: Transformer-based inpainting
+        ori_frames = [np.array(f) for f in pil_frames]
+        comp_frames = [None] * video_length
+        neighbor_stride = neighbor_length // 2
+        if video_length > subvideo_length:
+            ref_num = subvideo_length // ref_stride
+        else:
+            ref_num = -1
+
+        for f in tqdm(range(0, video_length, neighbor_stride), desc="ProPainter inpaint"):
+            neighbor_ids = list(range(
+                max(0, f - neighbor_stride),
+                min(video_length, f + neighbor_stride + 1),
+            ))
+            ref_ids = get_ref_index(f, neighbor_ids, video_length, ref_stride, ref_num)
+            selected_imgs = updated_frames[:, neighbor_ids + ref_ids, :, :, :]
+            selected_masks = masks_dilated_t[:, neighbor_ids + ref_ids, :, :, :]
+            selected_update_masks = updated_masks[:, neighbor_ids + ref_ids, :, :, :]
+            selected_pred_flows_bi = (
+                pred_flows_bi[0][:, neighbor_ids[:-1], :, :, :],
+                pred_flows_bi[1][:, neighbor_ids[:-1], :, :, :],
+            )
+
+            with torch.no_grad():
+                l_t = len(neighbor_ids)
+                pred_img = self._model(
+                    selected_imgs, selected_pred_flows_bi,
+                    selected_masks, selected_update_masks, l_t,
+                )
+                pred_img = pred_img.view(-1, 3, h, w)
+                pred_img = (pred_img + 1) / 2
+                pred_img = pred_img.cpu().permute(0, 2, 3, 1).numpy() * 255
+                binary_masks = masks_dilated_t[0, neighbor_ids, :, :, :].cpu().permute(
+                    0, 2, 3, 1).numpy().astype(np.uint8)
+                for i in range(len(neighbor_ids)):
+                    idx = neighbor_ids[i]
+                    img = np.array(pred_img[i]).astype(np.uint8) * binary_masks[i] \
+                        + ori_frames[idx] * (1 - binary_masks[i])
+                    if comp_frames[idx] is None:
+                        comp_frames[idx] = img
+                    else:
+                        comp_frames[idx] = comp_frames[idx].astype(np.float32) * 0.5 + img.astype(np.float32) * 0.5
+
+        # Composite results back
+        for i in range(n_frames):
+            if comp_frames[i] is not None:
+                output[i] = comp_frames[i].astype(np.uint8)
+
+        torch.cuda.empty_cache()
         return output
 
     def cleanup(self):
@@ -204,7 +349,13 @@ class ProPainterInpainter:
         if self._model is not None:
             del self._model
             self._model = None
-            torch.cuda.empty_cache()
+        if self._raft is not None:
+            del self._raft
+            self._raft = None
+        if self._flow_complete is not None:
+            del self._flow_complete
+            self._flow_complete = None
+        torch.cuda.empty_cache()
 
 
 def isolate_person(
@@ -266,19 +417,19 @@ def isolate_person(
     cap.release()
     frames = np.array(frames[:num_frames])
 
+    # Build mask of all OTHER people's pixels
+    other_mask = np.zeros((num_frames, video_h, video_w), dtype=bool)
+    for pid, pmasks in all_masks.items():
+        if pid == target_person_id:
+            continue
+        n = min(num_frames, pmasks.shape[0])
+        other_mask[:n] |= pmasks[:n]
+
     if needs_inpaint:
-        # Build inpaint mask: combine all OTHER people's masks
         print(f"[Isolate] Person {target_person_id}: {isolation_modes.count('inpaint')}/{len(isolation_modes)} frames need inpainting")
 
-        inpaint_mask = np.zeros((num_frames, video_h, video_w), dtype=bool)
-        for pid, pmasks in all_masks.items():
-            if pid == target_person_id:
-                continue
-            n = min(num_frames, pmasks.shape[0])
-            inpaint_mask[:n] |= pmasks[:n]
-
-        # Only inpaint frames that actually need it
-        # For crop-only frames, zero out the mask
+        # For inpainting, only mask overlap frames
+        inpaint_mask = other_mask.copy()
         for f in range(len(isolation_modes)):
             if isolation_modes[f] == "crop":
                 inpaint_mask[f] = False
@@ -292,8 +443,14 @@ def isolate_person(
                 inpainted_rgb = inpainter.inpaint_video(frames_rgb, inpaint_mask)
                 frames = inpainted_rgb[:, :, :, ::-1].copy()
             except (ImportError, FileNotFoundError) as e:
-                print(f"[Isolate] ProPainter not available ({e}). Using crop-only fallback.")
+                print(f"[Isolate] ProPainter not available ({e}). Using mask blackout fallback.")
                 isolation_modes = ["crop"] * len(isolation_modes)
+
+    # Black out other people's pixels on any frame that wasn't inpainted
+    # This ensures GVHMR's detector can only see the target person
+    for f in range(min(num_frames, len(isolation_modes))):
+        if isolation_modes[f] == "crop" and f < other_mask.shape[0] and other_mask[f].any():
+            frames[f][other_mask[f]] = 0
 
     # Crop and write output
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")

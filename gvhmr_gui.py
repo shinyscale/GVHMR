@@ -1348,7 +1348,7 @@ with gr.Blocks(
             )
 
             with gr.Accordion("Identity Inspector", open=False) as id_inspector_accordion:
-                id_panel = build_identity_panel()
+                id_panel = build_identity_panel(scene_preview_video=mp_scene_preview)
                 mp_confidence_files = gr.File(
                     label="Confidence CSVs",
                     file_count="multiple",

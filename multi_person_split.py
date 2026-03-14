@@ -508,17 +508,25 @@ def split_multi_person_video(
 
                 person_video_paths.append(str(isolated_video))
             except ImportError:
-                # No ProPainter — crop only
+                # No ProPainter — crop with blackout of other people
+                other_bb = [
+                    all_tracks[j]["bbx_xyxy"].cpu().numpy()
+                    for j in range(len(all_tracks)) if j != i
+                ]
                 _crop_person_video(
                     video_path, track["bbx_xyxy"].cpu().numpy(),
-                    str(isolated_video),
+                    str(isolated_video), other_bboxes=other_bb,
                 )
                 person_video_paths.append(str(isolated_video))
         else:
-            # No masks available — crop only
+            # No masks available — crop with blackout of other people
+            other_bb = [
+                all_tracks[j]["bbx_xyxy"].cpu().numpy()
+                for j in range(len(all_tracks)) if j != i
+            ]
             _crop_person_video(
                 video_path, track["bbx_xyxy"].cpu().numpy(),
-                str(isolated_video),
+                str(isolated_video), other_bboxes=other_bb,
             )
             person_video_paths.append(str(isolated_video))
 
@@ -793,12 +801,23 @@ def reprocess_person(
     if progress_callback:
         progress_callback(0.1, f"Re-isolating person {person_index}...")
 
+    # Load ALL people's cached SAM2 masks so isolate_person can black out others
     masks = {}
     masks_dir_path = Path(masks_dir)
-    mask_file = masks_dir_path / f"person_{tid}_masks.npz"
-    if mask_file.exists():
-        mask_data = np.load(str(mask_file))
-        masks[tid] = mask_data["masks"]
+    for t in all_tracks:
+        other_tid = t.get("track_id", t.get("id"))
+        mask_file = masks_dir_path / f"person_{other_tid}_masks.npz"
+        if mask_file.exists():
+            mask_data = np.load(str(mask_file))
+            masks[other_tid] = mask_data["masks"]
+
+    # Collect other people's bboxes for blackout during crop isolation
+    other_bb = [
+        all_tracks[j]["bbx_xyxy"].cpu().numpy()
+        if isinstance(all_tracks[j]["bbx_xyxy"], torch.Tensor)
+        else all_tracks[j]["bbx_xyxy"]
+        for j in range(len(all_tracks)) if j != person_index
+    ]
 
     if len(all_tracks) == 1:
         shutil.copy2(video_path, str(isolated_video))
@@ -814,9 +833,11 @@ def reprocess_person(
                 output_path=str(isolated_video),
             )
         except ImportError:
-            _crop_person_video(video_path, updated_bboxes, str(isolated_video))
+            _crop_person_video(video_path, updated_bboxes, str(isolated_video),
+                               other_bboxes=other_bb)
     else:
-        _crop_person_video(video_path, updated_bboxes, str(isolated_video))
+        _crop_person_video(video_path, updated_bboxes, str(isolated_video),
+                           other_bboxes=other_bb)
 
     if not isolated_video.exists():
         # Restore backups — isolation failed
@@ -1029,14 +1050,16 @@ def _compute_overlap_map(masks, all_tracks):
     return overlap
 
 
-def _crop_person_video(video_path, bboxes, output_path, padding=40):
-    """Simple crop-only isolation: extract person's bbox region from each frame.
+def _crop_person_video(video_path, bboxes, output_path, padding=40,
+                       other_bboxes=None):
+    """Crop-and-mask isolation: extract person's bbox region, black out others.
 
     Args:
         video_path: input video
-        bboxes: (N_frames, 4) array of xyxy bboxes
+        bboxes: (N_frames, 4) array of xyxy bboxes for target person
         output_path: output video path
         padding: extra pixels around bbox
+        other_bboxes: list of (N_frames, 4) arrays for OTHER people to mask out
     """
     import cv2
 
@@ -1066,6 +1089,17 @@ def _crop_person_video(video_path, bboxes, output_path, padding=40):
         ret, frame = cap.read()
         if not ret:
             break
+
+        # Black out other people's bboxes before cropping
+        if other_bboxes:
+            for ob in other_bboxes:
+                if f < len(ob):
+                    ox1 = max(0, int(ob[f, 0]))
+                    oy1 = max(0, int(ob[f, 1]))
+                    ox2 = min(img_w, int(ob[f, 2]))
+                    oy2 = min(img_h, int(ob[f, 3]))
+                    frame[oy1:oy2, ox1:ox2] = 0
+
         crop = frame[y1_min:y1_min + crop_h, x1_min:x1_min + crop_w]
         writer.write(crop)
 

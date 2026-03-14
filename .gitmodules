@@ -1,3 +1,6 @@
 [submodule "third-party/DPVO"]
 	path = third-party/DPVO
 	url = https://github.com/princeton-vl/DPVO.git
+[submodule "third-party/ProPainter"]
+	path = third-party/ProPainter
+	url = https://github.com/sczhou/ProPainter

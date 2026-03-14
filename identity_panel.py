@@ -580,16 +580,19 @@ def on_person_change(person_str, frame_idx, state):
 
 
 def on_verify(frame_idx, state):
-    """Mark keyframe at current frame as verified (or create one)."""
+    """Mark keyframe at current frame as verified (or create one).
+
+    Also marks the person dirty so reprocessing picks up verified identity data.
+    """
     if state is None:
-        return state, *update_frame_display(0, state)
+        return state, gr.update(), *update_frame_display(0, state)
 
     session_id = state["session_id"]
     pid = state["selected_person"]
     frame_idx = int(frame_idx)
     track = _get_identity_track(session_id, pid)
     if track is None:
-        return state, *update_frame_display(frame_idx, state)
+        return state, gr.update(), *update_frame_display(frame_idx, state)
 
     # Find existing keyframe at this frame
     existing = [kf for kf in track.keyframes if kf.frame_index == frame_idx]
@@ -611,21 +614,24 @@ def on_verify(frame_idx, state):
             timestamp=frame_idx / sd.get("fps", 30.0),
         )
 
+    sd = _SESSION_DATA.get(session_id, {})
+    sd.setdefault("dirty_persons", set()).add(pid)
     _save_identity_track(session_id, pid)
-    return (state, *update_frame_display(frame_idx, state))
+    return (state, gr.update(value=_reprocess_btn_label(session_id)),
+            *update_frame_display(frame_idx, state))
 
 
 def on_add_keyframe(frame_idx, state):
-    """Add an unverified keyframe at current frame."""
+    """Add a keyframe at current frame and mark person dirty for reprocessing."""
     if state is None:
-        return state, *update_frame_display(0, state)
+        return state, gr.update(), *update_frame_display(0, state)
 
     session_id = state["session_id"]
     pid = state["selected_person"]
     frame_idx = int(frame_idx)
     track = _get_identity_track(session_id, pid)
     if track is None:
-        return state, *update_frame_display(frame_idx, state)
+        return state, gr.update(), *update_frame_display(frame_idx, state)
 
     bboxes = _get_bboxes_at_frame(session_id, frame_idx)
     confs = _get_confidences_at_frame(session_id, frame_idx)
@@ -641,8 +647,10 @@ def on_add_keyframe(frame_idx, state):
         verified=False,
         timestamp=frame_idx / sd.get("fps", 30.0),
     )
+    sd.setdefault("dirty_persons", set()).add(pid)
     _save_identity_track(session_id, pid)
-    return (state, *update_frame_display(frame_idx, state))
+    return (state, gr.update(value=_reprocess_btn_label(session_id)),
+            *update_frame_display(frame_idx, state))
 
 
 def on_remove_keyframe(frame_idx, state):
@@ -995,20 +1003,24 @@ def on_apply_keyframes(state):
     return status, state, gr.update(value=_reprocess_btn_label(session_id))
 
 
-def on_reprocess_all_dirty(state, progress=gr.Progress(track_tqdm=False)):
+def on_reprocess_all_dirty(state, progress=gr.Progress(track_tqdm=False),
+                           regenerate_preview: bool = False):
     """Reprocess all persons with pending bbox edits."""
+    _extra = (gr.update(),) if regenerate_preview else ()
+
     if state is None:
-        return state, "No session", gr.update(), *update_frame_display(0, state)
+        return state, "No session", gr.update(), *_extra, *update_frame_display(0, state)
 
     session_id = state.get("session_id", "")
     sd = _SESSION_DATA.get(session_id)
     if sd is None:
-        return state, "No session data", gr.update(), *update_frame_display(0, state)
+        return state, "No session data", gr.update(), *_extra, *update_frame_display(0, state)
 
     dirty = sd.get("dirty_persons", set())
     if not dirty:
         return (state, "No dirty persons",
                 gr.update(value=_reprocess_btn_label(session_id)),
+                *_extra,
                 *update_frame_display(state.get("current_frame", 0), state))
 
     from multi_person_split import reprocess_person
@@ -1086,11 +1098,44 @@ def on_reprocess_all_dirty(state, progress=gr.Progress(track_tqdm=False)):
             status_lines.append(f"Person {pid}: error \u2014 {e}")
 
     dirty.clear()
+
+    # Regenerate scene preview with updated results
+    scene_preview_update = gr.update()
+    if regenerate_preview:
+        try:
+            from multi_person_split import render_multi_person_incam
+            assembly_dir = Path(sd["output_dir"]) / "assembly"
+            assembly_dir.mkdir(parents=True, exist_ok=True)
+            scene_path = str(assembly_dir / "scene_preview.mp4")
+            Path(scene_path).unlink(missing_ok=True)
+
+            # Ensure person_dirs matches all_tracks order
+            person_dirs_ordered = []
+            for t in all_tracks:
+                tid = t.get("track_id", t.get("id"))
+                d = pid_to_dir.get(tid)
+                if d:
+                    person_dirs_ordered.append(d)
+
+            progress(0.9, desc="Regenerating scene preview...")
+            render_multi_person_incam(
+                video_path=sd["video_path"],
+                person_dirs=person_dirs_ordered,
+                all_tracks=all_tracks,
+                output_path=scene_path,
+                fps=sd.get("fps", 30.0),
+            )
+            scene_preview_update = gr.update(value=scene_path)
+        except Exception as e:
+            status_lines.append(f"Scene preview failed: {e}")
+            scene_preview_update = gr.update()
+
     progress(1.0, desc="Reprocessing complete")
 
     frame_idx = state.get("current_frame", 0)
     status = "\n".join(status_lines)
     return (state, status, gr.update(value=_reprocess_btn_label(session_id)),
+            *((scene_preview_update,) if regenerate_preview else ()),
             *update_frame_display(frame_idx, state))
 
 
@@ -1127,8 +1172,11 @@ def _nav_fwd1(frame_idx, state):
 # ── Build Panel ──
 
 
-def build_identity_panel() -> dict[str, Any]:
+def build_identity_panel(scene_preview_video=None) -> dict[str, Any]:
     """Construct the Identity Inspector Gradio components.
+
+    Args:
+        scene_preview_video: optional gr.Video component to update after reprocessing.
 
     Returns dict of component references for wiring in gvhmr_gui.py.
     """
@@ -1292,12 +1340,12 @@ def build_identity_panel() -> dict[str, Any]:
     verify_btn.click(
         fn=on_verify,
         inputs=[frame_slider, panel_state],
-        outputs=[panel_state] + display_outputs,
+        outputs=[panel_state, reprocess_btn] + display_outputs,
     )
     add_kf_btn.click(
         fn=on_add_keyframe,
         inputs=[frame_slider, panel_state],
-        outputs=[panel_state] + display_outputs,
+        outputs=[panel_state, reprocess_btn] + display_outputs,
     )
     remove_kf_btn.click(
         fn=on_remove_keyframe,
@@ -1342,10 +1390,17 @@ def build_identity_panel() -> dict[str, Any]:
         outputs=[bbox_edit_status, panel_state, reprocess_btn],
     )
 
+    _reprocess_outputs = [panel_state, reprocess_status, reprocess_btn]
+    if scene_preview_video is not None:
+        _reprocess_outputs.append(scene_preview_video)
+    _reprocess_outputs += display_outputs
+
     reprocess_btn.click(
-        fn=on_reprocess_all_dirty,
+        fn=lambda state, prog=gr.Progress(track_tqdm=False): on_reprocess_all_dirty(
+            state, progress=prog, regenerate_preview=scene_preview_video is not None,
+        ),
         inputs=[panel_state],
-        outputs=[panel_state, reprocess_status, reprocess_btn] + display_outputs,
+        outputs=_reprocess_outputs,
     )
 
     return {
