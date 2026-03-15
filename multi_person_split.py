@@ -20,6 +20,7 @@ from hmr4d.utils.geo.hmr_cam import estimate_K
 
 GVHMR_DIR = Path(__file__).resolve().parent
 DEMO_SCRIPT = GVHMR_DIR / "tools" / "demo" / "demo.py"
+PERSON_META_FILENAME = "person_meta.json"
 
 
 def _transform_crop_verts_to_fullframe(verts, K_crop, K_full, crop_x1, crop_y1):
@@ -177,6 +178,172 @@ class MultiPersonResult:
     bridging_summaries: list = field(default_factory=list)
 
 
+def _track_id(track: dict, fallback: int | None = None) -> int:
+    value = track.get("track_id", fallback)
+    if value is None:
+        raise ValueError("Track is missing track_id")
+    return int(value)
+
+
+def _track_numpy_bboxes(track: dict) -> np.ndarray:
+    bboxes = track["bbx_xyxy"]
+    if isinstance(bboxes, torch.Tensor):
+        return bboxes.cpu().numpy()
+    return np.asarray(bboxes)
+
+
+def _track_detection_mask(track: dict, num_frames: int | None = None) -> np.ndarray:
+    mask = track.get("detection_mask")
+    if mask is None:
+        length = num_frames if num_frames is not None else len(track["bbx_xyxy"])
+        return np.ones(length, dtype=bool)
+    if isinstance(mask, torch.Tensor):
+        mask = mask.cpu().numpy()
+    mask = np.asarray(mask, dtype=bool)
+    if num_frames is not None:
+        return mask[:num_frames]
+    return mask
+
+
+def _person_meta_path(person_dir: str | Path) -> Path:
+    return Path(person_dir) / PERSON_META_FILENAME
+
+
+def _load_person_meta(person_dir: str | Path) -> dict | None:
+    meta_path = _person_meta_path(person_dir)
+    if not meta_path.exists():
+        return None
+    try:
+        with open(meta_path) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _save_person_meta(person_dir: str | Path, meta: dict) -> Path:
+    meta_path = _person_meta_path(person_dir)
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(meta_path, "w") as f:
+        json.dump(meta, f, indent=2)
+    return meta_path
+
+
+def _make_person_meta(
+    track: dict,
+    source_index: int,
+    isolation_result: dict | None = None,
+    bbox_override_path: str | None = None,
+) -> dict:
+    meta = {
+        "binding_version": 1,
+        "track_id": _track_id(track, source_index),
+        "source_index": int(source_index),
+        "num_detected_frames": int(_track_detection_mask(track).sum()),
+    }
+    if isolation_result is not None:
+        meta["crop_bbox"] = isolation_result.get("crop_bbox")
+        meta["isolation_debug"] = isolation_result.get("debug", {})
+        meta["num_inpainted"] = isolation_result.get("num_inpainted", 0)
+        meta["num_crop_only"] = isolation_result.get("num_crop_only", 0)
+        meta["warnings"] = isolation_result.get("warnings", [])
+    if bbox_override_path:
+        meta["bbox_override_path"] = str(bbox_override_path)
+    return meta
+
+
+def _person_meta_matches_track(meta: dict | None, track: dict, source_index: int) -> bool:
+    if not meta:
+        return False
+    return (
+        int(meta.get("binding_version", 0)) >= 1
+        and int(meta.get("track_id", -1)) == _track_id(track, source_index)
+        and int(meta.get("source_index", -1)) == int(source_index)
+    )
+
+
+def _build_bbox_override_payload(
+    bboxes_fullframe: np.ndarray,
+    crop_bbox: list[int] | tuple[int, int, int, int] | None,
+    output_size: tuple[int, int] | None = None,
+) -> dict:
+    """Convert full-frame boxes into isolated-video coordinates for demo.py."""
+    bboxes = np.asarray(bboxes_fullframe, dtype=np.float32).copy()
+    if crop_bbox is not None:
+        x1, y1, x2, y2 = [float(v) for v in crop_bbox]
+        bboxes[:, [0, 2]] -= x1
+        bboxes[:, [1, 3]] -= y1
+        if output_size is None:
+            output_size = (max(1, int(round(x2 - x1))), max(1, int(round(y2 - y1))))
+
+    if output_size is not None:
+        out_w, out_h = output_size
+        bboxes[:, [0, 2]] = np.clip(bboxes[:, [0, 2]], 0, max(out_w - 1, 1))
+        bboxes[:, [1, 3]] = np.clip(bboxes[:, [1, 3]], 0, max(out_h - 1, 1))
+
+    bbx_xyxy = torch.from_numpy(bboxes).float()
+    bbx_xys = get_bbx_xys_from_xyxy(bbx_xyxy, base_enlarge=1.2).float()
+    return {
+        "bbx_xyxy": bbx_xyxy,
+        "bbx_xys": bbx_xys,
+    }
+
+
+def _save_bbox_override(
+    person_dir: str | Path,
+    track: dict,
+    crop_bbox: list[int] | tuple[int, int, int, int] | None,
+    output_size: tuple[int, int] | None = None,
+) -> Path:
+    override_path = Path(person_dir) / "bbox_override.pt"
+    payload = _build_bbox_override_payload(
+        _track_numpy_bboxes(track),
+        crop_bbox=crop_bbox,
+        output_size=output_size,
+    )
+    torch.save(payload, override_path)
+    return override_path
+
+
+def _bbox_iou(box_a: np.ndarray, box_b: np.ndarray) -> float:
+    x1 = max(box_a[0], box_b[0])
+    y1 = max(box_a[1], box_b[1])
+    x2 = min(box_a[2], box_b[2])
+    y2 = min(box_a[3], box_b[3])
+    inter = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    area_a = max(0.0, box_a[2] - box_a[0]) * max(0.0, box_a[3] - box_a[1])
+    area_b = max(0.0, box_b[2] - box_b[0]) * max(0.0, box_b[3] - box_b[1])
+    union = area_a + area_b - inter
+    return float(inter / union) if union > 0 else 0.0
+
+
+def _collapsed_track_pairs(
+    all_tracks: list[dict],
+    iou_threshold: float = 0.65,
+    min_overlap_frames: int = 10,
+) -> list[tuple[int, int, int]]:
+    """Detect suspicious track collapse where two tracks follow the same body."""
+    suspicious = []
+    for i in range(len(all_tracks)):
+        boxes_i = _track_numpy_bboxes(all_tracks[i])
+        mask_i = _track_detection_mask(all_tracks[i], len(boxes_i))
+        tid_i = _track_id(all_tracks[i], i)
+        for j in range(i + 1, len(all_tracks)):
+            boxes_j = _track_numpy_bboxes(all_tracks[j])
+            mask_j = _track_detection_mask(all_tracks[j], len(boxes_j))
+            tid_j = _track_id(all_tracks[j], j)
+            n = min(len(boxes_i), len(boxes_j), len(mask_i), len(mask_j))
+            overlap_frames = 0
+            for f in range(n):
+                if not mask_i[f] or not mask_j[f]:
+                    continue
+                iou = _bbox_iou(boxes_i[f], boxes_j[f])
+                if iou >= iou_threshold:
+                    overlap_frames += 1
+            if overlap_frames >= min_overlap_frames:
+                suspicious.append((tid_i, tid_j, overlap_frames))
+    return suspicious
+
+
 def compute_shared_slam(
     video_path,
     output_path,
@@ -248,6 +415,7 @@ def run_person_pipeline(
     person_id,
     output_dir,
     slam_override_path=None,
+    bbx_override_path=None,
     static_cam=False,
     use_dpvo=False,
     f_mm=None,
@@ -261,6 +429,7 @@ def run_person_pipeline(
         person_id: person track ID (for logging)
         output_dir: root output directory for this person
         slam_override_path: path to shared SLAM results
+        bbx_override_path: path to pre-approved bounding boxes for this person
         static_cam: whether camera is static
         use_dpvo: whether to use DPVO (ignored if slam_override provided)
         f_mm: focal length override
@@ -285,6 +454,8 @@ def run_person_pipeline(
         cmd.append(f"--f_mm={f_mm}")
     if slam_override_path:
         cmd.append(f"--slam_override={slam_override_path}")
+    if bbx_override_path:
+        cmd.append(f"--bbx_override={bbx_override_path}")
     if skip_render:
         cmd.append("--skip_render")
     elif render_incam_only:
@@ -380,25 +551,48 @@ def split_multi_person_video(
     detection_dir.mkdir(parents=True, exist_ok=True)
     tracks_path = detection_dir / "all_tracks.pt"
 
+    all_tracks = None
+    cache_reason = None
+    current_tracker_backend = "unknown"
     if tracks_path.exists():
         tracks_data = torch.load(str(tracks_path), map_location="cpu", weights_only=False)
-        all_tracks = tracks_data["tracks"]
-        _progress(0.10, f"Loaded {len(all_tracks)} cached tracks")
-    else:
+        cached_tracks = tracks_data["tracks"] if isinstance(tracks_data, dict) and "tracks" in tracks_data else tracks_data
+        cache_meta = tracks_data.get("metadata", {}) if isinstance(tracks_data, dict) else {}
+
+        from person_tracker import OCSORT_AVAILABLE
+        current_tracker_backend = "ocsort" if OCSORT_AVAILABLE else "yolo"
+        cached_backend = cache_meta.get("tracker_backend")
+        cached_version = int(cache_meta.get("tracking_version", 0))
+
+        if cached_version < 2:
+            cache_reason = "cached tracks predate current crossing fixes"
+        elif cached_backend == "yolo" and current_tracker_backend == "ocsort":
+            cache_reason = "cached tracks were generated without OC-SORT"
+        else:
+            all_tracks = cached_tracks
+            _progress(0.10, f"Loaded {len(all_tracks)} cached tracks ({cached_backend or 'legacy cache'})")
+
+    if all_tracks is None:
         from person_tracker import PersonTracker, render_track_visualization
 
+        if cache_reason:
+            _progress(0.08, f"Ignoring cached tracks: {cache_reason}")
         tracker = PersonTracker()
+        current_tracker_backend = tracker.tracker_backend
         all_tracks = tracker.detect_and_track_all(
             video_path, min_track_frames=min_track_duration
         )
-        torch.save({"tracks": all_tracks}, str(tracks_path))
+        torch.save(
+            {"tracks": all_tracks, "metadata": tracker.cache_metadata()},
+            str(tracks_path),
+        )
         del tracker
 
         # Render track visualization
         viz_path = detection_dir / "track_visualization.mp4"
         render_track_visualization(video_path, all_tracks, str(viz_path))
 
-        _progress(0.10, f"Detected {len(all_tracks)} people")
+        _progress(0.10, f"Detected {len(all_tracks)} people ({current_tracker_backend})")
 
     # Cap to max_persons largest tracks (already sorted by area)
     if max_persons > 0 and len(all_tracks) > max_persons:
@@ -407,6 +601,13 @@ def split_multi_person_video(
 
     result.all_tracks = all_tracks
     result.num_persons = len(all_tracks)
+
+    collapsed_pairs = _collapsed_track_pairs(all_tracks)
+    if collapsed_pairs:
+        summary = ", ".join(
+            f"{a}<->{b} ({frames} frames)" for a, b, frames in collapsed_pairs
+        )
+        _progress(0.11, f"WARNING: Suspicious track overlap detected: {summary}")
 
     if len(all_tracks) == 0:
         _progress(1.0, "No people detected in video.")
@@ -428,8 +629,8 @@ def split_multi_person_video(
     # ── Step 3: Segmentation (only if >1 person AND inpainting enabled) ──
     masks = {}
     if len(all_tracks) > 1 and not use_inpainting:
-        _progress(0.22, "Using fast bbox-crop isolation (no SAM2/ProPainter)")
-        _progress(0.35, "Skipped segmentation — bbox blackout mode")
+        _progress(0.22, "Using fast bbox-crop isolation (unsafe for crossings)")
+        _progress(0.35, "Skipped segmentation — bbox blackout mode may swap/erase overlapping people")
     elif len(all_tracks) > 1:
         _progress(0.22, "Segmenting all people with SAM2...")
 
@@ -469,7 +670,12 @@ def split_multi_person_video(
                 np.savez_compressed(str(masks_dir / "overlap_map.npz"), overlap=overlap)
 
                 _progress(0.35, f"Segmented {len(masks)} people")
-            except ImportError as e:
+            except Exception as e:
+                if use_inpainting:
+                    raise RuntimeError(
+                        "SAM2 inpainting was requested, but segmentation could not start. "
+                        "Install/configure SAM2 instead of falling back to bbox blackout."
+                    ) from e
                 _progress(0.35, f"SAM2 not available ({e}). Using bbox-only isolation (no inpainting).")
                 masks = {}
 
@@ -480,6 +686,7 @@ def split_multi_person_video(
 
     person_dirs = []
     person_video_paths = []
+    person_meta_by_tid = {}
 
     for i, track in enumerate(all_tracks):
         tid = track["track_id"]
@@ -488,8 +695,30 @@ def split_multi_person_video(
         person_dirs.append(person_dir)
 
         isolated_video = person_dir / "isolated_video.mp4"
+        isolation_mode_path = person_dir / "isolation_mode.json"
+        meta = _load_person_meta(person_dir)
+        can_reuse_isolation = isolated_video.exists()
+        if can_reuse_isolation and not _person_meta_matches_track(meta, track, i):
+            can_reuse_isolation = False
+            _progress(
+                0.37 + (i + 1) / len(all_tracks) * 0.13,
+                f"Person {i} cache belongs to a different track; regenerating",
+            )
+        if can_reuse_isolation and use_inpainting and len(all_tracks) > 1:
+            can_reuse_isolation = isolation_mode_path.exists()
+            if not can_reuse_isolation:
+                _progress(
+                    0.37 + (i + 1) / len(all_tracks) * 0.13,
+                    f"Person {i} isolation cache missing mode log; regenerating",
+                )
 
-        if isolated_video.exists():
+        if can_reuse_isolation:
+            crop_bbox = meta.get("crop_bbox") if meta else None
+            bbox_override_path = _save_bbox_override(person_dir, track, crop_bbox=crop_bbox)
+            if meta:
+                meta["bbox_override_path"] = str(bbox_override_path)
+                _save_person_meta(person_dir, meta)
+                person_meta_by_tid[tid] = meta
             person_video_paths.append(str(isolated_video))
             _progress(
                 0.37 + (i + 1) / len(all_tracks) * 0.13,
@@ -497,10 +726,18 @@ def split_multi_person_video(
             )
             continue
 
+        isolation_result = None
         if len(all_tracks) == 1:
             # Single person — just symlink/copy the original video
             shutil.copy2(video_path, str(isolated_video))
             person_video_paths.append(str(isolated_video))
+            isolation_result = {
+                "crop_bbox": None,
+                "debug": {"crop_area_ratio": 1.0, "trusted_crop_frames": int(_track_detection_mask(track).sum())},
+                "num_inpainted": 0,
+                "num_crop_only": len(_track_numpy_bboxes(track)),
+                "warnings": [],
+            }
         elif masks:
             # Multi-person with masks — smart isolation
             try:
@@ -510,6 +747,7 @@ def split_multi_person_video(
                     video_path=video_path,
                     target_person_id=tid,
                     target_track_bboxes=track["bbx_xyxy"].cpu().numpy(),
+                    target_detection_mask=_track_detection_mask(track, len(track["bbx_xyxy"])),
                     all_masks=masks,
                     output_path=str(isolated_video),
                 )
@@ -518,16 +756,25 @@ def split_multi_person_video(
                 with open(person_dir / "isolation_mode.json", "w") as f:
                     json.dump(isolation_result.get("isolation_modes", []), f)
 
+                with open(person_dir / "isolation_debug.json", "w") as f:
+                    json.dump(isolation_result.get("debug", {}), f, indent=2)
+
                 person_video_paths.append(str(isolated_video))
-            except ImportError:
+            except Exception as e:
+                if use_inpainting:
+                    raise RuntimeError(
+                        "SAM2/ProPainter inpainting was requested, but isolation fell back before producing "
+                        "an inpainted clip. Fix ProPainter/dependencies instead of using bbox blackout."
+                    ) from e
                 # No ProPainter — crop with blackout of other people
                 other_bb = [
                     all_tracks[j]["bbx_xyxy"].cpu().numpy()
                     for j in range(len(all_tracks)) if j != i
                 ]
-                _crop_person_video(
+                isolation_result = _crop_person_video(
                     video_path, track["bbx_xyxy"].cpu().numpy(),
                     str(isolated_video), other_bboxes=other_bb,
+                    detection_mask=_track_detection_mask(track, len(track["bbx_xyxy"])),
                 )
                 person_video_paths.append(str(isolated_video))
         else:
@@ -536,11 +783,39 @@ def split_multi_person_video(
                 all_tracks[j]["bbx_xyxy"].cpu().numpy()
                 for j in range(len(all_tracks)) if j != i
             ]
-            _crop_person_video(
+            isolation_result = _crop_person_video(
                 video_path, track["bbx_xyxy"].cpu().numpy(),
                 str(isolated_video), other_bboxes=other_bb,
+                detection_mask=_track_detection_mask(track, len(track["bbx_xyxy"])),
             )
             person_video_paths.append(str(isolated_video))
+
+        crop_bbox = isolation_result.get("crop_bbox") if isolation_result else None
+        bbox_override_path = _save_bbox_override(person_dir, track, crop_bbox=crop_bbox)
+        meta = _make_person_meta(
+            track,
+            source_index=i,
+            isolation_result=isolation_result,
+            bbox_override_path=str(bbox_override_path),
+        )
+        _save_person_meta(person_dir, meta)
+        person_meta_by_tid[tid] = meta
+        if isolation_result is not None:
+            with open(person_dir / "isolation_debug.json", "w") as f:
+                json.dump(isolation_result.get("debug", {}), f, indent=2)
+
+        debug = (isolation_result or {}).get("debug", {})
+        crop_ratio = float(debug.get("crop_area_ratio", 0.0))
+        if crop_ratio >= 0.85:
+            _progress(
+                0.37 + (i + 1) / len(all_tracks) * 0.13,
+                f"WARNING: Person {i} crop covers {crop_ratio:.0%} of frame; isolation may be contaminated",
+            )
+        if "low_target_coverage" in (isolation_result or {}).get("warnings", []):
+            _progress(
+                0.37 + (i + 1) / len(all_tracks) * 0.13,
+                f"WARNING: Person {i} target mask coverage is very low; GVHMR may still lock onto the wrong performer",
+            )
 
         _progress(
             0.37 + (i + 1) / len(all_tracks) * 0.13,
@@ -556,15 +831,29 @@ def split_multi_person_video(
     for i, (person_video, person_dir) in enumerate(zip(person_video_paths, person_dirs)):
         track = all_tracks[i]
         tid = track["track_id"]
+        meta = _load_person_meta(person_dir)
+        crop_bbox = meta.get("crop_bbox") if meta else None
+        bbox_override_path = _save_bbox_override(person_dir, track, crop_bbox=crop_bbox)
+        if meta is not None:
+            meta["bbox_override_path"] = str(bbox_override_path)
+            _save_person_meta(person_dir, meta)
+            person_meta_by_tid[tid] = meta
 
         # Check if already processed
         existing_pt = list(person_dir.rglob("hmr4d_results.pt"))
-        if existing_pt:
+        isolated_mtime = Path(person_video).stat().st_mtime if Path(person_video).exists() else 0.0
+        newest_pt_mtime = max((pt.stat().st_mtime for pt in existing_pt), default=0.0)
+        if existing_pt and newest_pt_mtime >= isolated_mtime:
             _progress(
                 0.50 + (i + 1) / len(all_tracks) * 0.30,
                 f"Person {i} already processed",
             )
             continue
+        if existing_pt:
+            _progress(
+                0.50 + i / len(all_tracks) * 0.30,
+                f"Person {i} isolation changed; re-running GVHMR",
+            )
 
         _progress(
             0.50 + i / len(all_tracks) * 0.30,
@@ -576,6 +865,7 @@ def split_multi_person_video(
             person_id=tid,
             output_dir=person_dir,
             slam_override_path=str(slam_path) if not static_cam else None,
+            bbx_override_path=str(bbox_override_path),
             static_cam=static_cam,
             use_dpvo=use_dpvo,
             f_mm=f_mm,
@@ -594,10 +884,14 @@ def split_multi_person_video(
     _progress(0.82, "Running identity verification...")
 
     try:
-        from identity_confidence import compute_all_confidences, confidence_to_array, export_confidence_csv
+        from identity_confidence import compute_all_confidences, export_confidence_csv
         from identity_tracking import IdentityTrack, auto_generate_keyframes
         from identity_reid import ShapeReIdentifier
-        from identity_bridge import OcclusionBridge, summarize_bridging, crossing_spans_from_overlap
+        from identity_bridge import (
+            OcclusionBridge,
+            crossing_spans_from_overlap,
+            crossing_spans_from_signal,
+        )
         from smplx_to_bvh import extract_gvhmr_params
 
         identity_tracks = []
@@ -630,7 +924,7 @@ def split_multi_person_video(
                     vitpose = vp
 
             # Compute confidence scores
-            confidences = compute_all_confidences(
+            initial_confidences = compute_all_confidences(
                 track_idx=i,
                 all_tracks=all_tracks,
                 num_frames=num_person_frames,
@@ -645,12 +939,23 @@ def split_multi_person_video(
 
             auto_generate_keyframes(
                 track=id_track,
-                confidences=confidences,
+                confidences=initial_confidences,
                 per_frame_betas=per_frame_betas,
                 per_frame_bboxes=bboxes,
                 per_frame_poses=params.get("body_pose", params.get("body_pose_world")),
             )
             id_track.establish_identity()
+            confidences = compute_all_confidences(
+                track_idx=i,
+                all_tracks=all_tracks,
+                num_frames=num_person_frames,
+                vitpose=vitpose,
+                per_frame_betas=per_frame_betas,
+                established_betas=id_track.established_betas,
+            )
+            for kf in id_track.keyframes:
+                if 0 <= kf.frame_index < len(confidences):
+                    kf.confidence = confidences[kf.frame_index]
 
             # Bridge low-confidence spans
             bridge = OcclusionBridge(id_track)
@@ -659,7 +964,15 @@ def split_multi_person_video(
             transl = params.get("transl_world", params.get("transl"))
 
             if body_pose is not None and global_orient is not None and transl is not None:
-                crossing_spans = crossing_spans_from_overlap(confidences)
+                mask_overlap = _compute_track_mask_overlap(
+                    target_person_id=tid,
+                    all_masks=masks,
+                    num_frames=num_person_frames,
+                )
+                if mask_overlap is not None:
+                    crossing_spans = crossing_spans_from_signal(mask_overlap, threshold=0.10)
+                else:
+                    crossing_spans = crossing_spans_from_overlap(confidences)
                 if crossing_spans:
                     total_crossing = sum(e - s + 1 for s, e in crossing_spans)
                     _progress(0.82 + i / max(len(person_dirs), 1) * 0.03,
@@ -728,12 +1041,12 @@ def split_multi_person_video(
         # Shape re-identification (detect swaps)
         if len(identity_tracks) >= 2:
             reid = ShapeReIdentifier(identity_tracks)
-            per_person_mean_betas = {
-                t.person_id: t.established_betas
+            per_person_tail_betas = {
+                t.person_id: t.keyframes[-1].betas
                 for t in identity_tracks
-                if t.established_betas is not None
+                if t.keyframes and t.keyframes[-1].betas is not None
             }
-            swaps = reid.detect_swap(0, per_person_mean_betas)
+            swaps = reid.detect_swap(0, per_person_tail_betas)
             if swaps:
                 _progress(0.84, f"WARNING: Possible identity swaps detected: {swaps}")
 
@@ -788,6 +1101,17 @@ def split_multi_person_video(
         offsets=result.offsets,
         person_dirs=person_dirs,
         slam_path=str(slam_path),
+        person_bindings=[
+            {
+                "person_dir": str(person_dir),
+                **(_load_person_meta(person_dir) or {
+                    "track_id": _track_id(all_tracks[i], i),
+                    "source_index": i,
+                }),
+            }
+            for i, person_dir in enumerate(person_dirs)
+            if i < len(all_tracks)
+        ],
     )
 
     # ── Step 7: Render combined incam overlay ──
@@ -870,26 +1194,39 @@ def reprocess_person(
         else all_tracks[j]["bbx_xyxy"]
         for j in range(len(all_tracks)) if j != person_index
     ]
+    isolation_result = None
 
     if len(all_tracks) == 1:
         shutil.copy2(video_path, str(isolated_video))
+        isolation_result = {
+            "crop_bbox": None,
+            "debug": {"crop_area_ratio": 1.0},
+            "num_inpainted": 0,
+            "num_crop_only": len(updated_bboxes),
+            "warnings": [],
+        }
     elif masks:
         try:
             from propainter_inpaint import isolate_person
 
-            isolate_person(
+            isolation_result = isolate_person(
                 video_path=video_path,
                 target_person_id=tid,
                 target_track_bboxes=updated_bboxes,
+                target_detection_mask=_track_detection_mask(track, len(updated_bboxes)),
                 all_masks=masks,
                 output_path=str(isolated_video),
             )
         except ImportError:
-            _crop_person_video(video_path, updated_bboxes, str(isolated_video),
-                               other_bboxes=other_bb)
+            isolation_result = _crop_person_video(
+                video_path, updated_bboxes, str(isolated_video),
+                other_bboxes=other_bb, detection_mask=_track_detection_mask(track, len(updated_bboxes)),
+            )
     else:
-        _crop_person_video(video_path, updated_bboxes, str(isolated_video),
-                           other_bboxes=other_bb)
+        isolation_result = _crop_person_video(
+            video_path, updated_bboxes, str(isolated_video),
+            other_bboxes=other_bb, detection_mask=_track_detection_mask(track, len(updated_bboxes)),
+        )
 
     if not isolated_video.exists():
         # Restore backups — isolation failed
@@ -903,12 +1240,29 @@ def reprocess_person(
     if progress_callback:
         progress_callback(0.4, f"Running GVHMR for person {person_index}...")
 
+    bbox_override_path = _save_bbox_override(
+        person_dir, track, crop_bbox=(isolation_result or {}).get("crop_bbox"),
+    )
+    _save_person_meta(
+        person_dir,
+        _make_person_meta(
+            track,
+            source_index=person_index,
+            isolation_result=isolation_result,
+            bbox_override_path=str(bbox_override_path),
+        ),
+    )
+    if isolation_result is not None:
+        with open(person_dir / "isolation_debug.json", "w") as f:
+            json.dump(isolation_result.get("debug", {}), f, indent=2)
+
     try:
         pt_path, _ = run_person_pipeline(
             video_path=str(isolated_video),
             person_id=tid,
             output_dir=person_dir,
             slam_override_path=slam_path if not static_cam else None,
+            bbx_override_path=str(bbox_override_path),
             static_cam=static_cam,
             use_dpvo=use_dpvo,
             skip_render=True,
@@ -943,7 +1297,12 @@ def reprocess_person(
     try:
         from identity_confidence import compute_all_confidences, export_confidence_csv
         from identity_tracking import IdentityTrack, auto_generate_keyframes
-        from identity_bridge import OcclusionBridge, summarize_bridging, crossing_spans_from_overlap
+        from identity_bridge import (
+            OcclusionBridge,
+            summarize_bridging,
+            crossing_spans_from_overlap,
+            crossing_spans_from_signal,
+        )
         from smplx_to_bvh import extract_gvhmr_params
 
         params = extract_gvhmr_params(pt_path)
@@ -960,7 +1319,7 @@ def reprocess_person(
             elif isinstance(vp, np.ndarray):
                 vitpose = vp
 
-        confidences = compute_all_confidences(
+        initial_confidences = compute_all_confidences(
             track_idx=person_index,
             all_tracks=all_tracks,
             num_frames=num_person_frames,
@@ -973,12 +1332,23 @@ def reprocess_person(
 
         auto_generate_keyframes(
             track=id_track,
-            confidences=confidences,
+            confidences=initial_confidences,
             per_frame_betas=per_frame_betas,
             per_frame_bboxes=bboxes,
             per_frame_poses=params.get("body_pose", params.get("body_pose_world")),
         )
         id_track.establish_identity()
+        confidences = compute_all_confidences(
+            track_idx=person_index,
+            all_tracks=all_tracks,
+            num_frames=num_person_frames,
+            vitpose=vitpose,
+            per_frame_betas=per_frame_betas,
+            established_betas=id_track.established_betas,
+        )
+        for kf in id_track.keyframes:
+            if 0 <= kf.frame_index < len(confidences):
+                kf.confidence = confidences[kf.frame_index]
 
         # Bridge low-confidence spans
         bridge = OcclusionBridge(id_track)
@@ -988,7 +1358,15 @@ def reprocess_person(
 
         bridged_frames = set()
         if body_pose is not None and global_orient is not None and transl is not None:
-            crossing_spans = crossing_spans_from_overlap(confidences)
+            mask_overlap = _compute_track_mask_overlap(
+                target_person_id=tid,
+                all_masks=masks,
+                num_frames=num_person_frames,
+            )
+            if mask_overlap is not None:
+                crossing_spans = crossing_spans_from_signal(mask_overlap, threshold=0.10)
+            else:
+                crossing_spans = crossing_spans_from_overlap(confidences)
             if crossing_spans:
                 bridge_result = bridge.bridge_with_spans(
                     body_pose, global_orient, transl, crossing_spans)
@@ -1131,8 +1509,73 @@ def _compute_overlap_map(masks, all_tracks):
     return overlap
 
 
+def _compute_track_mask_overlap(target_person_id, all_masks, num_frames):
+    """Measure overlap of one person's mask against all others per frame.
+
+    Returns a per-frame fraction based on intersection over the smaller mask area.
+    This is more sensitive to front-occlusion than bbox IoU and is only used when
+    real SAM2 masks are available.
+    """
+    if not all_masks or target_person_id not in all_masks:
+        return None
+
+    target_masks = all_masks[target_person_id]
+    n = min(num_frames, len(target_masks))
+    if n <= 0:
+        return None
+
+    overlap = np.zeros(n, dtype=np.float32)
+    for other_tid, other_masks in all_masks.items():
+        if other_tid == target_person_id:
+            continue
+        m = min(n, len(other_masks))
+        for f in range(m):
+            target = target_masks[f]
+            other = other_masks[f]
+            inter = np.logical_and(target, other).sum()
+            if inter <= 0:
+                continue
+            denom = min(target.sum(), other.sum())
+            if denom > 0:
+                overlap[f] = max(overlap[f], float(inter / denom))
+
+    return overlap
+
+
+def _compute_stable_crop_bbox(
+    bboxes: np.ndarray,
+    img_w: int,
+    img_h: int,
+    padding: int = 40,
+    detection_mask: np.ndarray | None = None,
+) -> tuple[list[int], dict]:
+    bboxes = np.asarray(bboxes, dtype=np.float32)
+    trusted = None
+    if detection_mask is not None:
+        detection_mask = np.asarray(detection_mask, dtype=bool)[:len(bboxes)]
+        if detection_mask.any():
+            trusted = detection_mask
+
+    crop_source = bboxes[trusted] if trusted is not None else bboxes
+    x1_min = max(0, int(crop_source[:, 0].min()) - padding)
+    y1_min = max(0, int(crop_source[:, 1].min()) - padding)
+    x2_max = min(img_w, int(crop_source[:, 2].max()) + padding)
+    y2_max = min(img_h, int(crop_source[:, 3].max()) + padding)
+    crop_w = max(2, x2_max - x1_min)
+    crop_h = max(2, y2_max - y1_min)
+    crop_w -= crop_w % 2
+    crop_h -= crop_h % 2
+    crop_bbox = [x1_min, y1_min, x1_min + crop_w, y1_min + crop_h]
+    debug = {
+        "crop_area_ratio": float((crop_w * crop_h) / max(img_w * img_h, 1)),
+        "trusted_crop_frames": int(trusted.sum()) if trusted is not None else int(len(bboxes)),
+        "crop_from_trusted_frames": bool(trusted is not None),
+    }
+    return crop_bbox, debug
+
+
 def _crop_person_video(video_path, bboxes, output_path, padding=40,
-                       other_bboxes=None):
+                       other_bboxes=None, detection_mask=None):
     """Crop-and-mask isolation: extract person's bbox region, black out others.
 
     Args:
@@ -1150,18 +1593,12 @@ def _crop_person_video(video_path, bboxes, output_path, padding=40,
     img_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     img_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    # Compute stable crop region (max bbox + padding)
-    x1_min = max(0, int(bboxes[:, 0].min()) - padding)
-    y1_min = max(0, int(bboxes[:, 1].min()) - padding)
-    x2_max = min(img_w, int(bboxes[:, 2].max()) + padding)
-    y2_max = min(img_h, int(bboxes[:, 3].max()) + padding)
-
+    crop_bbox, debug = _compute_stable_crop_bbox(
+        bboxes, img_w=img_w, img_h=img_h, padding=padding, detection_mask=detection_mask,
+    )
+    x1_min, y1_min, x2_max, y2_max = crop_bbox
     crop_w = x2_max - x1_min
     crop_h = y2_max - y1_min
-
-    # Make dimensions even (required by most codecs)
-    crop_w = crop_w - (crop_w % 2)
-    crop_h = crop_h - (crop_h % 2)
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(output_path, fourcc, fps, (crop_w, crop_h))
@@ -1186,3 +1623,10 @@ def _crop_person_video(video_path, bboxes, output_path, padding=40,
 
     cap.release()
     writer.release()
+    return {
+        "crop_bbox": crop_bbox,
+        "debug": debug,
+        "num_inpainted": 0,
+        "num_crop_only": min(total, len(bboxes)),
+        "warnings": ["crop_near_full_frame"] if debug["crop_area_ratio"] >= 0.85 else [],
+    }

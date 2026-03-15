@@ -132,6 +132,11 @@ def compute_bbox_overlap(
     target_boxes = all_tracks[track_idx]["bbx_xyxy"]
     if isinstance(target_boxes, torch.Tensor):
         target_boxes = target_boxes.numpy()
+    target_mask = all_tracks[track_idx].get("detection_mask")
+    if isinstance(target_mask, torch.Tensor):
+        target_mask = target_mask.numpy()
+    if target_mask is None:
+        target_mask = np.ones(min(num_frames, len(target_boxes)), dtype=bool)
 
     for i, other_track in enumerate(all_tracks):
         if i == track_idx:
@@ -139,9 +144,17 @@ def compute_bbox_overlap(
         other_boxes = other_track["bbx_xyxy"]
         if isinstance(other_boxes, torch.Tensor):
             other_boxes = other_boxes.numpy()
+        other_mask = other_track.get("detection_mask")
+        if isinstance(other_mask, torch.Tensor):
+            other_mask = other_mask.numpy()
+        if other_mask is None:
+            other_mask = np.ones(min(num_frames, len(other_boxes)), dtype=bool)
 
-        n = min(num_frames, len(target_boxes), len(other_boxes))
+        n = min(num_frames, len(target_boxes), len(other_boxes), len(target_mask), len(other_mask))
         for f in range(n):
+            # Ignore synthetic/interpolated boxes when measuring crossing risk.
+            if not target_mask[f] or not other_mask[f]:
+                continue
             iou = compute_bbox_iou(target_boxes[f], other_boxes[f])
             overlap[f] = max(overlap[f], iou)
 

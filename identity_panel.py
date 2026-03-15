@@ -43,6 +43,7 @@ _SESSION_DATA: dict[str, Any] = {}
 #        pipeline_params, img_width, img_height
 
 _FRAME_CACHE_SIZE = 50
+_PERSON_META_FILENAME = "person_meta.json"
 
 # Person colors for bbox overlay (up to 8 people)
 _PERSON_COLORS = [
@@ -262,6 +263,18 @@ def _load_bbox_corrections(person_dir: str) -> dict[int, np.ndarray]:
         return {}
 
 
+def _load_person_binding(person_dir: str) -> dict | None:
+    meta_path = Path(person_dir) / _PERSON_META_FILENAME
+    if not meta_path.exists():
+        return None
+    try:
+        import json
+        with open(meta_path) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
 def _get_identity_track(session_id: str, person_id: int) -> IdentityTrack | None:
     """Get identity track for a person."""
     sd = _SESSION_DATA.get(session_id, {})
@@ -275,14 +288,13 @@ def _get_identity_track(session_id: str, person_id: int) -> IdentityTrack | None
 def _save_identity_track(session_id: str, person_id: int) -> None:
     """Save identity track to JSON."""
     sd = _SESSION_DATA.get(session_id, {})
-    person_dirs = sd.get("person_dirs", [])
+    pid_to_dir = sd.get("pid_to_dir", {})
     track = _get_identity_track(session_id, person_id)
     if track is None:
         return
-    for i, t in enumerate(sd.get("identity_tracks", [])):
-        if t.person_id == person_id and i < len(person_dirs):
-            track.save_json(Path(person_dirs[i]) / "identity_track.json")
-            break
+    person_dir = pid_to_dir.get(person_id)
+    if person_dir is not None:
+        track.save_json(Path(person_dir) / "identity_track.json")
 
 
 def _keyframe_dataframe(session_id: str, person_id: int) -> list[list]:
@@ -342,6 +354,23 @@ def init_panel_state(
     cap.release()
 
     str_person_dirs = [str(p) for p in person_dirs]
+    pid_to_dir = {}
+    pid_to_index = {}
+    for i, track in enumerate(all_tracks):
+        pid = track.get("track_id", i)
+        if i < len(str_person_dirs):
+            pid_to_dir[pid] = str_person_dirs[i]
+        pid_to_index[pid] = i
+    for pdir in str_person_dirs:
+        binding = _load_person_binding(pdir)
+        if binding is None:
+            continue
+        pid = binding.get("track_id")
+        source_index = binding.get("source_index")
+        if pid is not None:
+            pid_to_dir[int(pid)] = pdir
+        if pid is not None and source_index is not None:
+            pid_to_index[int(pid)] = int(source_index)
 
     for i, track in enumerate(all_tracks):
         pid = track.get("track_id", i)
@@ -356,8 +385,11 @@ def init_panel_state(
 
     # Load and apply bbox corrections per person
     bbox_corrections: dict[int, dict[int, np.ndarray]] = {}
-    for i, pdir in enumerate(str_person_dirs):
-        pid = all_tracks[i].get("track_id", i) if i < len(all_tracks) else i
+    for pdir in str_person_dirs:
+        binding = _load_person_binding(pdir)
+        pid = int(binding["track_id"]) if binding and "track_id" in binding else None
+        if pid is None:
+            continue
         corr = _load_bbox_corrections(pdir)
         if corr:
             bbox_corrections[pid] = corr
@@ -368,11 +400,12 @@ def init_panel_state(
                         all_bboxes[pid][frame_idx] = bbox
 
     # Load confidence from identity tracks or recompute
-    for i, id_track in enumerate(identity_tracks):
+    for id_track in identity_tracks:
         pid = id_track.person_id
         # Try loading confidence CSV
-        if i < len(person_dirs):
-            csv_path = Path(person_dirs[i]) / "confidence.csv"
+        person_dir = pid_to_dir.get(pid)
+        if person_dir is not None:
+            csv_path = Path(person_dir) / "confidence.csv"
             if csv_path.exists():
                 confs = _load_confidence_csv(str(csv_path), num_frames)
                 all_confidences[pid] = confs
@@ -386,15 +419,6 @@ def init_panel_state(
             else:
                 confs.append(TrackConfidence())
         all_confidences[pid] = confs
-
-    # Build pid → directory and pid → index mappings (track_id may != array index)
-    pid_to_dir = {}
-    pid_to_index = {}
-    for i, track in enumerate(all_tracks):
-        pid = track.get("track_id", i)
-        if i < len(str_person_dirs):
-            pid_to_dir[pid] = str_person_dirs[i]
-        pid_to_index[pid] = i
 
     _SESSION_DATA[session_id] = {
         "video_path": video_path,
@@ -422,8 +446,7 @@ def init_panel_state(
     correction_tracks = {}
     str_person_dirs = [str(p) for p in person_dirs]
 
-    for i, pdir in enumerate(str_person_dirs):
-        pid = identity_tracks[i].person_id if i < len(identity_tracks) else i
+    for pid, pdir in pid_to_dir.items():
         pdir_path = Path(pdir)
 
         # Load GVHMR params (hmr4d_results.pt)

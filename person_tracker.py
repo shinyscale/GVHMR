@@ -109,12 +109,24 @@ class PersonTracker:
         self.smooth_window = smooth_window
         self.smooth_passes = smooth_passes
         self.use_ocsort = use_ocsort and OCSORT_AVAILABLE
+        self.tracker_backend = "ocsort" if self.use_ocsort else "yolo"
 
         if use_ocsort and not OCSORT_AVAILABLE:
             print(
                 "[PersonTracker] OC-SORT not installed — falling back to YOLO tracker. "
                 "Install with: pip install ocsort"
             )
+
+    def cache_metadata(self) -> dict:
+        """Describe how this tracker instance produced cached tracks."""
+        return {
+            "tracking_version": 2,
+            "tracker_backend": self.tracker_backend,
+            "conf_threshold": float(self.conf_threshold),
+            "smooth_window": int(self.smooth_window),
+            "smooth_passes": int(self.smooth_passes),
+            "min_track_duration": int(self.min_track_duration),
+        }
 
     def _track_with_ocsort(self, video_path: str) -> list[list[dict]]:
         tracker = OCSort(

@@ -144,18 +144,47 @@ class SAM2Segmenter:
                 prompt_frames.insert(0, 0)
 
             # Add bbox prompts for all persons at prompt frames
-            for prompt_frame in prompt_frames:
-                for track in tracks:
-                    tid = track["track_id"]
-                    bbox = track["bbx_xyxy"][prompt_frame].numpy()
+            for track in tracks:
+                tid = track["track_id"]
+                boxes = track["bbx_xyxy"]
+                if isinstance(boxes, torch.Tensor):
+                    boxes = boxes.cpu().numpy()
+                det_mask = track.get("detection_mask")
+                if isinstance(det_mask, torch.Tensor):
+                    det_mask = det_mask.cpu().numpy().astype(bool)
+                elif det_mask is None:
+                    det_mask = np.ones(min(num_frames, len(boxes)), dtype=bool)
+                else:
+                    det_mask = np.asarray(det_mask, dtype=bool)
+                det_conf = track.get("detection_conf")
+                if isinstance(det_conf, torch.Tensor):
+                    det_conf = det_conf.cpu().numpy()
+                elif det_conf is not None:
+                    det_conf = np.asarray(det_conf, dtype=np.float32)
 
+                trusted_frames = []
+                for prompt_frame in prompt_frames:
+                    actual_frame = self._nearest_trusted_prompt_frame(
+                        prompt_frame=prompt_frame,
+                        detection_mask=det_mask,
+                        detection_conf=det_conf,
+                        max_frame=num_frames,
+                        search_radius=reprompt_interval,
+                    )
+                    if actual_frame is None:
+                        continue
+                    if actual_frame in trusted_frames:
+                        continue
+                    trusted_frames.append(actual_frame)
+
+                for actual_frame in trusted_frames:
+                    bbox = boxes[actual_frame]
                     # Skip if bbox is degenerate
                     if bbox[2] - bbox[0] < 2 or bbox[3] - bbox[1] < 2:
                         continue
-
                     _, _, _ = self.predictor.add_new_points_or_box(
                         inference_state=state,
-                        frame_idx=prompt_frame,
+                        frame_idx=actual_frame,
                         obj_id=tid,
                         box=bbox,
                     )
@@ -175,6 +204,36 @@ class SAM2Segmenter:
             self.predictor.reset_state(state)
 
         return all_masks
+
+    @staticmethod
+    def _nearest_trusted_prompt_frame(
+        prompt_frame: int,
+        detection_mask: np.ndarray,
+        detection_conf: np.ndarray | None,
+        max_frame: int,
+        search_radius: int,
+        min_conf: float = 0.35,
+    ) -> int | None:
+        """Pick the nearest real/trusted detection frame for a SAM2 prompt."""
+        limit = min(max_frame, len(detection_mask))
+        if prompt_frame < limit and detection_mask[prompt_frame]:
+            if detection_conf is None or prompt_frame >= len(detection_conf) or detection_conf[prompt_frame] >= min_conf:
+                return int(prompt_frame)
+
+        best_frame = None
+        best_distance = None
+        start = max(0, prompt_frame - search_radius)
+        end = min(limit, prompt_frame + search_radius + 1)
+        for frame_idx in range(start, end):
+            if not detection_mask[frame_idx]:
+                continue
+            if detection_conf is not None and frame_idx < len(detection_conf) and detection_conf[frame_idx] < min_conf:
+                continue
+            distance = abs(frame_idx - prompt_frame)
+            if best_distance is None or distance < best_distance:
+                best_distance = distance
+                best_frame = int(frame_idx)
+        return best_frame
 
     def compute_overlap_map(self, masks: dict[int, np.ndarray]) -> np.ndarray:
         """Compute per-frame overlap flags between all person pairs.

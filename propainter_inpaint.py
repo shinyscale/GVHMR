@@ -77,6 +77,103 @@ def should_inpaint_frame(
     return False
 
 
+def _resize_video_for_inpainting(
+    frames: np.ndarray,
+    masks: np.ndarray,
+    max_long_side: int | None,
+) -> tuple[np.ndarray, np.ndarray, tuple[int, int] | None]:
+    """Downscale frames/masks for inpainting, preserving aspect ratio.
+
+    Returns resized arrays plus the original `(height, width)` if resizing was
+    applied. The resized dimensions are forced even for codec/model stability.
+    """
+    _, height, width, _ = frames.shape
+    target_w, target_h = width, height
+
+    if max_long_side is not None and max_long_side > 0:
+        long_side = max(height, width)
+        if long_side > max_long_side:
+            scale = max_long_side / float(long_side)
+            target_w = max(8, int(round(width * scale)))
+            target_h = max(8, int(round(height * scale)))
+
+    # ProPainter's RAFT path expects sizes aligned to /8 feature maps.
+    process_w = max(8, target_w - (target_w % 8))
+    process_h = max(8, target_h - (target_h % 8))
+    if process_w <= 0 or process_h <= 0:
+        return frames, masks, None
+    if process_w == width and process_h == height:
+        return frames, masks, None
+
+    resized_frames = np.stack([
+        cv2.resize(frame, (process_w, process_h), interpolation=cv2.INTER_AREA)
+        for frame in frames
+    ], axis=0)
+    resized_masks = np.stack([
+        cv2.resize(mask.astype(np.uint8), (process_w, process_h), interpolation=cv2.INTER_NEAREST) > 0
+        for mask in masks
+    ], axis=0)
+    return resized_frames, resized_masks, (height, width)
+
+
+def _compute_trusted_crop_bbox(
+    target_track_bboxes: np.ndarray,
+    video_w: int,
+    video_h: int,
+    padding: int = 40,
+    detection_mask: np.ndarray | None = None,
+) -> tuple[list[int], dict]:
+    """Compute a stable crop ROI, preferring frames with real detections."""
+    bboxes = np.asarray(target_track_bboxes, dtype=np.float32)
+    if detection_mask is not None:
+        detection_mask = np.asarray(detection_mask, dtype=bool)[:len(bboxes)]
+    trusted = detection_mask if detection_mask is not None and detection_mask.any() else None
+    crop_source = bboxes[trusted] if trusted is not None else bboxes
+
+    x1_min = max(0, int(crop_source[:, 0].min()) - padding)
+    y1_min = max(0, int(crop_source[:, 1].min()) - padding)
+    x2_max = min(video_w, int(crop_source[:, 2].max()) + padding)
+    y2_max = min(video_h, int(crop_source[:, 3].max()) + padding)
+
+    crop_w = max(2, x2_max - x1_min)
+    crop_h = max(2, y2_max - y1_min)
+    crop_w -= crop_w % 2
+    crop_h -= crop_h % 2
+    crop_bbox = [x1_min, y1_min, x1_min + crop_w, y1_min + crop_h]
+    debug = {
+        "crop_area_ratio": float((crop_w * crop_h) / max(video_w * video_h, 1)),
+        "trusted_crop_frames": int(trusted.sum()) if trusted is not None else int(len(bboxes)),
+        "crop_from_trusted_frames": bool(trusted is not None),
+    }
+    return crop_bbox, debug
+
+
+def _dilate_mask(mask: np.ndarray, iterations: int = 3) -> np.ndarray:
+    if mask.size == 0:
+        return mask
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    return cv2.dilate(mask.astype(np.uint8), kernel, iterations=iterations) > 0
+
+
+def _bbox_mask_in_crop(
+    bbox_xyxy: np.ndarray,
+    crop_bbox: list[int],
+    crop_shape: tuple[int, int],
+) -> np.ndarray:
+    """Build a bbox fallback mask in crop coordinates."""
+    crop_h, crop_w = crop_shape
+    x1, y1, _, _ = crop_bbox
+    bx1, by1, bx2, by2 = bbox_xyxy.astype(np.int32)
+    bx1 = max(0, bx1 - int(x1))
+    by1 = max(0, by1 - int(y1))
+    bx2 = min(crop_w, bx2 - int(x1))
+    by2 = min(crop_h, by2 - int(y1))
+    mask = np.zeros((crop_h, crop_w), dtype=bool)
+    if bx2 > bx1 and by2 > by1:
+        mask[by1:by2, bx1:bx2] = True
+    return mask
+
+
 class ProPainterInpainter:
     """ProPainter video inpainting wrapper using the full 4-stage pipeline:
     1. Optical flow estimation (RAFT)
@@ -154,6 +251,7 @@ class ProPainterInpainter:
         ref_stride: int = 10,
         raft_iter: int = 20,
         mask_dilation: int = 4,
+        max_long_side: int | None = 960,
     ) -> np.ndarray:
         """Inpaint masked regions in video frames using full ProPainter pipeline.
 
@@ -165,6 +263,7 @@ class ProPainterInpainter:
             ref_stride: stride for reference frame selection
             raft_iter: RAFT optical flow iterations
             mask_dilation: dilation applied to masks for flow/inpainting
+            max_long_side: optional long-side cap for inpainting resolution
 
         Returns:
             (N, H, W, 3) uint8 inpainted frames
@@ -174,7 +273,14 @@ class ProPainterInpainter:
         from core.utils import to_tensors
         from inference_propainter import get_ref_index
 
+        original_hw = frames.shape[1:3]
+        frames, masks, restore_hw = _resize_video_for_inpainting(frames, masks, max_long_side)
         n_frames, h, w, _ = frames.shape
+        if restore_hw is not None:
+            print(
+                f"[ProPainter] Resizing inpaint ROI from "
+                f"{original_hw[1]}x{original_hw[0]} to {w}x{h} (max_long_side={max_long_side})"
+            )
         output = frames.copy()
 
         # Convert frames to PIL Images for to_tensors()
@@ -342,6 +448,12 @@ class ProPainterInpainter:
                 output[i] = comp_frames[i].astype(np.uint8)
 
         torch.cuda.empty_cache()
+        if restore_hw is not None:
+            restore_h, restore_w = restore_hw
+            output = np.stack([
+                cv2.resize(frame, (restore_w, restore_h), interpolation=cv2.INTER_LINEAR)
+                for frame in output
+            ], axis=0)
         return output
 
     def cleanup(self):
@@ -362,10 +474,12 @@ def isolate_person(
     video_path: str,
     target_person_id: int,
     target_track_bboxes: np.ndarray,
+    target_detection_mask: np.ndarray | None,
     all_masks: dict[int, np.ndarray],
     output_path: str,
     inpainter: ProPainterInpainter | None = None,
     target_fps: float = 30.0,
+    propainter_max_long_side: int | None = 960,
 ) -> dict:
     """Isolate a single person from a multi-person video.
 
@@ -376,10 +490,12 @@ def isolate_person(
         video_path: input multi-person video
         target_person_id: track_id of person to isolate
         target_track_bboxes: (N_frames, 4) xyxy bboxes
+        target_detection_mask: (N_frames,) bool array for real detections
         all_masks: {track_id: (N_frames, H, W) bool} from SAM2
         output_path: where to save the isolated video
         inpainter: ProPainterInpainter instance (created if None and needed)
         target_fps: output video FPS
+        propainter_max_long_side: optional long-side cap for cropped inpainting ROI
 
     Returns:
         dict with 'video_path', 'isolation_modes', 'crop_bbox'
@@ -396,15 +512,16 @@ def isolate_person(
 
     needs_inpaint = "inpaint" in isolation_modes
 
-    # Compute stable crop region (max bbox + padding across all frames)
-    padding = 40
-    x1_min = max(0, int(target_track_bboxes[:, 0].min()) - padding)
-    y1_min = max(0, int(target_track_bboxes[:, 1].min()) - padding)
-    x2_max = min(video_w, int(target_track_bboxes[:, 2].max()) + padding)
-    y2_max = min(video_h, int(target_track_bboxes[:, 3].max()) + padding)
-
-    crop_w = (x2_max - x1_min) - ((x2_max - x1_min) % 2)  # even dims
-    crop_h = (y2_max - y1_min) - ((y2_max - y1_min) % 2)
+    crop_bbox, debug = _compute_trusted_crop_bbox(
+        target_track_bboxes,
+        video_w=video_w,
+        video_h=video_h,
+        padding=40,
+        detection_mask=target_detection_mask,
+    )
+    x1_min, y1_min, x2_max, y2_max = crop_bbox
+    crop_w = x2_max - x1_min
+    crop_h = y2_max - y1_min
 
     # Read video
     cap = cv2.VideoCapture(video_path)
@@ -416,19 +533,43 @@ def isolate_person(
         frames.append(frame)
     cap.release()
     frames = np.array(frames[:num_frames])
+    frames = frames[:, y1_min:y1_min + crop_h, x1_min:x1_min + crop_w]
+    original_frames = frames.copy()
 
-    # Build mask of all OTHER people's pixels
-    other_mask = np.zeros((num_frames, video_h, video_w), dtype=bool)
+    # Build mask of all OTHER people's pixels in the crop ROI only.
+    other_mask = np.zeros((num_frames, crop_h, crop_w), dtype=bool)
     for pid, pmasks in all_masks.items():
         if pid == target_person_id:
             continue
         n = min(num_frames, pmasks.shape[0])
-        other_mask[:n] |= pmasks[:n]
+        other_mask[:n] |= pmasks[:n, y1_min:y1_min + crop_h, x1_min:x1_min + crop_w]
+
+    target_mask = np.zeros((num_frames, crop_h, crop_w), dtype=bool)
+    if target_person_id in all_masks:
+        pmasks = all_masks[target_person_id]
+        n = min(num_frames, pmasks.shape[0])
+        target_mask[:n] = pmasks[:n, y1_min:y1_min + crop_h, x1_min:x1_min + crop_w]
+
+    focus_mask = np.zeros_like(target_mask)
+    for f in range(min(num_frames, len(target_track_bboxes))):
+        if target_mask[f].any():
+            focus_mask[f] = _dilate_mask(target_mask[f], iterations=4)
+        else:
+            focus_mask[f] = _bbox_mask_in_crop(target_track_bboxes[f], crop_bbox, (crop_h, crop_w))
+
+    debug["target_mask_mean_coverage"] = float(target_mask.mean()) if target_mask.size else 0.0
+    debug["focus_mask_mean_coverage"] = float(focus_mask.mean()) if focus_mask.size else 0.0
+    debug["other_mask_mean_coverage"] = float(other_mask.mean()) if other_mask.size else 0.0
+    warnings = []
+    if debug["crop_area_ratio"] >= 0.85:
+        warnings.append("crop_near_full_frame")
+    if debug["focus_mask_mean_coverage"] <= 0.05:
+        warnings.append("low_target_coverage")
 
     if needs_inpaint:
         print(f"[Isolate] Person {target_person_id}: {isolation_modes.count('inpaint')}/{len(isolation_modes)} frames need inpainting")
 
-        # For inpainting, only mask overlap frames
+        # For inpainting, only mask overlap frames within the person's crop ROI.
         inpaint_mask = other_mask.copy()
         for f in range(len(isolation_modes)):
             if isolation_modes[f] == "crop":
@@ -438,27 +579,42 @@ def isolate_person(
             try:
                 if inpainter is None:
                     inpainter = ProPainterInpainter()
-                # Convert BGR to RGB for ProPainter, then back
+                # Convert BGR to RGB for ProPainter, then back. We only inpaint
+                # inside the stable crop ROI, which is much cheaper than full-frame.
                 frames_rgb = frames[:, :, :, ::-1].copy()
-                inpainted_rgb = inpainter.inpaint_video(frames_rgb, inpaint_mask)
+                inpainted_rgb = inpainter.inpaint_video(
+                    frames_rgb,
+                    inpaint_mask,
+                    max_long_side=propainter_max_long_side,
+                )
                 frames = inpainted_rgb[:, :, :, ::-1].copy()
+                for f in range(min(num_frames, len(frames))):
+                    if focus_mask[f].any():
+                        frames[f][focus_mask[f]] = original_frames[f][focus_mask[f]]
             except (ImportError, FileNotFoundError) as e:
                 print(f"[Isolate] ProPainter not available ({e}). Using mask blackout fallback.")
                 isolation_modes = ["crop"] * len(isolation_modes)
 
-    # Black out other people's pixels on any frame that wasn't inpainted
-    # This ensures GVHMR's detector can only see the target person
+    # Make the target explicit: preserve only the target focus region on crop-only
+    # frames, and always keep the original target pixels when a focus mask exists.
     for f in range(min(num_frames, len(isolation_modes))):
-        if isolation_modes[f] == "crop" and f < other_mask.shape[0] and other_mask[f].any():
-            frames[f][other_mask[f]] = 0
+        if focus_mask[f].any():
+            frames[f][focus_mask[f]] = original_frames[f][focus_mask[f]]
+        if isolation_modes[f] == "crop":
+            keep = focus_mask[f]
+            if keep.any():
+                frame = frames[f]
+                frame[~keep] = 0
+                frames[f] = frame
+            elif f < other_mask.shape[0] and other_mask[f].any():
+                frames[f][other_mask[f]] = 0
 
     # Crop and write output
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(output_path, fourcc, target_fps, (crop_w, crop_h))
 
     for f in range(min(num_frames, len(frames))):
-        crop = frames[f][y1_min:y1_min + crop_h, x1_min:x1_min + crop_w]
-        writer.write(crop)
+        writer.write(frames[f])
 
     writer.release()
 
@@ -468,4 +624,6 @@ def isolate_person(
         "crop_bbox": [x1_min, y1_min, x1_min + crop_w, y1_min + crop_h],
         "num_inpainted": isolation_modes.count("inpaint"),
         "num_crop_only": isolation_modes.count("crop"),
+        "debug": debug,
+        "warnings": warnings,
     }

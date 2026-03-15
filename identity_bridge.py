@@ -20,34 +20,21 @@ from identity_confidence import TrackConfidence, confidence_to_array
 from identity_tracking import IdentityTrack
 
 
-def crossing_spans_from_overlap(
-    confidences: list[TrackConfidence],
-    iou_threshold: float = 0.15,
+def crossing_spans_from_signal(
+    overlap: np.ndarray,
+    threshold: float = 0.15,
     dilate: int = 5,
     merge_gap: int = 5,
 ) -> list[tuple[int, int]]:
-    """Detect crossing windows from bbox overlap IoU.
-
-    Uses raw bbox_overlap from TrackConfidence instead of the weighted overall
-    score, which dilutes overlap signal and fragments crossings into tiny spans.
-
-    Args:
-        confidences: per-frame confidence scores
-        iou_threshold: minimum bbox overlap IoU to flag a crossing
-        dilate: extend each span by this many frames on each side
-        merge_gap: merge spans separated by <= this many frames
-
-    Returns:
-        list of (start, end) inclusive spans where crossing is detected
-    """
-    if not confidences:
+    """Detect crossing windows from an overlap-like per-frame signal."""
+    if overlap.size == 0:
         return []
 
-    overlap = np.array([c.bbox_overlap for c in confidences], dtype=np.float32)
+    overlap = np.asarray(overlap, dtype=np.float32)
     N = len(overlap)
 
     # Find contiguous spans where overlap >= threshold
-    above = overlap >= iou_threshold
+    above = overlap >= threshold
     if not above.any():
         return []
 
@@ -80,6 +67,29 @@ def crossing_spans_from_overlap(
             merged.append((s, e))
 
     return merged
+
+
+def crossing_spans_from_overlap(
+    confidences: list[TrackConfidence],
+    iou_threshold: float = 0.15,
+    dilate: int = 5,
+    merge_gap: int = 5,
+) -> list[tuple[int, int]]:
+    """Detect crossing windows from bbox overlap IoU.
+
+    Uses raw bbox_overlap from TrackConfidence instead of the weighted overall
+    score, which dilutes overlap signal and fragments crossings into tiny spans.
+    """
+    if not confidences:
+        return []
+
+    overlap = np.array([c.bbox_overlap for c in confidences], dtype=np.float32)
+    return crossing_spans_from_signal(
+        overlap,
+        threshold=iou_threshold,
+        dilate=dilate,
+        merge_gap=merge_gap,
+    )
 
 
 class OcclusionBridge:

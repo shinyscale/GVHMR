@@ -136,8 +136,8 @@ rm -rf outputs/multi_person/*/assembly/
 rm -f outputs/multi_person/*/session_manifest.json
 ```
 
-**Keep these** (expensive to recompute, input-only, still valid):
-- `detection/all_tracks.pt` — OC-SORT tracking (input-only, doesn't change)
+**Usually keep these** (expensive to recompute, input-only, still valid):
+- `detection/all_tracks.pt` — OC-SORT tracking cache. Keep it only if it was produced by the current tracker stack and IDs already look stable in `track_visualization.mp4`; otherwise delete it and re-track.
 - `detection/track_visualization.mp4` — same
 - `shared_slam.pt` — camera motion (computed on original video, not affected)
 - `masks/` — SAM2 masks (if they exist, they're already correct)
@@ -210,7 +210,7 @@ The pipeline runs 7 steps:
 | Inpainting activated | `person_*/isolation_mode.json` | Shows `"inpaint"` during crossing frames, `"crop"` elsewhere |
 | Clean isolation | `person_*/isolated_video.mp4` | Other person removed cleanly in overlap frames |
 | Per-person skeleton correct | `person_*/demo/` results | Skeleton tracks the right body, doesn't jump |
-| World assembly | `assembly/person_offsets.json` | Non-zero offsets placing people at correct positions |
+| World assembly | `assembly/person_offsets.json` | `offsets` should be non-zero where expected; `metadata` should show a sensible reference frame and avoid obviously synthetic early-frame anchors |
 | Scene preview | `assembly/scene_preview.mp4` | Both skeletons visible and correctly positioned |
 
 **The acid test**: At the exact crossing frames, does each person's skeleton stay on their own body?
@@ -257,7 +257,7 @@ outputs/multi_person/crossing_test/
   person_1/
     ...                              # Same structure
   assembly/
-    person_offsets.json              # Relative XZ positions
+    person_offsets.json              # Relative XZ positions + reference-frame metadata
     assembled_smplx.pt               # All people in shared world frame
     scene_preview.mp4                # Combined overlay video
   session_manifest.json              # Full session metadata

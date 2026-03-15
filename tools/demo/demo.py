@@ -60,6 +60,12 @@ def parse_args_to_cfg():
         default=None,
         help="Path to pre-computed SLAM results (.pt). Skips SLAM computation when provided.",
     )
+    parser.add_argument(
+        "--bbx_override",
+        type=str,
+        default=None,
+        help="Path to pre-computed bounding boxes (.pt). Skips single-person retracking when provided.",
+    )
     args = parser.parse_args()
 
     # Input
@@ -94,6 +100,7 @@ def parse_args_to_cfg():
     from omegaconf import OmegaConf
     OmegaConf.set_struct(cfg, False)
     cfg.slam_override = args.slam_override
+    cfg.bbx_override = args.bbx_override
     cfg.skip_render = args.skip_render
     cfg.render_incam_only = args.render_incam_only
     OmegaConf.set_struct(cfg, True)
@@ -121,7 +128,28 @@ def run_preprocess(cfg):
     verbose = cfg.verbose
 
     # Get bbx tracking result
-    if not Path(paths.bbx).exists():
+    bbx_override = getattr(cfg, "bbx_override", None)
+    if bbx_override and Path(bbx_override).exists():
+        override_data = torch.load(bbx_override, map_location="cpu", weights_only=False)
+        if isinstance(override_data, dict) and "bbx_xyxy" in override_data:
+            bbx_xyxy = override_data["bbx_xyxy"]
+            bbx_xys = override_data.get("bbx_xys")
+        else:
+            bbx_xyxy = override_data
+            bbx_xys = None
+
+        if isinstance(bbx_xyxy, np.ndarray):
+            bbx_xyxy = torch.from_numpy(bbx_xyxy)
+        bbx_xyxy = bbx_xyxy.float()
+        if bbx_xys is None:
+            bbx_xys = get_bbx_xys_from_xyxy(bbx_xyxy, base_enlarge=1.2).float()
+        elif isinstance(bbx_xys, np.ndarray):
+            bbx_xys = torch.from_numpy(bbx_xys).float()
+        else:
+            bbx_xys = bbx_xys.float()
+        torch.save({"bbx_xyxy": bbx_xyxy, "bbx_xys": bbx_xys}, paths.bbx)
+        Log.info(f"[Preprocess] bbx override from {bbx_override}")
+    elif not Path(paths.bbx).exists():
         tracker = Tracker()
         bbx_xyxy = tracker.get_one_track(video_path).float()  # (L, 4)
         bbx_xys = get_bbx_xys_from_xyxy(bbx_xyxy, base_enlarge=1.2).float()  # (L, 3) apply aspect ratio and enlarge

@@ -1279,6 +1279,7 @@ with gr.Blocks(
                 "Detects and tracks N people, isolates each into a clean single-person video "
                 "(using segmentation + inpainting when people overlap), then runs the full "
                 "pipeline per person. Results are assembled in shared world coordinates.\n\n"
+                "For front-crossings and heavy occlusion, enable inpainting or expect ID swaps / body erasure.\n\n"
                 "Requires: `segment-anything-2` (SAM2), `ProPainter` (optional, for occlusion handling)."
             )
 
@@ -1327,9 +1328,9 @@ with gr.Blocks(
                     )
                     mp_use_inpainting = gr.Checkbox(
                         label="SAM2 + ProPainter inpainting",
-                        value=False,
+                        value=True,
                         info="Pixel-accurate isolation via segmentation + video inpainting. "
-                             "Very slow (~5min/person). Only needed for heavy occlusion.",
+                             "Required for front-crossings / heavy occlusion. Very slow (~5min/person).",
                     )
                     mp_run_btn = gr.Button(
                         "Run Multi-Person Pipeline",

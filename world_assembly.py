@@ -10,6 +10,57 @@ import torch
 from pathlib import Path
 
 
+def _track_detection_mask(track) -> np.ndarray:
+    """Return a track's real-detection mask as a numpy bool array."""
+    mask = track.get("detection_mask")
+    if mask is None:
+        boxes = track["bbx_xyxy"]
+        length = len(boxes)
+        return np.ones(length, dtype=bool)
+    if isinstance(mask, torch.Tensor):
+        mask = mask.cpu().numpy()
+    return np.asarray(mask, dtype=bool)
+
+
+def choose_reference_frame(
+    all_tracks,
+    preferred_frame=0,
+):
+    """Pick a frame with the strongest simultaneous real detections."""
+    if not all_tracks:
+        return 0, {"strategy": "empty"}
+
+    masks = [_track_detection_mask(track) for track in all_tracks]
+    common_len = min(len(mask) for mask in masks)
+    if common_len <= 0:
+        return 0, {"strategy": "empty_masks"}
+
+    preferred_frame = max(0, min(int(preferred_frame), common_len - 1))
+    stacked = np.stack([mask[:common_len] for mask in masks], axis=0)
+    counts = stacked.sum(axis=0)
+
+    if stacked[:, preferred_frame].all():
+        return preferred_frame, {
+            "strategy": "preferred_all_real",
+            "num_real_tracks": int(counts[preferred_frame]),
+        }
+
+    best_count = int(counts.max())
+    if best_count <= 0:
+        return preferred_frame, {
+            "strategy": "no_real_detections",
+            "num_real_tracks": 0,
+        }
+
+    candidates = np.flatnonzero(counts == best_count)
+    later = candidates[candidates >= preferred_frame]
+    chosen = int(later[0] if len(later) else candidates[0])
+    return chosen, {
+        "strategy": "max_real_tracks",
+        "num_real_tracks": best_count,
+    }
+
+
 def bbox_bottom_center(bbox_xyxy):
     """Get the bottom-center point of a bbox (approximate foot position).
 
@@ -69,20 +120,68 @@ def compute_person_offsets(
         camera_K = camera_K.cpu().numpy()
 
     if len(all_tracks) == 0:
-        return {}
+        return {}, {
+            "chosen_reference_frame": None,
+            "reference_info": {"strategy": "empty"},
+            "per_track": {},
+        }
 
     offsets = {}
+    offset_metadata = {}
+    chosen_frame, reference_info = choose_reference_frame(all_tracks, preferred_frame=reference_frame)
+
     ref_track = all_tracks[0]
-    ref_bbox = ref_track["bbx_xyxy"][reference_frame].cpu().numpy()
+    ref_boxes = ref_track["bbx_xyxy"]
+    if isinstance(ref_boxes, torch.Tensor):
+        ref_boxes = ref_boxes.cpu().numpy()
+    ref_mask = _track_detection_mask(ref_track)
+
+    if chosen_frame >= len(ref_boxes):
+        chosen_frame = len(ref_boxes) - 1
+    if not ref_mask[min(chosen_frame, len(ref_mask) - 1)] and ref_mask.any():
+        chosen_frame = int(np.flatnonzero(ref_mask)[0])
+
+    ref_bbox = ref_boxes[chosen_frame]
     ref_feet = bbox_bottom_center(ref_bbox)
     ref_depth = estimate_depth_from_bbox_height(ref_bbox, camera_K, assumed_height_m)
 
     fx = camera_K[0, 0]
-    cx = camera_K[0, 2]
 
     for track in all_tracks:
         tid = track["track_id"]
-        bbox = track["bbx_xyxy"][reference_frame].cpu().numpy()
+        boxes = track["bbx_xyxy"]
+        if isinstance(boxes, torch.Tensor):
+            boxes = boxes.cpu().numpy()
+        mask = _track_detection_mask(track)
+
+        if len(boxes) == 0:
+            offsets[tid] = np.zeros(3, dtype=np.float32)
+            offset_metadata[tid] = {
+                "reference_frame": None,
+                "approximate": True,
+                "reason": "empty_track",
+            }
+            continue
+
+        track_frame = min(chosen_frame, len(boxes) - 1)
+        approximate = False
+        if track_frame >= len(mask):
+            track_frame = len(mask) - 1
+        if track_frame < 0 or not mask[track_frame]:
+            real_frames = np.flatnonzero(mask)
+            if len(real_frames) == 0:
+                offsets[tid] = np.zeros(3, dtype=np.float32)
+                offset_metadata[tid] = {
+                    "reference_frame": None,
+                    "approximate": True,
+                    "reason": "no_real_detection",
+                }
+                continue
+            nearest_idx = int(np.argmin(np.abs(real_frames - chosen_frame)))
+            track_frame = int(real_frames[nearest_idx])
+            approximate = True
+
+        bbox = boxes[track_frame]
         feet = bbox_bottom_center(bbox)
         depth = estimate_depth_from_bbox_height(bbox, camera_K, assumed_height_m)
 
@@ -94,8 +193,16 @@ def compute_person_offsets(
         dz_meters = depth - ref_depth
 
         offsets[tid] = np.array([dx_meters, 0.0, dz_meters])
+        offset_metadata[tid] = {
+            "reference_frame": int(track_frame),
+            "approximate": approximate,
+        }
 
-    return offsets
+    return offsets, {
+        "chosen_reference_frame": int(chosen_frame),
+        "reference_info": reference_info,
+        "per_track": offset_metadata,
+    }
 
 
 def apply_offsets_to_smplx(smplx_params_path, offset, output_path=None):
@@ -149,7 +256,7 @@ def assemble_scene(
     assembly_dir.mkdir(parents=True, exist_ok=True)
 
     # Compute offsets
-    offsets = compute_person_offsets(all_tracks, camera_K, reference_frame)
+    offsets, offset_info = compute_person_offsets(all_tracks, camera_K, reference_frame)
 
     # Save offsets
     offsets_json = {
@@ -157,7 +264,10 @@ def assemble_scene(
         for tid, offset in offsets.items()
     }
     with open(assembly_dir / "person_offsets.json", "w") as f:
-        json.dump(offsets_json, f, indent=2)
+        json.dump({
+            "offsets": offsets_json,
+            "metadata": offset_info,
+        }, f, indent=2)
 
     # Apply offsets to each person's SMPL-X params
     assembled_params = {}
@@ -201,6 +311,7 @@ def save_session_manifest(
     offsets,
     person_dirs,
     slam_path=None,
+    person_bindings=None,
 ):
     """Save a session manifest JSON with all metadata."""
     manifest = {
@@ -220,6 +331,8 @@ def save_session_manifest(
         },
         "person_dirs": [str(d) for d in person_dirs],
     }
+    if person_bindings is not None:
+        manifest["person_bindings"] = person_bindings
 
     manifest_path = Path(output_dir) / "session_manifest.json"
     with open(manifest_path, "w") as f:
