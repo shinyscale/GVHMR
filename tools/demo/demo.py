@@ -76,8 +76,14 @@ def parse_args_to_cfg():
     Log.info(f"(L, W, H) = ({length}, {width}, {height})")
     # Cfg
     with initialize_config_module(version_base="1.3", config_module=f"hmr4d.configs"):
+        # Hydra treats commas as list separators; escape values that may
+        # contain commas or spaces (e.g. "Video Dec 18 2024, 2 44 14 PM").
+        def _hesc(val):
+            s = str(val)
+            return f"'{s}'" if any(c in s for c in (",", " ")) else s
+
         overrides = [
-            f"video_name={video_path.stem}",
+            f"video_name={_hesc(video_path.stem)}",
             f"static_cam={args.static_cam}",
             f"verbose={args.verbose}",
             f"use_dpvo={args.use_dpvo}",
@@ -87,7 +93,7 @@ def parse_args_to_cfg():
 
         # Allow to change output root
         if args.output_root is not None:
-            overrides.append(f"output_root={args.output_root}")
+            overrides.append(f"output_root={_hesc(args.output_root)}")
         register_store_gvhmr()
         cfg = compose(config_name="demo", overrides=overrides)
 

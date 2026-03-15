@@ -203,10 +203,7 @@ class ProPainterInpainter:
         self._model = None
 
     def _ensure_loaded(self):
-        """Lazy-load all ProPainter models (RAFT, flow completion, inpainter)."""
-        if self._model is not None:
-            return
-
+        """Lazy-load ProPainter models, reloading any that were freed between stages."""
         from model.modules.flow_comp_raft import RAFT_bi
         from model.recurrent_flow_completion import RecurrentFlowCompleteNet
         from model.propainter import InpaintGenerator
@@ -217,41 +214,44 @@ class ProPainterInpainter:
         pretrain_url = "https://github.com/sczhou/ProPainter/releases/download/v0.1.0/"
 
         # RAFT optical flow
-        raft_path = load_file_from_url(
-            url=pretrain_url + "raft-things.pth",
-            model_dir=str(weights_dir), progress=True,
-        )
-        self._raft = RAFT_bi(raft_path, self.device)
+        if self._raft is None:
+            raft_path = load_file_from_url(
+                url=pretrain_url + "raft-things.pth",
+                model_dir=str(weights_dir), progress=True,
+            )
+            self._raft = RAFT_bi(raft_path, self.device)
 
         # Flow completion
-        fc_path = load_file_from_url(
-            url=pretrain_url + "recurrent_flow_completion.pth",
-            model_dir=str(weights_dir), progress=True,
-        )
-        self._flow_complete = RecurrentFlowCompleteNet(fc_path)
-        for p in self._flow_complete.parameters():
-            p.requires_grad = False
-        self._flow_complete.to(self.device)
-        self._flow_complete.eval()
+        if self._flow_complete is None:
+            fc_path = load_file_from_url(
+                url=pretrain_url + "recurrent_flow_completion.pth",
+                model_dir=str(weights_dir), progress=True,
+            )
+            self._flow_complete = RecurrentFlowCompleteNet(fc_path)
+            for p in self._flow_complete.parameters():
+                p.requires_grad = False
+            self._flow_complete.to(self.device)
+            self._flow_complete.eval()
 
         # InpaintGenerator
-        pp_path = load_file_from_url(
-            url=pretrain_url + "ProPainter.pth",
-            model_dir=str(weights_dir), progress=True,
-        )
-        self._model = InpaintGenerator(model_path=pp_path).to(self.device)
-        self._model.eval()
+        if self._model is None:
+            pp_path = load_file_from_url(
+                url=pretrain_url + "ProPainter.pth",
+                model_dir=str(weights_dir), progress=True,
+            )
+            self._model = InpaintGenerator(model_path=pp_path).to(self.device)
+            self._model.eval()
 
     def inpaint_video(
         self,
         frames: np.ndarray,
         masks: np.ndarray,
-        subvideo_length: int = 80,
+        subvideo_length: int = 50,
         neighbor_length: int = 10,
         ref_stride: int = 10,
         raft_iter: int = 20,
         mask_dilation: int = 4,
-        max_long_side: int | None = 960,
+        max_long_side: int | None = 576,
     ) -> np.ndarray:
         """Inpaint masked regions in video frames using full ProPainter pipeline.
 
@@ -363,8 +363,12 @@ class ProPainterInpainter:
                 pred_flows_bi = self._flow_complete.combine_flow(gt_flows_bi, pred_flows_bi, flow_masks_t)
                 torch.cuda.empty_cache()
 
-            # Free flow memory
+            # Free flow memory and RAFT model (no longer needed)
             del gt_flows_bi
+            if self._raft is not None:
+                del self._raft
+                self._raft = None
+            torch.cuda.empty_cache()
 
             # Stage 3: Image propagation (fill from temporal neighbors)
             masked_frames = frames_t * (1 - masks_dilated_t)
@@ -398,6 +402,15 @@ class ProPainterInpainter:
                 updated_frames = frames_t * (1 - masks_dilated_t) + prop_imgs.view(b, t, 3, h, w) * masks_dilated_t
                 updated_masks = updated_local_masks.view(b, t, 1, h, w)
                 torch.cuda.empty_cache()
+
+            # Free tensors and models no longer needed before transformer stage
+            del masked_frames
+            del flow_masks_t
+            del frames_t
+            if self._flow_complete is not None:
+                del self._flow_complete
+                self._flow_complete = None
+            torch.cuda.empty_cache()
 
         # Stage 4: Transformer-based inpainting
         ori_frames = [np.array(f) for f in pil_frames]
@@ -479,7 +492,7 @@ def isolate_person(
     output_path: str,
     inpainter: ProPainterInpainter | None = None,
     target_fps: float = 30.0,
-    propainter_max_long_side: int | None = 960,
+    propainter_max_long_side: int | None = 576,
 ) -> dict:
     """Isolate a single person from a multi-person video.
 
