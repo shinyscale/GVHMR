@@ -893,6 +893,7 @@ def run_multi_person_pipeline(
     multi_use_dpvo: bool,
     max_persons: int,
     render_overlays: bool = False,
+    use_inpainting: bool = False,
     progress=gr.Progress(track_tqdm=False),
 ):
     """Run the multi-person capture pipeline."""
@@ -917,6 +918,7 @@ def run_multi_person_pipeline(
         static_cam=bool(multi_static_cam),
         use_dpvo=bool(multi_use_dpvo),
         max_persons=int(max_persons) if max_persons else 0,
+        use_inpainting=bool(use_inpainting),
     )
 
     # Preprocess
@@ -943,6 +945,7 @@ def run_multi_person_pipeline(
             use_dpvo=multi_use_dpvo,
             max_persons=int(max_persons) if max_persons else 0,
             render_overlays=render_overlays,
+            use_inpainting=use_inpainting,
             progress_callback=mp_progress,
         )
     except Exception as e:
@@ -1322,6 +1325,12 @@ with gr.Blocks(
                         value=False,
                         info="Render in-camera mesh overlay per person (slower)",
                     )
+                    mp_use_inpainting = gr.Checkbox(
+                        label="SAM2 + ProPainter inpainting",
+                        value=False,
+                        info="Pixel-accurate isolation via segmentation + video inpainting. "
+                             "Very slow (~5min/person). Only needed for heavy occlusion.",
+                    )
                     mp_run_btn = gr.Button(
                         "Run Multi-Person Pipeline",
                         variant="primary",
@@ -1365,6 +1374,7 @@ with gr.Blocks(
                 inputs=[
                     mp_video_upload, mp_video_path, mp_fps, mp_fbx_naming,
                     mp_static_cam, mp_use_dpvo, mp_max_persons, mp_render_overlays,
+                    mp_use_inpainting,
                 ],
                 outputs=[
                     mp_track_viz, mp_scene_preview, mp_person_count,
@@ -1393,27 +1403,28 @@ with gr.Blocks(
             # Restore saved params when a video path is entered
             def _restore_mp_config(video_path_text):
                 if not video_path_text or not video_path_text.strip():
-                    return (gr.update(),) * 5
+                    return (gr.update(),) * 6
                 cfg = load_solve_config(video_path_text.strip(), "multi_person")
                 if cfg is None:
-                    return (gr.update(),) * 5
+                    return (gr.update(),) * 6
                 return (
                     gr.update(value=cfg.get("static_cam", False)),
                     gr.update(value=cfg.get("use_dpvo", False)),
                     gr.update(value=cfg.get("max_persons", 0)),
                     gr.update(value=cfg.get("target_fps", "30")),
                     gr.update(value=cfg.get("fbx_naming", "Mixamo (Cascadeur)")),
+                    gr.update(value=cfg.get("use_inpainting", False)),
                 )
 
             mp_video_path.change(
                 fn=_restore_mp_config,
                 inputs=[mp_video_path],
-                outputs=[mp_static_cam, mp_use_dpvo, mp_max_persons, mp_fps, mp_fbx_naming],
+                outputs=[mp_static_cam, mp_use_dpvo, mp_max_persons, mp_fps, mp_fbx_naming, mp_use_inpainting],
             )
             mp_video_upload.upload(
                 fn=lambda v: _restore_mp_config(v),
                 inputs=[mp_video_upload],
-                outputs=[mp_static_cam, mp_use_dpvo, mp_max_persons, mp_fps, mp_fbx_naming],
+                outputs=[mp_static_cam, mp_use_dpvo, mp_max_persons, mp_fps, mp_fbx_naming, mp_use_inpainting],
             )
 
 

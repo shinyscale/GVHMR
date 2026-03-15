@@ -20,6 +20,68 @@ from identity_confidence import TrackConfidence, confidence_to_array
 from identity_tracking import IdentityTrack
 
 
+def crossing_spans_from_overlap(
+    confidences: list[TrackConfidence],
+    iou_threshold: float = 0.15,
+    dilate: int = 5,
+    merge_gap: int = 5,
+) -> list[tuple[int, int]]:
+    """Detect crossing windows from bbox overlap IoU.
+
+    Uses raw bbox_overlap from TrackConfidence instead of the weighted overall
+    score, which dilutes overlap signal and fragments crossings into tiny spans.
+
+    Args:
+        confidences: per-frame confidence scores
+        iou_threshold: minimum bbox overlap IoU to flag a crossing
+        dilate: extend each span by this many frames on each side
+        merge_gap: merge spans separated by <= this many frames
+
+    Returns:
+        list of (start, end) inclusive spans where crossing is detected
+    """
+    if not confidences:
+        return []
+
+    overlap = np.array([c.bbox_overlap for c in confidences], dtype=np.float32)
+    N = len(overlap)
+
+    # Find contiguous spans where overlap >= threshold
+    above = overlap >= iou_threshold
+    if not above.any():
+        return []
+
+    spans = []
+    in_span = False
+    start = 0
+    for i in range(N):
+        if above[i] and not in_span:
+            start = i
+            in_span = True
+        elif not above[i] and in_span:
+            spans.append((start, i - 1))
+            in_span = False
+    if in_span:
+        spans.append((start, N - 1))
+
+    # Dilate each span
+    spans = [(max(0, s - dilate), min(N - 1, e + dilate)) for s, e in spans]
+
+    # Merge spans separated by <= merge_gap
+    if len(spans) <= 1:
+        return spans
+
+    merged = [spans[0]]
+    for s, e in spans[1:]:
+        prev_s, prev_e = merged[-1]
+        if s <= prev_e + merge_gap + 1:
+            merged[-1] = (prev_s, max(prev_e, e))
+        else:
+            merged.append((s, e))
+
+    return merged
+
+
 class OcclusionBridge:
     """Interpolates body pose through low-confidence spans.
 
@@ -221,6 +283,89 @@ class OcclusionBridge:
             "body_pose": bridged_rots[:, 1:].reshape(num_frames, -1, 3),
             "global_orient": bridged_rots[:, 0],
             "transl": bridged_transl,
+            "bridged_frames": bridged_frames,
+        }
+
+    def bridge_with_spans(
+        self,
+        body_pose: np.ndarray,
+        global_orient: np.ndarray,
+        transl: np.ndarray,
+        spans: list[tuple[int, int]],
+    ) -> dict:
+        """Bridge explicit crossing spans using direct frame anchors.
+
+        Unlike bridge_poses() which computes spans from confidence scores and
+        looks up keyframes, this takes pre-computed spans (from IoU overlap)
+        and uses the immediately adjacent clean frames as SLERP anchors.
+
+        Args:
+            body_pose: (N, 21, 3) or (N, 63) axis-angle body joint rotations
+            global_orient: (N, 3) axis-angle root orientation
+            transl: (N, 3) root translation
+            spans: list of (start, end) inclusive crossing spans
+
+        Returns:
+            dict with 'body_pose', 'global_orient', 'transl', 'bridged_frames'
+        """
+        num_frames = len(body_pose)
+
+        # Reshape body_pose to (N, 21, 3) if flat
+        if body_pose.ndim == 2 and body_pose.shape[1] == 63:
+            body_pose = body_pose.reshape(num_frames, 21, 3)
+        elif body_pose.ndim == 2:
+            num_joints = body_pose.shape[1] // 3
+            body_pose = body_pose.reshape(num_frames, num_joints, 3)
+
+        # Concat global orient + body pose for joint SLERP
+        global_orient_3d = global_orient.reshape(num_frames, 1, 3)
+        all_rots = np.concatenate([global_orient_3d, body_pose], axis=1)  # (N, 22, 3)
+        rot_output = all_rots.copy()
+        transl_output = transl.copy()
+        bridged_frames = set()
+
+        for start, end in spans:
+            prev_frame = max(0, start - 1)
+            next_frame = min(num_frames - 1, end + 1)
+
+            # Guard: if span covers entire clip, no clean anchors exist
+            if prev_frame == start and next_frame == end:
+                continue
+
+            num_joints = all_rots.shape[1]
+
+            # Per-joint SLERP for rotations
+            for j in range(num_joints):
+                r_prev = Rotation.from_rotvec(all_rots[prev_frame, j])
+                r_next = Rotation.from_rotvec(all_rots[next_frame, j])
+                slerp = Slerp([0.0, 1.0], Rotation.concatenate([r_prev, r_next]))
+
+                for f in range(start, end + 1):
+                    if next_frame > prev_frame:
+                        t = (f - prev_frame) / (next_frame - prev_frame)
+                    else:
+                        t = 0.0
+                    t = max(0.0, min(1.0, t))
+                    rot_output[f, j] = slerp([t]).as_rotvec()[0]
+                    bridged_frames.add(f)
+
+            # Linear interpolation for translations
+            for f in range(start, end + 1):
+                if next_frame > prev_frame:
+                    t = (f - prev_frame) / (next_frame - prev_frame)
+                else:
+                    t = 0.0
+                transl_output[f] = (1 - t) * transl[prev_frame] + t * transl[next_frame]
+
+            # No crossfade for crossing spans — unlike confidence-based spans where
+            # boundary frames are "somewhat OK", crossing span boundaries contain
+            # corrupted HMR output. The SLERP from prev_frame→next_frame already
+            # provides smooth transitions (t≈0 at start, t≈1 at end).
+
+        return {
+            "body_pose": rot_output[:, 1:].reshape(num_frames, -1, 3),
+            "global_orient": rot_output[:, 0],
+            "transl": transl_output,
             "bridged_frames": bridged_frames,
         }
 

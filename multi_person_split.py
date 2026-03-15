@@ -205,14 +205,18 @@ def compute_shared_slam(
     from hmr4d.utils.preproc import SimpleVO
     from hmr4d.utils.geo.hmr_cam import estimate_K, convert_K_to_K4
 
-    # Check DPVO availability
+    # Check DPVO availability — must test the full import chain that slam.py needs,
+    # not just dpvo.config. slam.py has a bare `except: pass` that silently leaves
+    # cfg undefined if dpvo.dpvo.DPVO fails to import (e.g. build mismatch).
     dpvo_available = False
     if use_dpvo:
         try:
+            from dpvo.utils import Timer as _dpvo_timer
+            from dpvo.dpvo import DPVO as _dpvo_cls
             from dpvo.config import cfg as _dpvo_cfg
             dpvo_available = True
-        except ImportError:
-            print("[SLAM] DPVO not installed — falling back to SimpleVO.")
+        except Exception as e:
+            print(f"[SLAM] DPVO not available ({e}) — falling back to SimpleVO.")
 
     if not use_dpvo or not dpvo_available:
         simple_vo = SimpleVO(str(video_path), scale=0.5, step=8, method="sift", f_mm=f_mm)
@@ -327,6 +331,7 @@ def split_multi_person_video(
     f_mm=None,
     max_persons=0,
     render_overlays=False,
+    use_inpainting=False,
     progress_callback=None,
 ):
     """Full multi-person isolation pipeline.
@@ -334,10 +339,10 @@ def split_multi_person_video(
     Steps:
         1. Detect & track all people (OC-SORT / YOLO fallback)
         2. Compute shared camera motion (SLAM) once on original video
-        3. Segment all people (SAM2)
-        4. Per-person: smart isolate (crop or inpaint)
-        5. Per-person: run existing GVHMR pipeline with shared SLAM
-        6. Compute relative offsets and assemble world-space results
+        3. (If use_inpainting) Segment all people (SAM2) + inpaint overlaps
+           (If not) Bbox crop with blackout — fast path, usually sufficient
+        4. Per-person: run existing GVHMR pipeline with shared SLAM
+        5. Compute relative offsets and assemble world-space results
 
     Args:
         video_path: path to input multi-person video
@@ -347,6 +352,10 @@ def split_multi_person_video(
         use_dpvo: use DPVO for camera estimation
         f_mm: focal length in mm (None for auto)
         max_persons: limit to N largest people (0 = all)
+        render_overlays: render per-person mesh overlays
+        use_inpainting: use SAM2 + ProPainter for pixel-accurate isolation
+            (slow but better for heavy occlusion). When False, uses fast
+            bbox-crop-and-blackout which is sufficient for most crossings.
         progress_callback: fn(frac, msg) for progress updates
 
     Returns:
@@ -416,9 +425,12 @@ def split_multi_person_video(
 
     _progress(0.20, "SLAM complete")
 
-    # ── Step 3: Segmentation (only if >1 person) ──
+    # ── Step 3: Segmentation (only if >1 person AND inpainting enabled) ──
     masks = {}
-    if len(all_tracks) > 1:
+    if len(all_tracks) > 1 and not use_inpainting:
+        _progress(0.22, "Using fast bbox-crop isolation (no SAM2/ProPainter)")
+        _progress(0.35, "Skipped segmentation — bbox blackout mode")
+    elif len(all_tracks) > 1:
         _progress(0.22, "Segmenting all people with SAM2...")
 
         masks_dir = output_dir / "masks"
@@ -585,7 +597,7 @@ def split_multi_person_video(
         from identity_confidence import compute_all_confidences, confidence_to_array, export_confidence_csv
         from identity_tracking import IdentityTrack, auto_generate_keyframes
         from identity_reid import ShapeReIdentifier
-        from identity_bridge import OcclusionBridge, summarize_bridging
+        from identity_bridge import OcclusionBridge, summarize_bridging, crossing_spans_from_overlap
         from smplx_to_bvh import extract_gvhmr_params
 
         identity_tracks = []
@@ -647,8 +659,49 @@ def split_multi_person_video(
             transl = params.get("transl_world", params.get("transl"))
 
             if body_pose is not None and global_orient is not None and transl is not None:
-                bridge_result = bridge.bake(body_pose, global_orient, transl, confidences)
+                crossing_spans = crossing_spans_from_overlap(confidences)
+                if crossing_spans:
+                    total_crossing = sum(e - s + 1 for s, e in crossing_spans)
+                    _progress(0.82 + i / max(len(person_dirs), 1) * 0.03,
+                              f"Person {i}: {len(crossing_spans)} crossing spans detected, "
+                              f"bridging {total_crossing} frames")
+                    bridge_result = bridge.bridge_with_spans(
+                        body_pose, global_orient, transl, crossing_spans)
+                else:
+                    bridge_result = bridge.bake(body_pose, global_orient, transl, confidences)
                 bridged_frames = bridge_result["bridged_frames"]
+
+                # Save bridged params back to hmr4d_results.pt
+                if bridged_frames:
+                    pt_data = torch.load(str(pt_files[0]), map_location="cpu", weights_only=False)
+                    g = pt_data["smpl_params_global"]
+
+                    bridged_bp = bridge_result["body_pose"]     # (N, 21, 3)
+                    bridged_go = bridge_result["global_orient"]  # (N, 3)
+                    bridged_tr = bridge_result["transl"]         # (N, 3)
+
+                    g["body_pose"] = torch.from_numpy(bridged_bp.reshape(num_person_frames, -1)).float()
+                    g["global_orient"] = torch.from_numpy(bridged_go.reshape(num_person_frames, -1)).float()
+                    g["transl"] = torch.from_numpy(bridged_tr).float()
+
+                    # Also bridge smpl_params_incam so scene preview shows corrected poses
+                    if crossing_spans and "smpl_params_incam" in pt_data:
+                        ic = pt_data["smpl_params_incam"]
+                        ic_bp = np.array(ic["body_pose"]).reshape(num_person_frames, -1, 3)
+                        ic_go = np.array(ic["global_orient"]).reshape(num_person_frames, 3)
+                        ic_tr = np.array(ic["transl"]).reshape(num_person_frames, 3)
+                        ic_result = bridge.bridge_with_spans(ic_bp, ic_go, ic_tr, crossing_spans)
+                        ic["body_pose"] = torch.from_numpy(
+                            ic_result["body_pose"].reshape(num_person_frames, -1)).float()
+                        ic["global_orient"] = torch.from_numpy(
+                            ic_result["global_orient"].reshape(num_person_frames, -1)).float()
+                        ic["transl"] = torch.from_numpy(ic_result["transl"]).float()
+
+                    torch.save(pt_data, str(pt_files[0]))
+
+                    _progress(0.82 + i / max(len(person_dirs), 1) * 0.03,
+                              f"Person {i}: {len(bridged_frames)} frames bridged and saved")
+
                 summary = summarize_bridging(confidences, bridged_frames)
                 bridging_summaries.append(summary)
 
@@ -691,17 +744,16 @@ def split_multi_person_video(
     _progress(0.85, "Generating BVH files...")
 
     try:
-        from smplx_to_bvh import convert_params_to_bvh
+        from smplx_to_bvh import convert_params_to_bvh, extract_gvhmr_params as _extract_gvhmr
 
         for i, person_dir in enumerate(person_dirs):
             pt_files = list(person_dir.rglob("hmr4d_results.pt"))
             if not pt_files:
                 continue
             bvh_path = person_dir / "body.bvh"
-            if bvh_path.exists():
-                continue
             try:
-                convert_params_to_bvh(str(pt_files[0]), str(bvh_path))
+                params = _extract_gvhmr(str(pt_files[0]))
+                convert_params_to_bvh(params, str(bvh_path), skip_world_grounding=True)
                 _progress(0.85 + (i + 1) / len(person_dirs) * 0.05,
                           f"Person {i} BVH exported")
             except Exception as e:
@@ -891,7 +943,7 @@ def reprocess_person(
     try:
         from identity_confidence import compute_all_confidences, export_confidence_csv
         from identity_tracking import IdentityTrack, auto_generate_keyframes
-        from identity_bridge import OcclusionBridge, summarize_bridging
+        from identity_bridge import OcclusionBridge, summarize_bridging, crossing_spans_from_overlap
         from smplx_to_bvh import extract_gvhmr_params
 
         params = extract_gvhmr_params(pt_path)
@@ -936,8 +988,37 @@ def reprocess_person(
 
         bridged_frames = set()
         if body_pose is not None and global_orient is not None and transl is not None:
-            bridge_result = bridge.bake(body_pose, global_orient, transl, confidences)
+            crossing_spans = crossing_spans_from_overlap(confidences)
+            if crossing_spans:
+                bridge_result = bridge.bridge_with_spans(
+                    body_pose, global_orient, transl, crossing_spans)
+            else:
+                bridge_result = bridge.bake(body_pose, global_orient, transl, confidences)
             bridged_frames = bridge_result["bridged_frames"]
+
+            # Save bridged params back to .pt
+            if bridged_frames:
+                pt_data = torch.load(pt_path, map_location="cpu", weights_only=False)
+                g = pt_data["smpl_params_global"]
+                g["body_pose"] = torch.from_numpy(
+                    bridge_result["body_pose"].reshape(num_person_frames, -1)).float()
+                g["global_orient"] = torch.from_numpy(
+                    bridge_result["global_orient"].reshape(num_person_frames, -1)).float()
+                g["transl"] = torch.from_numpy(bridge_result["transl"]).float()
+
+                if crossing_spans and "smpl_params_incam" in pt_data:
+                    ic = pt_data["smpl_params_incam"]
+                    ic_bp = np.array(ic["body_pose"]).reshape(num_person_frames, -1, 3)
+                    ic_go = np.array(ic["global_orient"]).reshape(num_person_frames, 3)
+                    ic_tr = np.array(ic["transl"]).reshape(num_person_frames, 3)
+                    ic_result = bridge.bridge_with_spans(ic_bp, ic_go, ic_tr, crossing_spans)
+                    ic["body_pose"] = torch.from_numpy(
+                        ic_result["body_pose"].reshape(num_person_frames, -1)).float()
+                    ic["global_orient"] = torch.from_numpy(
+                        ic_result["global_orient"].reshape(num_person_frames, -1)).float()
+                    ic["transl"] = torch.from_numpy(ic_result["transl"]).float()
+
+                torch.save(pt_data, pt_path)
 
         # Save
         id_track.save_json(person_dir / "identity_track.json")
