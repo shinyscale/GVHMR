@@ -15,7 +15,7 @@ import numpy as np
 import torch
 
 from hmr4d.utils.video_io_utils import get_video_lwh
-from hmr4d.utils.geo.hmr_cam import estimate_K
+from hmr4d.utils.geo.hmr_cam import estimate_K, get_bbx_xys_from_xyxy
 
 
 GVHMR_DIR = Path(__file__).resolve().parent

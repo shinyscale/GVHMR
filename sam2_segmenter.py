@@ -177,6 +177,19 @@ class SAM2Segmenter:
                         continue
                     trusted_frames.append(actual_frame)
 
+                # Fallback: if no trusted frames found, use first detected frame
+                if not trusted_frames:
+                    for f in range(min(num_frames, len(boxes))):
+                        if det_mask is not None and f < len(det_mask) and det_mask[f]:
+                            trusted_frames.append(f)
+                            break
+                    if not trusted_frames:
+                        # Last resort: use frame 0
+                        trusted_frames.append(0)
+                    print(f"[SAM2] Track {tid}: no high-conf prompt frames found, "
+                          f"falling back to frame {trusted_frames[0]}")
+
+                prompts_added = 0
                 for actual_frame in trusted_frames:
                     bbox = boxes[actual_frame]
                     # Skip if bbox is degenerate
@@ -186,8 +199,13 @@ class SAM2Segmenter:
                         inference_state=state,
                         frame_idx=actual_frame,
                         obj_id=tid,
-                        box=bbox,
+                        box=bbox.astype(np.float32),
                     )
+                    prompts_added += 1
+
+                print(f"[SAM2] Track {tid}: {prompts_added} prompts added "
+                      f"from {len(trusted_frames)} trusted frames "
+                      f"(det_mask has {int(det_mask.sum()) if det_mask is not None else 'N/A'} detections)")
 
             # Propagate through video
             print("[SAM2] Propagating masks through video...")

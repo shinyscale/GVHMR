@@ -4,3 +4,6 @@
 [submodule "third-party/ProPainter"]
 	path = third-party/ProPainter
 	url = https://github.com/sczhou/ProPainter
+[submodule "third-party/pytorch_scatter"]
+	path = third-party/pytorch_scatter
+	url = https://github.com/rusty1s/pytorch_scatter.git
