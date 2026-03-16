@@ -1110,6 +1110,8 @@ def split_multi_person_video(
                 _progress(0.84, f"WARNING: Possible identity swaps detected: {swaps}")
 
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         _progress(0.84, f"Identity verification skipped: {e}")
 
     # ── Step 5.7: Generate per-person BVH ──
