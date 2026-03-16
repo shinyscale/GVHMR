@@ -615,7 +615,7 @@ def _reprocess_btn_label(session_id: str) -> str:
     """Dynamic label for the reprocess button showing dirty count."""
     sd = _SESSION_DATA.get(session_id, {})
     n = len(sd.get("dirty_persons", set()))
-    return f"Reprocess All ({n} dirty)"
+    return f"Reprocess All ({n} IDs dirty)"
 
 
 # ── Callback Functions ──
@@ -2146,7 +2146,7 @@ def build_identity_panel(scene_preview_video=None) -> dict[str, Any]:
             "Apply Keyframes", size="sm", scale=0, min_width=140,
         )
         reprocess_btn = gr.Button(
-            "Reprocess All (0 dirty)", variant="primary", size="sm", scale=0, min_width=180,
+            "Reprocess All (0 IDs dirty)", variant="primary", size="sm", scale=0, min_width=180,
         )
     reprocess_status = gr.Textbox(
         label="Reprocess Status", value="", interactive=False, lines=2,
