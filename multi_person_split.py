@@ -360,6 +360,9 @@ def compute_shared_slam(
     if output_path.exists():
         return str(output_path)
 
+    # Free any lingering GPU memory from prior pipeline stages (YOLO, SAM2, etc.)
+    torch.cuda.empty_cache()
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     if static_cam:
@@ -588,6 +591,7 @@ def split_multi_person_video(
             str(tracks_path),
         )
         del tracker
+        torch.cuda.empty_cache()
 
         # Render track visualization
         viz_path = detection_dir / "track_visualization.mp4"
