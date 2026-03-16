@@ -939,6 +939,7 @@ def split_multi_person_video(
             OcclusionBridge,
             crossing_spans_from_overlap,
             crossing_spans_from_signal,
+            summarize_bridging,
         )
         from smplx_to_bvh import extract_gvhmr_params
 
