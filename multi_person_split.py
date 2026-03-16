@@ -1484,6 +1484,8 @@ def reprocess_person(
         result["confidences"] = confidences
 
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         print(f"[reprocess_person] Identity verification failed for person {person_index}: {e}")
 
     if progress_callback:

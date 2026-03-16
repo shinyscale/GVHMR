@@ -44,7 +44,7 @@ _SESSION_DATA: dict[str, Any] = {}
 #        fps, frame_cache, output_dir, person_dirs, all_tracks,
 #        pipeline_params, img_width, img_height
 
-_FRAME_CACHE_SIZE = 50
+_FRAME_CACHE_SIZE = 200
 _PERSON_META_FILENAME = "person_meta.json"
 
 # Person colors for bbox overlay (up to 8 people)
@@ -101,7 +101,7 @@ class _LRUFrameCache:
 
 
 def _extract_frame(video_path: str, frame_idx: int, session_id: str) -> np.ndarray | None:
-    """Extract a single frame from video, using cache."""
+    """Extract a single frame from video, using cache and persistent VideoCapture."""
     sd = _SESSION_DATA.get(session_id)
     if sd is None:
         return None
@@ -115,10 +115,18 @@ def _extract_frame(video_path: str, frame_idx: int, session_id: str) -> np.ndarr
     if cached is not None:
         return cached
 
-    cap = cv2.VideoCapture(video_path)
+    # Reuse persistent VideoCapture (avoids ~10-20ms open/close per frame)
+    cap = sd.get("_cap")
+    cap_path = sd.get("_cap_path")
+    if cap is None or cap_path != video_path or not cap.isOpened():
+        if cap is not None:
+            cap.release()
+        cap = cv2.VideoCapture(video_path)
+        sd["_cap"] = cap
+        sd["_cap_path"] = video_path
+
     cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
     ret, frame = cap.read()
-    cap.release()
 
     if not ret:
         return None
@@ -215,7 +223,7 @@ def _render_frame_with_bboxes(
         conf = confidences.get(pid)
         overall = conf.overall if conf else 0.0
         marker = "\u25b6 " if pid == selected_person else ""
-        label = f"{marker}Person {pid} ({overall:.2f})"
+        label = f"{marker}ID {pid} ({overall:.2f})"
 
         font = cv2.FONT_HERSHEY_SIMPLEX
         font_scale = 0.5
@@ -227,35 +235,63 @@ def _render_frame_with_bboxes(
     return img
 
 
-def _render_confidence_plot(
+_CONFIDENCE_TIMELINE_WIDTH = 1024  # px — matches Gradio default column width
+_CONFIDENCE_TIMELINE_HEIGHT = 40   # px
+
+
+def _render_confidence_timeline(
     overall_array: np.ndarray,
     current_frame: int,
     keyframe_frames: list[int],
     num_frames: int,
-) -> plt.Figure:
-    """Render confidence heatmap timeline as matplotlib figure."""
-    fig, ax = plt.subplots(figsize=(14, 1.0))
-    fig.patch.set_facecolor("#1a1a2e")
-    ax.set_facecolor("#1a1a2e")
+    has_real_data: bool = True,
+    width: int = _CONFIDENCE_TIMELINE_WIDTH,
+    height: int = _CONFIDENCE_TIMELINE_HEIGHT,
+) -> np.ndarray:
+    """Render confidence heatmap timeline as an RGB numpy image.
 
-    if num_frames > 0 and len(overall_array) > 0:
-        colors = plt.cm.RdYlGn(overall_array)
-        ax.bar(range(len(overall_array)), np.ones(len(overall_array)),
-               width=1.0, color=colors, edgecolor="none")
+    Returns np.ndarray (H, W, 3) suitable for gr.Image(type="numpy").
+    Click x-coordinate maps to frame via: frame = x * num_frames / width.
+    """
+    img = np.full((height, width, 3), 26, dtype=np.uint8)  # #1a1a2e background
 
-    # Keyframe diamonds
+    if num_frames <= 0:
+        return img
+
+    bar_h = height - 10  # leave room for keyframe diamonds at top
+
+    if not has_real_data:
+        # Gray bar with "No confidence data" text
+        img[10:, :] = 77  # gray
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        text = "No confidence data"
+        (tw, th), _ = cv2.getTextSize(text, font, 0.45, 1)
+        tx = (width - tw) // 2
+        ty = 10 + (bar_h + th) // 2
+        cv2.putText(img, text, (tx, ty), font, 0.45, (136, 136, 136), 1, cv2.LINE_AA)
+    elif len(overall_array) > 0:
+        # RdYlGn colormap — render each frame as a vertical stripe
+        cmap = plt.cm.RdYlGn
+        colors_rgba = cmap(overall_array)  # (N, 4) float 0-1
+        colors_rgb = (colors_rgba[:, :3] * 255).astype(np.uint8)  # (N, 3)
+        for x in range(width):
+            f = int(x * num_frames / width)
+            f = min(f, len(colors_rgb) - 1)
+            img[10:, x] = colors_rgb[f]
+
+    # Keyframe diamonds (small triangles at top)
     for kf in keyframe_frames:
         if 0 <= kf < num_frames:
-            ax.plot(kf, 1.08, "D", color="#60a5fa", markersize=5, zorder=5)
+            kx = int(kf * width / num_frames)
+            pts = np.array([[kx, 8], [kx - 4, 1], [kx + 4, 1]], dtype=np.int32)
+            cv2.fillPoly(img, [pts], (96, 165, 250))  # #60a5fa
 
-    # Playhead
-    ax.axvline(current_frame, color="white", lw=1.5, zorder=10)
+    # Playhead — white vertical line
+    px = int(current_frame * width / num_frames)
+    px = max(0, min(px, width - 1))
+    cv2.line(img, (px, 0), (px, height - 1), (255, 255, 255), 2)
 
-    ax.set_xlim(0, max(num_frames, 1))
-    ax.set_ylim(0, 1.2)
-    ax.axis("off")
-    fig.tight_layout(pad=0.1)
-    return fig
+    return img
 
 
 def _get_bboxes_at_frame(session_id: str, frame_idx: int) -> dict[int, np.ndarray]:
@@ -368,7 +404,7 @@ def _person_choices(session_id: str) -> list[str]:
     """Get person dropdown choices."""
     sd = _SESSION_DATA.get(session_id, {})
     tracks = sd.get("identity_tracks", [])
-    return [f"Person {t.person_id}" for t in tracks]
+    return [f"ID {t.person_id}" for t in tracks]
 
 
 # ── Public API ──
@@ -392,6 +428,12 @@ def init_panel_state(
     Returns a lightweight gr.State dict.
     """
     import torch
+
+    # Release any existing VideoCapture from previous sessions
+    for old_sd in _SESSION_DATA.values():
+        old_cap = old_sd.pop("_cap", None)
+        if old_cap is not None:
+            old_cap.release()
 
     session_id = str(uuid.uuid4())
 
@@ -623,9 +665,12 @@ def update_frame_display(frame_idx, state):
     # Confidence timeline
     all_confs = sd["confidences"].get(selected_person, [])
     overall_array = confidence_to_array(all_confs) if all_confs else np.zeros(num_frames)
+    # Check if any frame has real detection data (not all stubs)
+    has_real_data = any(c.detection_score > 0 for c in all_confs) if all_confs else False
     track = _get_identity_track(session_id, selected_person)
     kf_frames = [kf.frame_index for kf in track.keyframes] if track else []
-    fig = _render_confidence_plot(overall_array, frame_idx, kf_frames, num_frames)
+    fig = _render_confidence_timeline(overall_array, frame_idx, kf_frames, num_frames,
+                                      has_real_data=has_real_data)
 
     # Keyframe DataFrame
     kf_data = _keyframe_dataframe(session_id, selected_person)
@@ -650,7 +695,7 @@ def on_person_change(person_str, frame_idx, state):
     if not person_str or state is None:
         return state, *update_frame_display(frame_idx, state)
 
-    # Parse "Person N" -> N
+    # Parse "ID N" -> N
     try:
         pid = int(person_str.split()[-1])
     except (ValueError, IndexError):
@@ -898,7 +943,7 @@ def on_frame_click(evt: gr.SelectData, frame_idx, state):
 
         if best_pid is not None:
             state["bbox_edit_state"] = {"pid": best_pid, "corner": best_corner, "frame": frame_idx}
-            status = f"Corner selected for Person {best_pid} \u2014 click new position"
+            status = f"Corner selected for ID {best_pid} \u2014 click new position"
         else:
             status = ""
     else:
@@ -949,7 +994,7 @@ def on_frame_click(evt: gr.SelectData, frame_idx, state):
             _save_bbox_corrections(session_id, pid)
 
             n_edited = len(pid_corrections)
-            status = f"{n_edited} frames edited for Person {pid}"
+            status = f"{n_edited} frames edited for ID {pid}"
         else:
             status = ""
 
@@ -1017,7 +1062,7 @@ def on_interpolate_bboxes(state):
     sd.setdefault("dirty_persons", set()).add(pid)
     _save_bbox_corrections(session_id, pid)
     n_total = len(sd.get("bbox_corrections", {}).get(pid, {}))
-    return (f"Interpolated: {n_total} frames corrected for Person {pid}", state,
+    return (f"Interpolated: {n_total} frames corrected for ID {pid}", state,
             gr.update(value=_reprocess_btn_label(session_id)))
 
 
@@ -1079,7 +1124,7 @@ def on_apply_keyframes(state):
         sd.setdefault("dirty_persons", set()).add(pid)
         _save_bbox_corrections(session_id, pid)
         n = len(all_corrections)
-        status_parts.append(f"Person {pid}: {n} frames from {len(kf_corrections)} keyframes")
+        status_parts.append(f"ID {pid}: {n} frames from {len(kf_corrections)} keyframes")
 
     if not status_parts:
         return "No keyframes with bboxes found", state, gr.update()
@@ -1122,18 +1167,18 @@ def on_reprocess_all_dirty(state, progress=gr.Progress(track_tqdm=False),
     status_lines = []
 
     for idx, pid in enumerate(dirty_list):
-        progress((idx) / total, desc=f"Reprocessing person {pid} ({idx + 1}/{total})...")
+        progress((idx) / total, desc=f"Reprocessing ID {pid} ({idx + 1}/{total})...")
 
         person_dir = pid_to_dir.get(pid)
         p_index = pid_to_index.get(pid)
         if person_dir is None or p_index is None:
-            status_lines.append(f"Person {pid}: skipped (invalid index)")
+            status_lines.append(f"ID {pid}: skipped (invalid index)")
             continue
 
         # Build updated bboxes array
         updated_bboxes = sd["all_bboxes"].get(pid)
         if updated_bboxes is None:
-            status_lines.append(f"Person {pid}: skipped (no bboxes)")
+            status_lines.append(f"ID {pid}: skipped (no bboxes)")
             continue
 
         try:
@@ -1176,11 +1221,11 @@ def on_reprocess_all_dirty(state, progress=gr.Progress(track_tqdm=False),
                     if pid not in pose_sd["correction_tracks"]:
                         pose_sd["correction_tracks"][pid] = CorrectionTrack(person_id=pid)
 
-                status_lines.append(f"Person {pid}: reprocessed OK")
+                status_lines.append(f"ID {pid}: reprocessed OK")
             else:
-                status_lines.append(f"Person {pid}: reprocess failed")
+                status_lines.append(f"ID {pid}: reprocess failed")
         except Exception as e:
-            status_lines.append(f"Person {pid}: error \u2014 {e}")
+            status_lines.append(f"ID {pid}: error \u2014 {e}")
 
     dirty.clear()
 
@@ -1353,7 +1398,7 @@ def _build_gallery_image(
         label_h = 20
         label_bar = np.zeros((label_h, max_w, 3), dtype=np.uint8)
         label_bar[:] = color
-        label = f"Person {pid}"
+        label = f"ID {pid}"
         cv2.putText(label_bar, label, (4, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
                     (255, 255, 255), 1, cv2.LINE_AA)
 
@@ -1541,7 +1586,7 @@ def on_scan_issues(state):
     if not issues:
         return "No issues found.", gr.update(value=[])
 
-    rows = [[i.frame, f"Person {i.person_id}", i.issue_type, i.description]
+    rows = [[i.frame, f"ID {i.person_id}", i.issue_type, i.description]
             for i in issues]
     return f"Found {len(issues)} issues. Use Next/Prev to navigate.", gr.update(value=rows)
 
@@ -1557,7 +1602,7 @@ def on_next_issue(state):
     idx = min(idx + 1, len(issues) - 1) if idx < len(issues) - 1 else 0
     state["review_issue_idx"] = idx
     issue = issues[idx]
-    return issue.frame, f"[{idx+1}/{len(issues)}] Person {issue.person_id}: {issue.description}"
+    return issue.frame, f"[{idx+1}/{len(issues)}] ID {issue.person_id}: {issue.description}"
 
 
 def on_prev_issue(state):
@@ -1571,7 +1616,7 @@ def on_prev_issue(state):
     idx = max(idx - 1, 0) if idx > 0 else len(issues) - 1
     state["review_issue_idx"] = idx
     issue = issues[idx]
-    return issue.frame, f"[{idx+1}/{len(issues)}] Person {issue.person_id}: {issue.description}"
+    return issue.frame, f"[{idx+1}/{len(issues)}] ID {issue.person_id}: {issue.description}"
 
 
 # ── Track Split ──
@@ -1608,7 +1653,7 @@ def on_split_track(frame_idx, state):
             target_idx = i
             break
     if target_track is None:
-        return state, f"Person {selected_person} not found", gr.update(), gr.update()
+        return state, f"ID {selected_person} not found", gr.update(), gr.update()
 
     boxes = target_track["bbx_xyxy"]
     mask = target_track["detection_mask"]
@@ -1655,7 +1700,7 @@ def on_split_track(frame_idx, state):
     inactive = sd.get("inactive_tracks", [])
     merge_choices = [describe_track(t) for t in inactive]
 
-    status = f"Split Person {selected_person} at frame {frame_idx}. New {describe_track(new_track)} available for merge."
+    status = f"Split ID {selected_person} at frame {frame_idx}. New {describe_track(new_track)} available for merge."
     return state, status, gr.update(choices=merge_choices, value=None), gr.update(value=_reprocess_btn_label(session_id))
 
 
@@ -1729,7 +1774,7 @@ def on_merge_track(merge_source_label, frame_idx, state):
     # Rebuild merge dropdown choices
     choices = [describe_track(t) for t in inactive]
 
-    status = f"Merged Track {merge_tid} into Person {selected_person}. Person marked dirty."
+    status = f"Merged Track {merge_tid} into ID {selected_person}. Marked dirty."
     return state, status, gr.update(choices=choices, value=None)
 
 
@@ -1780,7 +1825,7 @@ def on_crossing_end(frame_idx, state):
 
     # Build DataFrame
     rows = _build_crossing_spans_df(sd.get("crossing_spans", {}))
-    status = f"Crossing span added: frames {start}-{end} ({end - start} frames) for Person {selected_person}"
+    status = f"Crossing span added: frames {start}-{end} ({end - start} frames) for ID {selected_person}"
     return status, gr.update(value=rows)
 
 
@@ -1789,8 +1834,111 @@ def _build_crossing_spans_df(crossing_spans: dict) -> list[list]:
     rows = []
     for pid, spans in sorted(crossing_spans.items()):
         for start, end in spans:
-            rows.append([f"Person {pid}", start, end, end - start])
+            rows.append([f"ID {pid}", start, end, end - start])
     return rows
+
+
+def on_remove_crossing_span(state):
+    """Remove the last crossing span for the selected person."""
+    if state is None:
+        return "No session", gr.update()
+    session_id = state.get("session_id", "")
+    sd = _SESSION_DATA.get(session_id)
+    if sd is None:
+        return "No session", gr.update()
+
+    selected_person = state.get("selected_person", 0)
+    spans = sd.get("crossing_spans", {})
+    person_spans = spans.get(selected_person, [])
+    if not person_spans:
+        return f"No crossing spans for ID {selected_person}", gr.update()
+
+    removed = person_spans.pop()
+
+    # Persist to disk
+    pid_to_dir = sd.get("pid_to_dir", {})
+    person_dir = pid_to_dir.get(selected_person)
+    if person_dir:
+        import json
+        spans_path = Path(person_dir) / "crossing_spans.json"
+        spans_path.write_text(json.dumps(person_spans))
+
+    rows = _build_crossing_spans_df(spans)
+    return (f"Removed crossing span {removed[0]}-{removed[1]} for ID {selected_person}",
+            gr.update(value=rows))
+
+
+def on_crossing_df_select(evt: gr.SelectData, state):
+    """Store selected crossing span row index for targeted removal."""
+    if state is None or evt is None:
+        return state
+    row_idx = evt.index[0] if isinstance(evt.index, (list, tuple)) else evt.index
+    state["_crossing_selected_row"] = row_idx
+    return state
+
+
+def on_remove_selected_crossing(state):
+    """Remove the selected crossing span (by DataFrame row click)."""
+    if state is None:
+        return "No session", gr.update()
+    session_id = state.get("session_id", "")
+    sd = _SESSION_DATA.get(session_id)
+    if sd is None:
+        return "No session", gr.update()
+
+    row_idx = state.get("_crossing_selected_row")
+    spans = sd.get("crossing_spans", {})
+
+    if row_idx is None:
+        # No row selected — remove last span for selected person
+        return on_remove_crossing_span(state)
+
+    # Map row index back to (pid, span_index) — rows are sorted by pid then span order
+    flat_idx = 0
+    target_pid = None
+    target_span_idx = None
+    for pid in sorted(spans.keys()):
+        for si, span in enumerate(spans[pid]):
+            if flat_idx == row_idx:
+                target_pid = pid
+                target_span_idx = si
+                break
+            flat_idx += 1
+        if target_pid is not None:
+            break
+
+    if target_pid is None:
+        return "Invalid selection", gr.update()
+
+    removed = spans[target_pid].pop(target_span_idx)
+    state.pop("_crossing_selected_row", None)
+
+    # Persist
+    pid_to_dir = sd.get("pid_to_dir", {})
+    person_dir = pid_to_dir.get(target_pid)
+    if person_dir:
+        import json
+        spans_path = Path(person_dir) / "crossing_spans.json"
+        spans_path.write_text(json.dumps(spans[target_pid]))
+
+    rows = _build_crossing_spans_df(spans)
+    return (f"Removed crossing span {removed[0]}-{removed[1]} for ID {target_pid}",
+            gr.update(value=rows))
+
+
+def on_confidence_click(evt: gr.SelectData, state):
+    """Click on confidence timeline image to seek to that frame."""
+    if state is None or evt is None:
+        return 0
+    session_id = state.get("session_id", "")
+    sd = _SESSION_DATA.get(session_id)
+    if sd is None:
+        return 0
+    num_frames = sd.get("num_frames", 1)
+    # evt.index gives (x, y) pixel coordinates
+    click_x = evt.index[0] if isinstance(evt.index, (list, tuple)) else evt.index
+    frame = int(click_x * num_frames / _CONFIDENCE_TIMELINE_WIDTH)
+    return max(0, min(frame, num_frames - 1))
 
 
 # ── Build Panel ──
@@ -1813,9 +1961,6 @@ def build_identity_panel(scene_preview_video=None) -> dict[str, Any]:
             interactive=True,
             scale=1,
         )
-        verify_btn = gr.Button("Verify", size="sm", scale=0, min_width=80)
-        add_kf_btn = gr.Button("Add Keyframe", size="sm", scale=0, min_width=110)
-        remove_kf_btn = gr.Button("Remove Keyframe", size="sm", scale=0, min_width=130)
         swap_btn = gr.Button("Swap IDs", size="sm", scale=0, min_width=90)
         swap_target = gr.Dropdown(
             label="Swap with",
@@ -1860,6 +2005,7 @@ def build_identity_panel(scene_preview_video=None) -> dict[str, Any]:
         with gr.Row():
             crossing_start_btn = gr.Button("Mark Crossing Start", size="sm", scale=0, min_width=150)
             crossing_end_btn = gr.Button("Mark Crossing End", size="sm", scale=0, min_width=150)
+            remove_crossing_btn = gr.Button("Remove Selected", size="sm", scale=0, min_width=130)
             crossing_status = gr.Textbox(
                 label="", value="", interactive=False, scale=2,
             )
@@ -1918,8 +2064,6 @@ def build_identity_panel(scene_preview_video=None) -> dict[str, Any]:
         fwd1_btn = gr.Button(">", size="sm", scale=0, min_width=40)
         fwd10_btn = gr.Button(">>", size="sm", scale=0, min_width=40)
         last_btn = gr.Button(">|", size="sm", scale=0, min_width=40)
-        prev_kf_btn = gr.Button("◇<", size="sm", scale=0, min_width=50)
-        next_kf_btn = gr.Button("◇>", size="sm", scale=0, min_width=50)
 
     frame_slider = gr.Slider(
         minimum=0,
@@ -1930,7 +2074,20 @@ def build_identity_panel(scene_preview_video=None) -> dict[str, Any]:
         interactive=True,
     )
 
-    confidence_plot = gr.Plot(label="Confidence Timeline")
+    confidence_plot = gr.Image(
+        label="Confidence Timeline (click to seek)",
+        interactive=False,
+        type="numpy",
+        height=_CONFIDENCE_TIMELINE_HEIGHT + 16,
+    )
+
+    # Keyframe buttons — placed right below the timelines where keyframes appear
+    with gr.Row():
+        verify_btn = gr.Button("Verify", size="sm", scale=0, min_width=80)
+        add_kf_btn = gr.Button("Add Keyframe", size="sm", scale=0, min_width=110)
+        remove_kf_btn = gr.Button("Remove Keyframe", size="sm", scale=0, min_width=130)
+        prev_kf_btn2 = gr.Button("< Prev KF", size="sm", scale=0, min_width=90)
+        next_kf_btn2 = gr.Button("Next KF >", size="sm", scale=0, min_width=90)
 
     # Keyframes + confidence breakdown side by side
     with gr.Row():
@@ -2018,18 +2175,6 @@ def build_identity_panel(scene_preview_video=None) -> dict[str, Any]:
     back1_btn.click(fn=_nav_back1, inputs=[frame_slider], outputs=[frame_slider])
     fwd1_btn.click(fn=_nav_fwd1, inputs=[frame_slider, panel_state], outputs=[frame_slider])
 
-    # Keyframe navigation
-    prev_kf_btn.click(
-        fn=on_prev_keyframe,
-        inputs=[frame_slider, panel_state],
-        outputs=[frame_slider],
-    )
-    next_kf_btn.click(
-        fn=on_next_keyframe,
-        inputs=[frame_slider, panel_state],
-        outputs=[frame_slider],
-    )
-
     # Identity operations
     verify_btn.click(
         fn=on_verify,
@@ -2093,6 +2238,35 @@ def build_identity_panel(scene_preview_video=None) -> dict[str, Any]:
         inputs=[frame_slider, panel_state],
         outputs=[crossing_status, crossing_spans_df],
     )
+    crossing_spans_df.select(
+        fn=on_crossing_df_select,
+        inputs=[panel_state],
+        outputs=[panel_state],
+    )
+    remove_crossing_btn.click(
+        fn=on_remove_selected_crossing,
+        inputs=[panel_state],
+        outputs=[crossing_status, crossing_spans_df],
+    )
+
+    # Confidence timeline click → seek to frame
+    confidence_plot.select(
+        fn=on_confidence_click,
+        inputs=[panel_state],
+        outputs=[frame_slider],
+    )
+
+    # Keyframe buttons (below timeline)
+    prev_kf_btn2.click(
+        fn=on_prev_keyframe,
+        inputs=[frame_slider, panel_state],
+        outputs=[frame_slider],
+    )
+    next_kf_btn2.click(
+        fn=on_next_keyframe,
+        inputs=[frame_slider, panel_state],
+        outputs=[frame_slider],
+    )
 
     # Review scanner
     scan_btn.click(
@@ -2135,12 +2309,20 @@ def build_identity_panel(scene_preview_video=None) -> dict[str, Any]:
         fn=on_interpolate_bboxes,
         inputs=[panel_state],
         outputs=[bbox_edit_status, panel_state, reprocess_btn],
+    ).then(
+        fn=update_frame_display,
+        inputs=[frame_slider, panel_state],
+        outputs=display_outputs,
     )
 
     apply_kf_btn.click(
         fn=on_apply_keyframes,
         inputs=[panel_state],
         outputs=[bbox_edit_status, panel_state, reprocess_btn],
+    ).then(
+        fn=update_frame_display,
+        inputs=[frame_slider, panel_state],
+        outputs=display_outputs,
     )
 
     _reprocess_outputs = [panel_state, reprocess_status, reprocess_btn]
