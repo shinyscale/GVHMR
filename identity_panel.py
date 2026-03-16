@@ -14,10 +14,12 @@ from __future__ import annotations
 
 import uuid
 from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import cv2
+import torch
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
@@ -1252,6 +1254,411 @@ def _nav_fwd1(frame_idx, state):
     return min(sd.get("num_frames", 1) - 1, int(frame_idx) + 1)
 
 
+# ── ReID Gallery ──
+
+
+def _extract_person_thumbnails(
+    session_id: str,
+    person_id: int,
+    max_thumbs: int = 4,
+    thumb_size: int = 128,
+) -> list[np.ndarray]:
+    """Extract thumbnail crops of a person from their highest-confidence frames."""
+    sd = _SESSION_DATA.get(session_id)
+    if sd is None:
+        return []
+
+    confs = sd.get("confidences", {}).get(person_id, [])
+    bboxes = sd.get("all_bboxes", {}).get(person_id)
+    if not confs or bboxes is None:
+        return []
+
+    # Find top-confidence frames
+    scored = [(f, c.overall if hasattr(c, "overall") else 0.0) for f, c in enumerate(confs)]
+    scored.sort(key=lambda x: -x[1])
+
+    # Pick well-spaced frames from top candidates
+    num_frames = sd.get("num_frames", len(confs))
+    min_spacing = max(10, num_frames // (max_thumbs * 3))
+    selected = []
+    for frame_idx, score in scored:
+        if score < 0.3:
+            break
+        if all(abs(frame_idx - s) >= min_spacing for s in selected):
+            selected.append(frame_idx)
+        if len(selected) >= max_thumbs:
+            break
+
+    if not selected:
+        return []
+    selected.sort()
+
+    thumbnails = []
+    for f in selected:
+        frame = _extract_frame(sd["video_path"], f, session_id)
+        if frame is None:
+            continue
+        bbox = bboxes[f] if f < len(bboxes) else None
+        if bbox is None:
+            continue
+        x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
+        h, w = frame.shape[:2]
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
+        if x2 - x1 < 10 or y2 - y1 < 10:
+            continue
+        crop = frame[y1:y2, x1:x2]
+        # Resize to uniform height, preserving aspect ratio
+        crop_h, crop_w = crop.shape[:2]
+        scale = thumb_size / crop_h
+        new_w = max(1, int(crop_w * scale))
+        thumb = cv2.resize(crop, (new_w, thumb_size), interpolation=cv2.INTER_AREA)
+        thumbnails.append(thumb)
+
+    return thumbnails
+
+
+def _build_gallery_image(
+    session_id: str,
+    selected_person: int,
+    thumb_size: int = 128,
+) -> np.ndarray | None:
+    """Build a horizontal gallery strip showing thumbnails for each active person.
+
+    Selected person shown first with a colored border.
+    """
+    sd = _SESSION_DATA.get(session_id)
+    if sd is None:
+        return None
+
+    all_tracks = sd.get("all_tracks", [])
+    if not all_tracks:
+        return None
+
+    strips = []
+    person_order = [selected_person] + [
+        t["track_id"] for t in all_tracks if t["track_id"] != selected_person
+    ]
+
+    for pid in person_order:
+        thumbs = _extract_person_thumbnails(session_id, pid, max_thumbs=3, thumb_size=thumb_size)
+        if not thumbs:
+            continue
+
+        color = _PERSON_COLORS[pid % len(_PERSON_COLORS)]
+        border = 3 if pid == selected_person else 1
+
+        # Add label bar on top
+        max_w = max(t.shape[1] for t in thumbs)
+        label_h = 20
+        label_bar = np.zeros((label_h, max_w, 3), dtype=np.uint8)
+        label_bar[:] = color
+        label = f"Person {pid}"
+        cv2.putText(label_bar, label, (4, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                    (255, 255, 255), 1, cv2.LINE_AA)
+
+        # Stack thumbs horizontally
+        row_h = thumb_size
+        row = np.zeros((row_h, 0, 3), dtype=np.uint8)
+        for thumb in thumbs:
+            # Pad to same height if needed
+            if thumb.shape[0] != row_h:
+                pad = np.zeros((row_h, thumb.shape[1], 3), dtype=np.uint8)
+                pad[:thumb.shape[0]] = thumb
+                thumb = pad
+            row = np.concatenate([row, thumb], axis=1)
+
+        # Pad label bar to match row width
+        if label_bar.shape[1] < row.shape[1]:
+            pad = np.zeros((label_h, row.shape[1] - label_bar.shape[1], 3), dtype=np.uint8)
+            pad[:] = color
+            label_bar = np.concatenate([label_bar, pad], axis=1)
+        elif label_bar.shape[1] > row.shape[1]:
+            label_bar = label_bar[:, :row.shape[1]]
+
+        person_strip = np.concatenate([label_bar, row], axis=0)
+
+        # Add border for selected person
+        if pid == selected_person:
+            cv2.rectangle(person_strip, (0, 0),
+                         (person_strip.shape[1] - 1, person_strip.shape[0] - 1),
+                         color, border)
+
+        strips.append(person_strip)
+
+    if not strips:
+        return None
+
+    # Stack strips vertically, padding to same width
+    max_w = max(s.shape[1] for s in strips)
+    padded = []
+    for s in strips:
+        if s.shape[1] < max_w:
+            pad = np.zeros((s.shape[0], max_w - s.shape[1], 3), dtype=np.uint8)
+            s = np.concatenate([s, pad], axis=1)
+        padded.append(s)
+
+    # Add 2px gap between strips
+    gap = np.zeros((2, max_w, 3), dtype=np.uint8)
+    result_parts = []
+    for i, s in enumerate(padded):
+        if i > 0:
+            result_parts.append(gap)
+        result_parts.append(s)
+
+    return np.concatenate(result_parts, axis=0)
+
+
+# ── Review Scanner ──
+
+
+@dataclass
+class ReviewIssue:
+    """A flagged issue found by the review scanner."""
+    frame: int
+    person_id: int
+    issue_type: str  # "low_confidence", "potential_swap", "shape_drift", "track_gap"
+    description: str
+    severity: float  # 0-1
+
+
+def compute_review_issues(
+    confidences: dict[int, list],
+    all_tracks: list[dict],
+    num_frames: int,
+    low_conf_threshold: float = 0.4,
+    gap_threshold: int = 30,
+) -> list[ReviewIssue]:
+    """Scan all persons for issues that need human review.
+
+    Returns issues sorted by frame number.
+    """
+    from dataclasses import dataclass as _dc  # already imported at module level
+    issues = []
+
+    for pid, confs in confidences.items():
+        if not confs:
+            continue
+
+        # Low-confidence spans
+        span_start = None
+        for f in range(len(confs)):
+            overall = confs[f].overall if hasattr(confs[f], "overall") else 0.0
+            if overall < low_conf_threshold:
+                if span_start is None:
+                    span_start = f
+            else:
+                if span_start is not None and f - span_start >= 5:
+                    mid = (span_start + f) // 2
+                    issues.append(ReviewIssue(
+                        frame=mid, person_id=pid,
+                        issue_type="low_confidence",
+                        description=f"Low confidence span frames {span_start}-{f-1} ({f - span_start} frames)",
+                        severity=0.7,
+                    ))
+                span_start = None
+        if span_start is not None and len(confs) - span_start >= 5:
+            mid = (span_start + len(confs)) // 2
+            issues.append(ReviewIssue(
+                frame=mid, person_id=pid,
+                issue_type="low_confidence",
+                description=f"Low confidence span frames {span_start}-{len(confs)-1}",
+                severity=0.7,
+            ))
+
+        # High overlap (potential swap)
+        for f in range(len(confs)):
+            overlap = confs[f].bbox_overlap if hasattr(confs[f], "bbox_overlap") else 0.0
+            if overlap > 0.5:
+                # Only flag first frame of each overlap burst
+                if f == 0 or (confs[f-1].bbox_overlap if hasattr(confs[f-1], "bbox_overlap") else 0.0) <= 0.5:
+                    issues.append(ReviewIssue(
+                        frame=f, person_id=pid,
+                        issue_type="potential_swap",
+                        description=f"High bbox overlap ({overlap:.2f}) — possible identity swap",
+                        severity=0.9,
+                    ))
+
+        # Shape drift
+        for f in range(len(confs)):
+            shape = confs[f].shape_consistency if hasattr(confs[f], "shape_consistency") else 0.0
+            if shape > 0.6:
+                if f == 0 or (confs[f-1].shape_consistency if hasattr(confs[f-1], "shape_consistency") else 0.0) <= 0.6:
+                    issues.append(ReviewIssue(
+                        frame=f, person_id=pid,
+                        issue_type="shape_drift",
+                        description=f"Shape inconsistency ({shape:.2f}) — body shape changed significantly",
+                        severity=0.6,
+                    ))
+
+    # Track gaps (detection mask gaps)
+    for track in all_tracks:
+        pid = track.get("track_id")
+        mask = track.get("detection_mask")
+        if mask is None:
+            continue
+        if isinstance(mask, torch.Tensor):
+            mask = mask.numpy()
+        mask = np.asarray(mask, dtype=bool)
+        gap_start = None
+        for f in range(len(mask)):
+            if not mask[f]:
+                if gap_start is None:
+                    gap_start = f
+            else:
+                if gap_start is not None and f - gap_start >= gap_threshold:
+                    mid = (gap_start + f) // 2
+                    issues.append(ReviewIssue(
+                        frame=mid, person_id=pid,
+                        issue_type="track_gap",
+                        description=f"Detection gap frames {gap_start}-{f-1} ({f - gap_start} frames)",
+                        severity=0.5,
+                    ))
+                gap_start = None
+
+    issues.sort(key=lambda i: i.frame)
+    return issues
+
+
+def on_scan_issues(state):
+    """Run the review scanner and return results."""
+    if state is None:
+        return "No session", gr.update()
+
+    session_id = state.get("session_id", "")
+    sd = _SESSION_DATA.get(session_id)
+    if sd is None:
+        return "No session", gr.update()
+
+    issues = compute_review_issues(
+        sd.get("confidences", {}),
+        sd.get("all_tracks", []),
+        sd.get("num_frames", 0),
+    )
+    state["review_issues"] = issues
+    state["review_issue_idx"] = 0
+
+    if not issues:
+        return "No issues found.", gr.update(value=[])
+
+    rows = [[i.frame, f"Person {i.person_id}", i.issue_type, i.description]
+            for i in issues]
+    return f"Found {len(issues)} issues. Use Next/Prev to navigate.", gr.update(value=rows)
+
+
+def on_next_issue(state):
+    """Navigate to the next review issue."""
+    if state is None:
+        return 0, ""
+    issues = state.get("review_issues", [])
+    if not issues:
+        return state.get("current_frame", 0), "No issues"
+    idx = state.get("review_issue_idx", 0)
+    idx = min(idx + 1, len(issues) - 1) if idx < len(issues) - 1 else 0
+    state["review_issue_idx"] = idx
+    issue = issues[idx]
+    return issue.frame, f"[{idx+1}/{len(issues)}] Person {issue.person_id}: {issue.description}"
+
+
+def on_prev_issue(state):
+    """Navigate to the previous review issue."""
+    if state is None:
+        return 0, ""
+    issues = state.get("review_issues", [])
+    if not issues:
+        return state.get("current_frame", 0), "No issues"
+    idx = state.get("review_issue_idx", 0)
+    idx = max(idx - 1, 0) if idx > 0 else len(issues) - 1
+    state["review_issue_idx"] = idx
+    issue = issues[idx]
+    return issue.frame, f"[{idx+1}/{len(issues)}] Person {issue.person_id}: {issue.description}"
+
+
+# ── Track Split ──
+
+
+def on_split_track(frame_idx, state):
+    """Split the selected person's track at the current frame.
+
+    Everything from frame_idx onward becomes a new inactive track.
+    The active track keeps frames before frame_idx.
+    """
+    if state is None:
+        return state, "No session", gr.update(), gr.update()
+
+    session_id = state.get("session_id", "")
+    sd = _SESSION_DATA.get(session_id)
+    if sd is None:
+        return state, "No session", gr.update(), gr.update()
+
+    selected_person = state.get("selected_person", 0)
+    frame_idx = int(frame_idx)
+    num_frames = sd.get("num_frames", 0)
+
+    if frame_idx <= 0 or frame_idx >= num_frames - 1:
+        return state, f"Cannot split at frame {frame_idx} (must be between 1 and {num_frames - 2})", gr.update(), gr.update()
+
+    # Find active track
+    active_tracks = sd.get("all_tracks", [])
+    target_track = None
+    target_idx = None
+    for i, t in enumerate(active_tracks):
+        if t.get("track_id") == selected_person:
+            target_track = t
+            target_idx = i
+            break
+    if target_track is None:
+        return state, f"Person {selected_person} not found", gr.update(), gr.update()
+
+    boxes = target_track["bbx_xyxy"]
+    mask = target_track["detection_mask"]
+    conf = target_track.get("detection_conf", torch.zeros(num_frames))
+    if isinstance(boxes, torch.Tensor):
+        boxes = boxes.clone()
+    if isinstance(mask, torch.Tensor):
+        mask = mask.clone()
+    if isinstance(conf, torch.Tensor):
+        conf = conf.clone()
+
+    # New track gets frames from frame_idx onward
+    new_tid = max(t["track_id"] for t in active_tracks + sd.get("inactive_tracks", [])) + 1
+    new_boxes = torch.zeros_like(boxes)
+    new_mask = torch.zeros_like(mask)
+    new_conf = torch.zeros_like(conf)
+    new_boxes[frame_idx:] = boxes[frame_idx:]
+    new_mask[frame_idx:] = mask[frame_idx:]
+    new_conf[frame_idx:] = conf[frame_idx:]
+
+    # Truncate original track
+    boxes[frame_idx:] = boxes[frame_idx - 1].unsqueeze(0).expand(num_frames - frame_idx, -1)
+    mask[frame_idx:] = False
+    conf[frame_idx:] = 0.0
+
+    target_track["bbx_xyxy"] = boxes
+    target_track["detection_mask"] = mask
+    target_track["detection_conf"] = conf
+
+    new_track = {
+        "track_id": new_tid,
+        "bbx_xyxy": new_boxes,
+        "detection_mask": new_mask,
+        "detection_conf": new_conf,
+    }
+    sd.setdefault("inactive_tracks", []).append(new_track)
+
+    # Update bboxes in session
+    sd["all_bboxes"][selected_person] = boxes.numpy().astype(np.float32)
+    sd["original_bboxes"][selected_person] = boxes.numpy().astype(np.float32).copy()
+    sd["dirty_persons"].add(selected_person)
+
+    from person_tracker import describe_track
+    inactive = sd.get("inactive_tracks", [])
+    merge_choices = [describe_track(t) for t in inactive]
+
+    status = f"Split Person {selected_person} at frame {frame_idx}. New {describe_track(new_track)} available for merge."
+    return state, status, gr.update(choices=merge_choices, value=None), gr.update(value=_reprocess_btn_label(session_id))
+
+
 # ── Track Merge Callbacks ──
 
 
@@ -1418,6 +1825,13 @@ def build_identity_panel(scene_preview_video=None) -> dict[str, Any]:
             visible=True,
         )
 
+    # ── ReID Gallery ──
+    reid_gallery = gr.Image(
+        label="Person Identity Gallery (high-confidence crops)",
+        interactive=False,
+        type="numpy",
+    )
+
     # ── Track Merge & Crossing Span Controls ──
     with gr.Accordion("Track Merge & Crossings", open=False):
         with gr.Row():
@@ -1425,7 +1839,12 @@ def build_identity_panel(scene_preview_video=None) -> dict[str, Any]:
                 label="Show All Tracks", value=False,
                 info="Overlay inactive/discarded track fragments on frame preview",
             )
-        gr.Markdown("**Merge Fragment into Active Person**")
+        gr.Markdown("**Split / Merge Tracks**")
+        with gr.Row():
+            split_btn = gr.Button("Split Track at Frame", size="sm", scale=0, min_width=160)
+            split_status = gr.Textbox(
+                label="", value="", interactive=False, scale=3,
+            )
         with gr.Row():
             merge_source = gr.Dropdown(
                 label="Inactive Track",
@@ -1449,6 +1868,20 @@ def build_identity_panel(scene_preview_video=None) -> dict[str, Any]:
             datatype=["str", "number", "number", "number"],
             interactive=False,
             row_count=(3, "dynamic"),
+        )
+        gr.Markdown("**Review Scanner** (find problem frames automatically)")
+        with gr.Row():
+            scan_btn = gr.Button("Scan for Issues", size="sm", scale=0, min_width=140)
+            prev_issue_btn = gr.Button("< Prev Issue", size="sm", scale=0, min_width=110)
+            next_issue_btn = gr.Button("Next Issue >", size="sm", scale=0, min_width=110)
+            review_summary = gr.Textbox(
+                label="", value="", interactive=False, scale=3,
+            )
+        review_issues_df = gr.DataFrame(
+            headers=["Frame", "Person", "Type", "Description"],
+            datatype=["number", "str", "str", "str"],
+            interactive=False,
+            row_count=(5, "dynamic"),
         )
 
     # CSS to prevent native browser image drag (otherwise misclicks
@@ -1560,10 +1993,21 @@ def build_identity_panel(scene_preview_video=None) -> dict[str, Any]:
     )
 
     # Person dropdown → update display
+    def _refresh_gallery(state):
+        if state is None:
+            return None
+        sid = state.get("session_id", "")
+        pid = state.get("selected_person", 0)
+        return _build_gallery_image(sid, pid)
+
     person_dropdown.change(
         fn=on_person_change,
         inputs=[person_dropdown, frame_slider, panel_state],
         outputs=[panel_state] + display_outputs,
+    ).then(
+        fn=_refresh_gallery,
+        inputs=[panel_state],
+        outputs=[reid_gallery],
     )
 
     # Transport buttons → update slider (which triggers display update)
@@ -1619,6 +2063,16 @@ def build_identity_panel(scene_preview_video=None) -> dict[str, Any]:
         outputs=display_outputs,
     )
 
+    split_btn.click(
+        fn=on_split_track,
+        inputs=[frame_slider, panel_state],
+        outputs=[panel_state, split_status, merge_source, reprocess_btn],
+    ).then(
+        fn=update_frame_display,
+        inputs=[frame_slider, panel_state],
+        outputs=display_outputs,
+    )
+
     merge_btn.click(
         fn=on_merge_track,
         inputs=[merge_source, frame_slider, panel_state],
@@ -1638,6 +2092,23 @@ def build_identity_panel(scene_preview_video=None) -> dict[str, Any]:
         fn=on_crossing_end,
         inputs=[frame_slider, panel_state],
         outputs=[crossing_status, crossing_spans_df],
+    )
+
+    # Review scanner
+    scan_btn.click(
+        fn=on_scan_issues,
+        inputs=[panel_state],
+        outputs=[review_summary, review_issues_df],
+    )
+    next_issue_btn.click(
+        fn=on_next_issue,
+        inputs=[panel_state],
+        outputs=[frame_slider, review_summary],
+    )
+    prev_issue_btn.click(
+        fn=on_prev_issue,
+        inputs=[panel_state],
+        outputs=[frame_slider, review_summary],
     )
 
     # Keyframe DataFrame click → navigate
@@ -1706,6 +2177,9 @@ def build_identity_panel(scene_preview_video=None) -> dict[str, Any]:
         "pose_panel": pose_panel,
         "merge_target": merge_source,
         "crossing_spans_df": crossing_spans_df,
+        "review_summary": review_summary,
+        "review_issues_df": review_issues_df,
+        "reid_gallery": reid_gallery,
     }
 
 
@@ -1719,7 +2193,7 @@ def populate_panel(
      + 9 display_outputs, merge_target, crossing_spans_df)
     """
     if state_dict is None:
-        return (None,) * 16
+        return (None,) * 17
 
     session_id = state_dict.get("session_id", "")
     sd = _SESSION_DATA.get(session_id, {})
@@ -1757,4 +2231,5 @@ def populate_panel(
         *display,                                       # 9 display outputs
         gr.update(choices=merge_choices, value=None),   # merge_target
         gr.update(value=spans_rows),                    # crossing_spans_df
+        _build_gallery_image(session_id, selected_person=sd.get("all_tracks", [{}])[0].get("track_id", 0) if sd.get("all_tracks") else 0),  # reid_gallery
     )

@@ -977,6 +977,17 @@ def split_multi_person_video(
                     crossing_spans = crossing_spans_from_signal(mask_overlap, threshold=0.10)
                 else:
                     crossing_spans = crossing_spans_from_overlap(confidences)
+
+                # Merge manual crossing spans from user annotation
+                manual_spans_path = person_dir / "crossing_spans.json"
+                if manual_spans_path.exists():
+                    try:
+                        manual = json.loads(manual_spans_path.read_text())
+                        manual_tuples = [tuple(s) for s in manual]
+                        crossing_spans = _merge_crossing_spans(crossing_spans + manual_tuples)
+                    except Exception:
+                        pass
+
                 if crossing_spans:
                     total_crossing = sum(e - s + 1 for s, e in crossing_spans)
                     _progress(0.82 + i / max(len(person_dirs), 1) * 0.03,
@@ -1371,6 +1382,19 @@ def reprocess_person(
                 crossing_spans = crossing_spans_from_signal(mask_overlap, threshold=0.10)
             else:
                 crossing_spans = crossing_spans_from_overlap(confidences)
+
+            # Merge manual crossing spans from user annotation
+            manual_spans_path = person_dir / "crossing_spans.json"
+            if manual_spans_path.exists():
+                try:
+                    manual = json.loads(manual_spans_path.read_text())
+                    manual_tuples = [tuple(s) for s in manual]
+                    crossing_spans = _merge_crossing_spans(crossing_spans + manual_tuples)
+                    print(f"[reprocess_person] Merged {len(manual_tuples)} manual crossing spans "
+                          f"for person {person_index} → {len(crossing_spans)} total spans")
+                except Exception as e:
+                    print(f"[reprocess_person] Failed to load manual crossing spans: {e}")
+
             if crossing_spans:
                 bridge_result = bridge.bridge_with_spans(
                     body_pose, global_orient, transl, crossing_spans)
@@ -1511,6 +1535,21 @@ def _compute_overlap_map(masks, all_tracks):
                 break
 
     return overlap
+
+
+def _merge_crossing_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Merge overlapping or adjacent crossing spans into non-overlapping sorted list."""
+    if not spans:
+        return []
+    sorted_spans = sorted(spans, key=lambda s: s[0])
+    merged = [sorted_spans[0]]
+    for start, end in sorted_spans[1:]:
+        prev_start, prev_end = merged[-1]
+        if start <= prev_end + 1:  # overlapping or adjacent
+            merged[-1] = (prev_start, max(prev_end, end))
+        else:
+            merged.append((start, end))
+    return merged
 
 
 def _compute_track_mask_overlap(target_person_id, all_masks, num_frames):

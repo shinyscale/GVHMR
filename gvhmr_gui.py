@@ -1402,6 +1402,7 @@ with gr.Blocks(
                     # Track merge & crossing outputs:
                     id_panel["merge_target"],
                     id_panel["crossing_spans_df"],
+                    id_panel["reid_gallery"],
                 ],
             )
 
