@@ -2090,9 +2090,6 @@ def build_identity_panel(scene_preview_video=None) -> dict[str, Any]:
         interactive=False,
         type="numpy",
         elem_id="confidence_timeline",
-        show_download_button=False,
-        show_fullscreen_button=False,
-        show_share_button=False,
     )
 
     # CSS: make confidence timeline fill width, hide chrome
@@ -2100,7 +2097,11 @@ def build_identity_panel(scene_preview_video=None) -> dict[str, Any]:
         "<style>"
         "#confidence_timeline { padding: 0; }"
         "#confidence_timeline img { width: 100% !important; height: auto !important; }"
-        "#confidence_timeline .icon-buttons { display: none !important; }"
+        "#confidence_timeline .icon-buttons, "
+        "#confidence_timeline .download-btn, "
+        "#confidence_timeline button.share, "
+        "#confidence_timeline .fullscreen-btn "
+        "{ display: none !important; }"
         "</style>"
     )
 
