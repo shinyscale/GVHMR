@@ -2174,36 +2174,33 @@ def build_identity_panel(scene_preview_video=None) -> dict[str, Any]:
         show_progress="hidden",
     )
 
-    # Play/Pause button — JS-based timer that increments the slider
-    play_btn.click(
-        fn=None,
-        js="""
-        () => {
-            const btn = document.querySelector('#play_pause_btn button') ||
-                        document.querySelector('#play_pause_btn');
-            const slider = document.querySelector('#frame_slider input[type=range]');
-            if (!slider) return;
-            if (window._playInterval) {
-                clearInterval(window._playInterval);
-                window._playInterval = null;
-                if (btn) btn.textContent = 'Play';
-            } else {
-                if (btn) btn.textContent = 'Pause';
-                window._playInterval = setInterval(() => {
-                    let val = parseInt(slider.value) + 1;
-                    if (val > parseInt(slider.max)) {
-                        clearInterval(window._playInterval);
-                        window._playInterval = null;
-                        if (btn) btn.textContent = 'Play';
-                        return;
-                    }
-                    slider.value = val;
-                    slider.dispatchEvent(new Event('input', {bubbles: true}));
-                }, 100);  // ~10fps
-            }
+    # Play/Pause — JS in HTML, button click just toggles via DOM event
+    gr.HTML("""<script>
+    document.addEventListener('click', function(e) {
+        const btn = e.target.closest('#play_pause_btn');
+        if (!btn) return;
+        const slider = document.querySelector('#frame_slider input[type=range]');
+        if (!slider) return;
+        if (window._playInterval) {
+            clearInterval(window._playInterval);
+            window._playInterval = null;
+            btn.querySelector('button').textContent = 'Play';
+        } else {
+            btn.querySelector('button').textContent = 'Pause';
+            window._playInterval = setInterval(() => {
+                let val = parseInt(slider.value) + 1;
+                if (val > parseInt(slider.max)) {
+                    clearInterval(window._playInterval);
+                    window._playInterval = null;
+                    btn.querySelector('button').textContent = 'Play';
+                    return;
+                }
+                slider.value = val;
+                slider.dispatchEvent(new Event('input', {bubbles: true}));
+            }, 100);
         }
-        """,
-    )
+    });
+    </script>""")
 
     # Person dropdown → update display
     def _refresh_gallery(state):
