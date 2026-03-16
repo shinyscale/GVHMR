@@ -18,6 +18,14 @@ from hmr4d.utils.video_io_utils import get_video_lwh
 from hmr4d.utils.geo.hmr_cam import estimate_K, get_bbx_xys_from_xyxy
 
 
+def _log_vram(label: str):
+    """Print GPU memory usage at a pipeline checkpoint."""
+    if torch.cuda.is_available():
+        alloc = torch.cuda.memory_allocated() / 1e9
+        reserved = torch.cuda.memory_reserved() / 1e9
+        print(f"[VRAM] {label}: {alloc:.2f} GB allocated, {reserved:.2f} GB reserved")
+
+
 GVHMR_DIR = Path(__file__).resolve().parent
 DEMO_SCRIPT = GVHMR_DIR / "tools" / "demo" / "demo.py"
 PERSON_META_FILENAME = "person_meta.json"
@@ -400,7 +408,12 @@ def compute_shared_slam(
         length, width, height = get_video_lwh(video_path)
         K_fullimg = estimate_K(width, height)
         intrinsics = convert_K_to_K4(K_fullimg)
-        slam = SLAMModel(str(video_path), width, height, intrinsics, buffer=4000, resize=0.5)
+        # Scale buffer to video length — DPVO pre-allocates patches_ tensor
+        # proportional to buffer size (~0.87 MB per slot). 4000 = 3.5 GB.
+        dpvo_buffer = min(max(length + 100, 512), 4000)
+        _log_vram("before DPVO init")
+        slam = SLAMModel(str(video_path), width, height, intrinsics, buffer=dpvo_buffer, resize=0.5)
+        _log_vram(f"after DPVO init (buffer={dpvo_buffer}, {width}x{height} @ 0.5x)")
         bar = tqdm(total=length, desc="DPVO (shared)")
         while True:
             ret = slam.track()
@@ -409,6 +422,8 @@ def compute_shared_slam(
             else:
                 break
         slam_results = slam.process()
+        del slam
+        torch.cuda.empty_cache()
         torch.save(slam_results, str(output_path))
 
     return str(output_path)
@@ -542,6 +557,7 @@ def split_multi_person_video(
 
     result = MultiPersonResult(output_dir=str(output_dir))
     log_lines = []
+    _log_vram("pipeline start")
 
     def _progress(frac, msg):
         if progress_callback:
@@ -549,6 +565,7 @@ def split_multi_person_video(
         log_lines.append(f"[{frac:.0%}] {msg}")
 
     # ── Step 1: Detection & Tracking ──
+    _log_vram("before tracking")
     _progress(0.05, "Detecting and tracking all people...")
 
     detection_dir = output_dir / "detection"
@@ -626,6 +643,7 @@ def split_multi_person_video(
         # Fall through to single-person processing below
 
     # ── Step 2: Shared SLAM ──
+    _log_vram("before SLAM")
     _progress(0.12, "Computing shared camera motion (SLAM)...")
 
     slam_path = output_dir / "shared_slam.pt"
@@ -633,6 +651,8 @@ def split_multi_person_video(
     result.slam_path = str(slam_path)
 
     _progress(0.20, "SLAM complete")
+
+    _log_vram("after SLAM")
 
     # ── Step 3: Segmentation (only if >1 person AND inpainting enabled) ──
     masks = {}
@@ -689,12 +709,15 @@ def split_multi_person_video(
 
         result.masks = masks
 
+    _log_vram("after segmentation")
+
     # ── Step 4: Per-person isolation ──
     _progress(0.37, "Isolating per-person videos...")
 
     person_dirs = []
     person_video_paths = []
     person_meta_by_tid = {}
+    _shared_inpainter = None  # Shared across persons, freed after loop
 
     for i, track in enumerate(all_tracks):
         tid = track["track_id"]
@@ -751,6 +774,10 @@ def split_multi_person_video(
             try:
                 from propainter_inpaint import isolate_person
 
+                if _shared_inpainter is None:
+                    from propainter_inpaint import ProPainterInpainter
+                    _shared_inpainter = ProPainterInpainter()
+
                 isolation_result = isolate_person(
                     video_path=video_path,
                     target_person_id=tid,
@@ -758,6 +785,7 @@ def split_multi_person_video(
                     target_detection_mask=_track_detection_mask(track, len(track["bbx_xyxy"])),
                     all_masks=masks,
                     output_path=str(isolated_video),
+                    inpainter=_shared_inpainter,
                 )
 
                 # Save isolation mode log
@@ -830,8 +858,20 @@ def split_multi_person_video(
             f"Person {i} isolated",
         )
 
+    # Free SAM2 masks from RAM (saved to disk, can reload if needed)
+    masks.clear()
+
+    # Free ProPainter GPU memory before GVHMR runs
+    if _shared_inpainter is not None:
+        _shared_inpainter.cleanup()
+        del _shared_inpainter
+        _shared_inpainter = None
+        torch.cuda.empty_cache()
+
     result.person_video_paths = person_video_paths
     result.person_dirs = person_dirs
+
+    _log_vram("after isolation")
 
     # ── Step 5: Per-person pipeline execution ──
     _progress(0.50, "Running per-person GVHMR pipelines...")
