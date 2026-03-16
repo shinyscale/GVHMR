@@ -58,6 +58,21 @@ _PERSON_COLORS = [
 ]
 
 
+def _draw_dashed_line(img, pt1, pt2, color, thickness=2, dash_len=8):
+    """Draw a dashed line on img from pt1 to pt2."""
+    x1, y1 = pt1
+    x2, y2 = pt2
+    dx = x2 - x1
+    dy = y2 - y1
+    dist = max(1, int((dx**2 + dy**2) ** 0.5))
+    for i in range(0, dist, dash_len * 2):
+        s = i / dist
+        e = min((i + dash_len) / dist, 1.0)
+        sx, sy = int(x1 + dx * s), int(y1 + dy * s)
+        ex, ey = int(x1 + dx * e), int(y1 + dy * e)
+        cv2.line(img, (sx, sy), (ex, ey), color, thickness)
+
+
 class _LRUFrameCache:
     """Simple LRU cache for decoded video frames."""
 
@@ -126,12 +141,46 @@ def _render_frame_with_bboxes(
     confidences: dict[int, TrackConfidence],
     selected_person: int,
     bbox_edit_state: dict | None = None,
+    inactive_tracks: list[dict] | None = None,
+    frame_idx: int = 0,
+    show_all_tracks: bool = False,
 ) -> np.ndarray:
     """Draw bboxes, corner handles, confidence badges, and labels via cv2.
 
     Returns a single np.ndarray (RGB) for gr.Image.
     """
     img = frame.copy()
+
+    # Draw inactive tracks as dashed semi-transparent overlays
+    if show_all_tracks and inactive_tracks:
+        for track in inactive_tracks:
+            tid = track["track_id"]
+            mask = track.get("detection_mask")
+            boxes = track.get("bbx_xyxy")
+            if boxes is None or frame_idx >= len(boxes):
+                continue
+            bbox = boxes[frame_idx]
+            if hasattr(bbox, "numpy"):
+                bbox = bbox.numpy()
+            x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
+            if x2 - x1 < 5 or y2 - y1 < 5:
+                continue
+            color = (128, 128, 128)
+            has_det = mask[frame_idx].item() if mask is not None and frame_idx < len(mask) else False
+            # Dashed rectangle via short line segments
+            for start, end in [((x1, y1), (x2, y1)), ((x2, y1), (x2, y2)),
+                               ((x2, y2), (x1, y2)), ((x1, y2), (x1, y1))]:
+                _draw_dashed_line(img, start, end, color, thickness=2, dash_len=8)
+            # Detection indicator dot
+            dot_color = (0, 180, 0) if has_det else (0, 0, 180)
+            cv2.circle(img, (x2 - 6, y1 + 6), 4, dot_color, -1)
+            # Label
+            label = f"Track {tid} (inactive)"
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            (tw, th), baseline = cv2.getTextSize(label, font, 0.4, 1)
+            cv2.rectangle(img, (x1, y2), (x1 + tw + 4, y2 + th + baseline + 4), (80, 80, 80), -1)
+            cv2.putText(img, label, (x1 + 2, y2 + th + 2), font, 0.4,
+                        (200, 200, 200), 1, cv2.LINE_AA)
 
     for pid, bbox in sorted(bboxes.items()):
         if bbox is None:
@@ -331,6 +380,7 @@ def init_panel_state(
     fps: float = 30.0,
     output_dir: str = "",
     pipeline_params: dict | None = None,
+    inactive_tracks: list[dict] | None = None,
 ) -> dict:
     """Initialize session data from pipeline results.
 
@@ -439,6 +489,8 @@ def init_panel_state(
         "img_height": img_height,
         "pid_to_dir": pid_to_dir,
         "pid_to_index": pid_to_index,
+        "inactive_tracks": inactive_tracks or [],
+        "crossing_spans": {},  # {person_id: [(start, end), ...]}
     }
 
     # Load per-person SMPL params and correction tracks for pose correction
@@ -549,8 +601,12 @@ def update_frame_display(frame_idx, state):
 
     # Render frame with bboxes drawn directly
     bbox_edit_state = state.get("bbox_edit_state") if state else None
+    show_all = state.get("show_all_tracks", False) if state else False
     rendered_frame = _render_frame_with_bboxes(
-        frame, bboxes, frame_confs, selected_person, bbox_edit_state
+        frame, bboxes, frame_confs, selected_person, bbox_edit_state,
+        inactive_tracks=sd.get("inactive_tracks"),
+        frame_idx=frame_idx,
+        show_all_tracks=show_all,
     )
 
     # Confidence breakdown for selected person
@@ -902,8 +958,12 @@ def on_frame_click(evt: gr.SelectData, frame_idx, state):
     if frame is not None:
         bboxes = _get_bboxes_at_frame(session_id, frame_idx)
         confs = _get_confidences_at_frame(session_id, frame_idx)
+        show_all = state.get("show_all_tracks", False) if state else False
         img = _render_frame_with_bboxes(frame, bboxes, confs, selected_person,
-                                        state.get("bbox_edit_state"))
+                                        state.get("bbox_edit_state"),
+                                        inactive_tracks=sd.get("inactive_tracks"),
+                                        frame_idx=frame_idx,
+                                        show_all_tracks=show_all)
     else:
         img = None
 
@@ -1192,6 +1252,140 @@ def _nav_fwd1(frame_idx, state):
     return min(sd.get("num_frames", 1) - 1, int(frame_idx) + 1)
 
 
+# ── Track Merge Callbacks ──
+
+
+def on_toggle_show_all_tracks(show_all, state):
+    """Toggle inactive track visibility in frame preview."""
+    if state is None:
+        return state
+    state["show_all_tracks"] = bool(show_all)
+    return state
+
+
+def on_merge_track(merge_source_label, frame_idx, state):
+    """Merge an inactive track fragment into the currently selected active person."""
+    if state is None or not merge_source_label:
+        return state, "No track selected", gr.update()
+
+    session_id = state.get("session_id", "")
+    sd = _SESSION_DATA.get(session_id)
+    if sd is None:
+        return state, "No session", gr.update()
+
+    # Parse track ID from dropdown label (e.g., "Track 4 (frames 400-899, 499 dets)")
+    import re
+    m = re.match(r"Track\s+(\d+)", merge_source_label)
+    if not m:
+        return state, f"Cannot parse track ID from: {merge_source_label}", gr.update()
+    merge_tid = int(m.group(1))
+
+    # Find the inactive track
+    inactive = sd.get("inactive_tracks", [])
+    source_track = None
+    source_idx = None
+    for i, t in enumerate(inactive):
+        if t["track_id"] == merge_tid:
+            source_track = t
+            source_idx = i
+            break
+    if source_track is None:
+        return state, f"Track {merge_tid} not found in inactive tracks", gr.update()
+
+    # Find active person's track
+    selected_person = state.get("selected_person", 0)
+    active_tracks = sd.get("all_tracks", [])
+    target_track = None
+    target_idx = None
+    for i, t in enumerate(active_tracks):
+        if t.get("track_id") == selected_person:
+            target_track = t
+            target_idx = i
+            break
+    if target_track is None:
+        return state, f"Active person {selected_person} not found", gr.update()
+
+    from person_tracker import merge_tracks, describe_track
+    merged = merge_tracks(target_track, source_track, sd["num_frames"])
+
+    # Update active track in place
+    active_tracks[target_idx] = merged
+    sd["all_bboxes"][selected_person] = merged["bbx_xyxy"].numpy().astype(np.float32)
+    sd["original_bboxes"][selected_person] = merged["bbx_xyxy"].numpy().astype(np.float32).copy()
+
+    # Remove from inactive list
+    inactive.pop(source_idx)
+
+    # Mark dirty
+    sd["dirty_persons"].add(selected_person)
+
+    # Rebuild merge dropdown choices
+    choices = [describe_track(t) for t in inactive]
+
+    status = f"Merged Track {merge_tid} into Person {selected_person}. Person marked dirty."
+    return state, status, gr.update(choices=choices, value=None)
+
+
+# ── Crossing Span Callbacks ──
+
+_CROSSING_SPAN_PENDING: dict[str, int | None] = {}  # session_id → pending start frame
+
+
+def on_crossing_start(frame_idx, state):
+    """Mark the start of a crossing span at the current frame."""
+    if state is None:
+        return "No session"
+    session_id = state.get("session_id", "")
+    _CROSSING_SPAN_PENDING[session_id] = int(frame_idx)
+    return f"Crossing start marked at frame {int(frame_idx)}. Now click 'Mark Crossing End'."
+
+
+def on_crossing_end(frame_idx, state):
+    """Mark the end of a crossing span and save it."""
+    if state is None:
+        return "No session", gr.update()
+    session_id = state.get("session_id", "")
+    sd = _SESSION_DATA.get(session_id)
+    if sd is None:
+        return "No session", gr.update()
+
+    start = _CROSSING_SPAN_PENDING.pop(session_id, None)
+    if start is None:
+        return "Click 'Mark Crossing Start' first.", gr.update()
+
+    end = int(frame_idx)
+    if end <= start:
+        return f"End frame ({end}) must be after start frame ({start}).", gr.update()
+
+    selected_person = state.get("selected_person", 0)
+    spans = sd.setdefault("crossing_spans", {})
+    person_spans = spans.setdefault(selected_person, [])
+    person_spans.append((start, end))
+    person_spans.sort()
+
+    # Persist to disk
+    pid_to_dir = sd.get("pid_to_dir", {})
+    person_dir = pid_to_dir.get(selected_person)
+    if person_dir:
+        import json
+        spans_path = Path(person_dir) / "crossing_spans.json"
+        spans_path.write_text(json.dumps(person_spans))
+
+    # Build DataFrame
+    rows = _build_crossing_spans_df(sd.get("crossing_spans", {}))
+    status = f"Crossing span added: frames {start}-{end} ({end - start} frames) for Person {selected_person}"
+    return status, gr.update(value=rows)
+
+
+def _build_crossing_spans_df(crossing_spans: dict) -> list[list]:
+    """Build DataFrame rows from crossing spans dict."""
+    rows = []
+    for pid, spans in sorted(crossing_spans.items()):
+        for start, end in spans:
+            rows.append([f"Person {pid}", start, end, end - start])
+    return rows
+
+
 # ── Build Panel ──
 
 
@@ -1222,6 +1416,39 @@ def build_identity_panel(scene_preview_video=None) -> dict[str, Any]:
             interactive=True,
             scale=1,
             visible=True,
+        )
+
+    # ── Track Merge & Crossing Span Controls ──
+    with gr.Accordion("Track Merge & Crossings", open=False):
+        with gr.Row():
+            show_all_tracks = gr.Checkbox(
+                label="Show All Tracks", value=False,
+                info="Overlay inactive/discarded track fragments on frame preview",
+            )
+        gr.Markdown("**Merge Fragment into Active Person**")
+        with gr.Row():
+            merge_source = gr.Dropdown(
+                label="Inactive Track",
+                choices=[],
+                interactive=True,
+                scale=2,
+            )
+            merge_btn = gr.Button("Merge", size="sm", scale=0, min_width=80)
+            merge_status = gr.Textbox(
+                label="", value="", interactive=False, scale=2,
+            )
+        gr.Markdown("**Crossing Spans** (SLERP bridge through occlusion)")
+        with gr.Row():
+            crossing_start_btn = gr.Button("Mark Crossing Start", size="sm", scale=0, min_width=150)
+            crossing_end_btn = gr.Button("Mark Crossing End", size="sm", scale=0, min_width=150)
+            crossing_status = gr.Textbox(
+                label="", value="", interactive=False, scale=2,
+            )
+        crossing_spans_df = gr.DataFrame(
+            headers=["Person", "Start", "End", "Duration"],
+            datatype=["str", "number", "number", "number"],
+            interactive=False,
+            row_count=(3, "dynamic"),
         )
 
     # CSS to prevent native browser image drag (otherwise misclicks
@@ -1381,6 +1608,38 @@ def build_identity_panel(scene_preview_video=None) -> dict[str, Any]:
         outputs=[panel_state, reprocess_btn] + display_outputs,
     )
 
+    # Track merge & crossing span callbacks
+    show_all_tracks.change(
+        fn=on_toggle_show_all_tracks,
+        inputs=[show_all_tracks, panel_state],
+        outputs=[panel_state],
+    ).then(
+        fn=update_frame_display,
+        inputs=[frame_slider, panel_state],
+        outputs=display_outputs,
+    )
+
+    merge_btn.click(
+        fn=on_merge_track,
+        inputs=[merge_source, frame_slider, panel_state],
+        outputs=[panel_state, merge_status, merge_source],
+    ).then(
+        fn=update_frame_display,
+        inputs=[frame_slider, panel_state],
+        outputs=display_outputs,
+    )
+
+    crossing_start_btn.click(
+        fn=on_crossing_start,
+        inputs=[frame_slider, panel_state],
+        outputs=[crossing_status],
+    )
+    crossing_end_btn.click(
+        fn=on_crossing_end,
+        inputs=[frame_slider, panel_state],
+        outputs=[crossing_status, crossing_spans_df],
+    )
+
     # Keyframe DataFrame click → navigate
     kf_dataframe.select(
         fn=on_df_select,
@@ -1445,6 +1704,8 @@ def build_identity_panel(scene_preview_video=None) -> dict[str, Any]:
         "conf_motion": conf_motion,
         "conf_overall": conf_overall,
         "pose_panel": pose_panel,
+        "merge_target": merge_source,
+        "crossing_spans_df": crossing_spans_df,
     }
 
 
@@ -1454,10 +1715,11 @@ def populate_panel(
     """Generate initial values for panel components after init_panel_state.
 
     Returns tuple of Gradio updates for:
-    (state, person_dropdown, swap_target, frame_slider, frame_label, + display_outputs)
+    (state, person_dropdown, swap_target, frame_slider, frame_label,
+     + 9 display_outputs, merge_target, crossing_spans_df)
     """
     if state_dict is None:
-        return (None,) * 14
+        return (None,) * 16
 
     session_id = state_dict.get("session_id", "")
     sd = _SESSION_DATA.get(session_id, {})
@@ -1467,6 +1729,25 @@ def populate_panel(
     # Initial display at frame 0
     display = update_frame_display(0, state_dict)
 
+    # Merge dropdown choices from inactive tracks
+    from person_tracker import describe_track
+    inactive = sd.get("inactive_tracks", [])
+    merge_choices = [describe_track(t) for t in inactive]
+
+    # Load crossing spans from disk
+    crossing_spans = sd.get("crossing_spans", {})
+    for pid, pdir in sd.get("pid_to_dir", {}).items():
+        import json
+        spans_path = Path(pdir) / "crossing_spans.json"
+        if spans_path.exists():
+            try:
+                loaded = json.loads(spans_path.read_text())
+                crossing_spans[pid] = [tuple(s) for s in loaded]
+            except Exception:
+                pass
+    sd["crossing_spans"] = crossing_spans
+    spans_rows = _build_crossing_spans_df(crossing_spans)
+
     return (
         state_dict,                                     # state
         gr.update(choices=choices, value=choices[0] if choices else None),  # person_dropdown
@@ -1474,4 +1755,6 @@ def populate_panel(
         gr.update(maximum=max(num_frames - 1, 1), value=0),  # frame_slider
         f"Frame 0/{num_frames - 1}" if num_frames > 0 else "Frame 0/0",  # frame_label
         *display,                                       # 9 display outputs
+        gr.update(choices=merge_choices, value=None),   # merge_target
+        gr.update(value=spans_rows),                    # crossing_spans_df
     )

@@ -171,6 +171,7 @@ class MultiPersonResult:
     slam_path: str = ""
     offsets: dict = field(default_factory=dict)
     all_tracks: list = field(default_factory=list)
+    inactive_tracks: list = field(default_factory=list)
     masks: dict = field(default_factory=dict)
     num_persons: int = 0
     output_dir: str = ""
@@ -595,11 +596,14 @@ def split_multi_person_video(
         _progress(0.10, f"Detected {len(all_tracks)} people ({current_tracker_backend})")
 
     # Cap to max_persons largest tracks (already sorted by area)
+    inactive_tracks = []
     if max_persons > 0 and len(all_tracks) > max_persons:
         _progress(0.10, f"Capping from {len(all_tracks)} tracks to {max_persons} largest")
+        inactive_tracks = all_tracks[max_persons:]
         all_tracks = all_tracks[:max_persons]
 
     result.all_tracks = all_tracks
+    result.inactive_tracks = inactive_tracks
     result.num_persons = len(all_tracks)
 
     collapsed_pairs = _collapsed_track_pairs(all_tracks)

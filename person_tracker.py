@@ -319,6 +319,132 @@ class PersonTracker:
         return tracks
 
 
+def merge_tracks(
+    track_a: dict,
+    track_b: dict,
+    num_frames: int,
+    smooth_window: int = 5,
+    smooth_passes: int = 2,
+) -> dict:
+    """Merge two track dicts into one, combining their real detections.
+
+    For each frame, picks the bbox from whichever track has a real detection.
+    If both have detections at the same frame, uses the one with higher
+    detection confidence. Gaps between detections are interpolated and the
+    result is smoothed.
+
+    Args:
+        track_a: primary track dict (its track_id is kept)
+        track_b: track to merge in
+        num_frames: total video frame count
+        smooth_window: moving average window for smoothing
+        smooth_passes: number of smoothing passes
+
+    Returns:
+        New merged track dict with keys: track_id, bbx_xyxy, detection_mask,
+        detection_conf, merged_from (list of source track_ids).
+    """
+    mask_a = track_a["detection_mask"]
+    mask_b = track_b["detection_mask"]
+    conf_a = track_a.get("detection_conf", torch.zeros(num_frames))
+    conf_b = track_b.get("detection_conf", torch.zeros(num_frames))
+    boxes_a = track_a["bbx_xyxy"]
+    boxes_b = track_b["bbx_xyxy"]
+
+    # Ensure tensors
+    if not isinstance(mask_a, torch.Tensor):
+        mask_a = torch.tensor(mask_a, dtype=torch.bool)
+    if not isinstance(mask_b, torch.Tensor):
+        mask_b = torch.tensor(mask_b, dtype=torch.bool)
+    if not isinstance(boxes_a, torch.Tensor):
+        boxes_a = torch.tensor(boxes_a, dtype=torch.float32)
+    if not isinstance(boxes_b, torch.Tensor):
+        boxes_b = torch.tensor(boxes_b, dtype=torch.float32)
+    if not isinstance(conf_a, torch.Tensor):
+        conf_a = torch.tensor(conf_a, dtype=torch.float32)
+    if not isinstance(conf_b, torch.Tensor):
+        conf_b = torch.tensor(conf_b, dtype=torch.float32)
+
+    n = min(num_frames, len(mask_a), len(mask_b))
+    merged_mask = torch.zeros(num_frames, dtype=torch.bool)
+    merged_conf = torch.zeros(num_frames, dtype=torch.float32)
+    merged_boxes = torch.zeros(num_frames, 4, dtype=torch.float32)
+
+    for f in range(n):
+        has_a = mask_a[f].item()
+        has_b = mask_b[f].item()
+        if has_a and has_b:
+            # Both have real detections — pick higher confidence
+            if conf_a[f] >= conf_b[f]:
+                merged_boxes[f] = boxes_a[f]
+                merged_conf[f] = conf_a[f]
+            else:
+                merged_boxes[f] = boxes_b[f]
+                merged_conf[f] = conf_b[f]
+            merged_mask[f] = True
+        elif has_a:
+            merged_boxes[f] = boxes_a[f]
+            merged_conf[f] = conf_a[f]
+            merged_mask[f] = True
+        elif has_b:
+            merged_boxes[f] = boxes_b[f]
+            merged_conf[f] = conf_b[f]
+            merged_mask[f] = True
+
+    # Interpolate gaps between real detections
+    if merged_mask.any():
+        missing = get_frame_id_list_from_mask(~merged_mask)
+        merged_boxes = linear_interpolate_frame_ids(merged_boxes, missing)
+
+        # Clamp leading/trailing to nearest valid bbox
+        nonzero = merged_boxes.sum(1) != 0
+        if nonzero.any() and not nonzero.all():
+            first = nonzero.nonzero(as_tuple=True)[0][0].item()
+            last = nonzero.nonzero(as_tuple=True)[0][-1].item()
+            if first > 0:
+                merged_boxes[:first] = merged_boxes[first]
+            if last < num_frames - 1:
+                merged_boxes[last + 1:] = merged_boxes[last]
+
+        # Smooth
+        for _ in range(smooth_passes):
+            merged_boxes = moving_average_smooth(
+                merged_boxes, window_size=smooth_window, dim=0
+            )
+
+    merged_from = [track_a["track_id"]]
+    if track_b["track_id"] not in merged_from:
+        merged_from.append(track_b["track_id"])
+    # Carry forward any prior merge history
+    for t in (track_a, track_b):
+        for tid in t.get("merged_from", []):
+            if tid not in merged_from:
+                merged_from.append(tid)
+
+    return {
+        "track_id": track_a["track_id"],
+        "bbx_xyxy": merged_boxes.float(),
+        "detection_mask": merged_mask,
+        "detection_conf": merged_conf,
+        "merged_from": merged_from,
+    }
+
+
+def describe_track(track: dict, fps: float = 30.0) -> str:
+    """One-line description of a track for UI display."""
+    tid = track["track_id"]
+    mask = track["detection_mask"]
+    if isinstance(mask, torch.Tensor):
+        mask = mask.numpy()
+    mask = np.asarray(mask, dtype=bool)
+    n_dets = int(mask.sum())
+    if n_dets == 0:
+        return f"Track {tid} (no detections)"
+    det_frames = np.where(mask)[0]
+    first, last = int(det_frames[0]), int(det_frames[-1])
+    return f"Track {tid} (frames {first}-{last}, {n_dets} dets)"
+
+
 def render_track_visualization(
     video_path: str | Path,
     all_tracks: list[dict],

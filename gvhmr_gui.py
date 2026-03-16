@@ -1017,6 +1017,7 @@ def run_multi_person_pipeline(
                     "static_cam": multi_static_cam,
                     "use_dpvo": multi_use_dpvo,
                 },
+                inactive_tracks=result.inactive_tracks,
             )
         except Exception as e:
             log_lines.append(f"[Identity Panel] Init warning: {e}")
@@ -1398,6 +1399,9 @@ with gr.Blocks(
                     id_panel["conf_motion"], id_panel["conf_overall"],
                     id_panel["confidence_plot"],
                     id_panel["kf_dataframe"],
+                    # Track merge & crossing outputs:
+                    id_panel["merge_target"],
+                    id_panel["crossing_spans_df"],
                 ],
             )
 
