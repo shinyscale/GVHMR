@@ -100,8 +100,15 @@ class _LRUFrameCache:
         self._cache.clear()
 
 
+_READAHEAD = 15  # cache this many frames ahead after each seek
+
+
 def _extract_frame(video_path: str, frame_idx: int, session_id: str) -> np.ndarray | None:
-    """Extract a single frame from video, using cache and persistent VideoCapture."""
+    """Extract a single frame from video with read-ahead caching.
+
+    After the expensive H.264 seek, reads the next _READAHEAD frames too
+    (sequential reads are nearly free). This makes forward stepping instant.
+    """
     sd = _SESSION_DATA.get(session_id)
     if sd is None:
         return None
@@ -115,25 +122,25 @@ def _extract_frame(video_path: str, frame_idx: int, session_id: str) -> np.ndarr
     if cached is not None:
         return cached
 
-    # Reuse persistent VideoCapture (avoids ~10-20ms open/close per frame)
-    cap = sd.get("_cap")
-    cap_path = sd.get("_cap_path")
-    if cap is None or cap_path != video_path or not cap.isOpened():
-        if cap is not None:
-            cap.release()
-        cap = cv2.VideoCapture(video_path)
-        sd["_cap"] = cap
-        sd["_cap_path"] = video_path
-
+    num_frames = sd.get("num_frames", 0)
+    cap = cv2.VideoCapture(video_path)
     cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-    ret, frame = cap.read()
 
-    if not ret:
-        return None
+    result = None
+    for i in range(_READAHEAD + 1):
+        f = frame_idx + i
+        if f >= num_frames:
+            break
+        ret, frame = cap.read()
+        if not ret:
+            break
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        cache.put(f, rgb)
+        if i == 0:
+            result = rgb
 
-    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    cache.put(frame_idx, frame_rgb)
-    return frame_rgb
+    cap.release()
+    return result
 
 
 def _confidence_color(value: float) -> str:
@@ -235,8 +242,8 @@ def _render_frame_with_bboxes(
     return img
 
 
-_CONFIDENCE_TIMELINE_WIDTH = 1024  # px — matches Gradio default column width
-_CONFIDENCE_TIMELINE_HEIGHT = 40   # px
+_CONFIDENCE_TIMELINE_HEIGHT = 48   # px
+_CONFIDENCE_TIMELINE_MIN_WIDTH = 1600  # px — render wide, Gradio scales to fit
 
 
 def _render_confidence_timeline(
@@ -245,45 +252,47 @@ def _render_confidence_timeline(
     keyframe_frames: list[int],
     num_frames: int,
     has_real_data: bool = True,
-    width: int = _CONFIDENCE_TIMELINE_WIDTH,
     height: int = _CONFIDENCE_TIMELINE_HEIGHT,
 ) -> np.ndarray:
     """Render confidence heatmap timeline as an RGB numpy image.
 
+    Width = max(num_frames, _CONFIDENCE_TIMELINE_MIN_WIDTH) so the image is
+    always wide enough for Gradio to stretch to full column width.
     Returns np.ndarray (H, W, 3) suitable for gr.Image(type="numpy").
-    Click x-coordinate maps to frame via: frame = x * num_frames / width.
     """
+    width = max(num_frames, _CONFIDENCE_TIMELINE_MIN_WIDTH, 1)
     img = np.full((height, width, 3), 26, dtype=np.uint8)  # #1a1a2e background
 
     if num_frames <= 0:
         return img
 
-    bar_h = height - 10  # leave room for keyframe diamonds at top
+    diamond_h = 12  # top region for keyframe diamonds
+    bar_h = height - diamond_h
 
     if not has_real_data:
         # Gray bar with "No confidence data" text
-        img[10:, :] = 77  # gray
+        img[diamond_h:, :] = 77  # gray
         font = cv2.FONT_HERSHEY_SIMPLEX
         text = "No confidence data"
-        (tw, th), _ = cv2.getTextSize(text, font, 0.45, 1)
+        (tw, th), _ = cv2.getTextSize(text, font, 0.5, 1)
         tx = (width - tw) // 2
-        ty = 10 + (bar_h + th) // 2
-        cv2.putText(img, text, (tx, ty), font, 0.45, (136, 136, 136), 1, cv2.LINE_AA)
+        ty = diamond_h + (bar_h + th) // 2
+        cv2.putText(img, text, (tx, ty), font, 0.5, (136, 136, 136), 1, cv2.LINE_AA)
     elif len(overall_array) > 0:
-        # RdYlGn colormap — render each frame as a vertical stripe
+        # RdYlGn colormap — each pixel column maps to a frame
         cmap = plt.cm.RdYlGn
         colors_rgba = cmap(overall_array)  # (N, 4) float 0-1
         colors_rgb = (colors_rgba[:, :3] * 255).astype(np.uint8)  # (N, 3)
         for x in range(width):
-            f = int(x * num_frames / width)
-            f = min(f, len(colors_rgb) - 1)
-            img[10:, x] = colors_rgb[f]
+            f = min(int(x * num_frames / width), len(colors_rgb) - 1)
+            img[diamond_h:, x] = colors_rgb[f]
 
-    # Keyframe diamonds (small triangles at top)
+    # Keyframe diamonds (downward-pointing triangles at top)
     for kf in keyframe_frames:
         if 0 <= kf < num_frames:
             kx = int(kf * width / num_frames)
-            pts = np.array([[kx, 8], [kx - 4, 1], [kx + 4, 1]], dtype=np.int32)
+            sz = 5
+            pts = np.array([[kx, diamond_h - 1], [kx - sz, 1], [kx + sz, 1]], dtype=np.int32)
             cv2.fillPoly(img, [pts], (96, 165, 250))  # #60a5fa
 
     # Playhead — white vertical line
@@ -428,12 +437,6 @@ def init_panel_state(
     Returns a lightweight gr.State dict.
     """
     import torch
-
-    # Release any existing VideoCapture from previous sessions
-    for old_sd in _SESSION_DATA.values():
-        old_cap = old_sd.pop("_cap", None)
-        if old_cap is not None:
-            old_cap.release()
 
     session_id = str(uuid.uuid4())
 
@@ -1927,7 +1930,11 @@ def on_remove_selected_crossing(state):
 
 
 def on_confidence_click(evt: gr.SelectData, state):
-    """Click on confidence timeline image to seek to that frame."""
+    """Click on confidence timeline image to seek to that frame.
+
+    Image is rendered at width = max(num_frames, min_width), so we map
+    x-coordinate back to frame index.
+    """
     if state is None or evt is None:
         return 0
     session_id = state.get("session_id", "")
@@ -1935,9 +1942,10 @@ def on_confidence_click(evt: gr.SelectData, state):
     if sd is None:
         return 0
     num_frames = sd.get("num_frames", 1)
-    # evt.index gives (x, y) pixel coordinates
-    click_x = evt.index[0] if isinstance(evt.index, (list, tuple)) else evt.index
-    frame = int(click_x * num_frames / _CONFIDENCE_TIMELINE_WIDTH)
+    img_width = max(num_frames, _CONFIDENCE_TIMELINE_MIN_WIDTH, 1)
+    idx = evt.index
+    click_x = idx[0] if isinstance(idx, (list, tuple)) else idx
+    frame = int(click_x * num_frames / img_width)
     return max(0, min(frame, num_frames - 1))
 
 
@@ -2055,6 +2063,8 @@ def build_identity_panel(scene_preview_video=None) -> dict[str, Any]:
         first_btn = gr.Button("|<", size="sm", scale=0, min_width=40)
         back10_btn = gr.Button("<<", size="sm", scale=0, min_width=40)
         back1_btn = gr.Button("<", size="sm", scale=0, min_width=40)
+        play_btn = gr.Button("Play", size="sm", scale=0, min_width=60,
+                             elem_id="play_pause_btn")
         frame_label = gr.Textbox(
             label="Frame",
             value="Frame 0/0",
@@ -2072,13 +2082,26 @@ def build_identity_panel(scene_preview_video=None) -> dict[str, Any]:
         value=0,
         label="Frame",
         interactive=True,
+        elem_id="frame_slider",
     )
 
     confidence_plot = gr.Image(
         label="Confidence Timeline (click to seek)",
         interactive=False,
         type="numpy",
-        height=_CONFIDENCE_TIMELINE_HEIGHT + 16,
+        elem_id="confidence_timeline",
+        show_download_button=False,
+        show_fullscreen_button=False,
+        show_share_button=False,
+    )
+
+    # CSS: make confidence timeline fill width, hide chrome
+    gr.HTML(
+        "<style>"
+        "#confidence_timeline { padding: 0; }"
+        "#confidence_timeline img { width: 100% !important; height: auto !important; }"
+        "#confidence_timeline .icon-buttons { display: none !important; }"
+        "</style>"
     )
 
     # Keyframe buttons — placed right below the timelines where keyframes appear
@@ -2142,11 +2165,43 @@ def build_identity_panel(scene_preview_video=None) -> dict[str, Any]:
 
     # ── Wire callbacks ──
 
-    # Frame slider → update display
+    # Frame slider → update display (hidden progress prevents frame blanking)
     frame_slider.change(
         fn=update_frame_display,
         inputs=[frame_slider, panel_state],
         outputs=display_outputs,
+        show_progress="hidden",
+    )
+
+    # Play/Pause button — JS-based timer that increments the slider
+    play_btn.click(
+        fn=None,
+        js="""
+        () => {
+            const btn = document.querySelector('#play_pause_btn button') ||
+                        document.querySelector('#play_pause_btn');
+            const slider = document.querySelector('#frame_slider input[type=range]');
+            if (!slider) return;
+            if (window._playInterval) {
+                clearInterval(window._playInterval);
+                window._playInterval = null;
+                if (btn) btn.textContent = 'Play';
+            } else {
+                if (btn) btn.textContent = 'Pause';
+                window._playInterval = setInterval(() => {
+                    let val = parseInt(slider.value) + 1;
+                    if (val > parseInt(slider.max)) {
+                        clearInterval(window._playInterval);
+                        window._playInterval = null;
+                        if (btn) btn.textContent = 'Play';
+                        return;
+                    }
+                    slider.value = val;
+                    slider.dispatchEvent(new Event('input', {bubbles: true}));
+                }, 100);  // ~10fps
+            }
+        }
+        """,
     )
 
     # Person dropdown → update display
@@ -2206,6 +2261,7 @@ def build_identity_panel(scene_preview_video=None) -> dict[str, Any]:
         fn=update_frame_display,
         inputs=[frame_slider, panel_state],
         outputs=display_outputs,
+        show_progress="hidden",
     )
 
     split_btn.click(
@@ -2216,6 +2272,7 @@ def build_identity_panel(scene_preview_video=None) -> dict[str, Any]:
         fn=update_frame_display,
         inputs=[frame_slider, panel_state],
         outputs=display_outputs,
+        show_progress="hidden",
     )
 
     merge_btn.click(
@@ -2226,6 +2283,7 @@ def build_identity_panel(scene_preview_video=None) -> dict[str, Any]:
         fn=update_frame_display,
         inputs=[frame_slider, panel_state],
         outputs=display_outputs,
+        show_progress="hidden",
     )
 
     crossing_start_btn.click(
@@ -2313,6 +2371,7 @@ def build_identity_panel(scene_preview_video=None) -> dict[str, Any]:
         fn=update_frame_display,
         inputs=[frame_slider, panel_state],
         outputs=display_outputs,
+        show_progress="hidden",
     )
 
     apply_kf_btn.click(
@@ -2323,6 +2382,7 @@ def build_identity_panel(scene_preview_video=None) -> dict[str, Any]:
         fn=update_frame_display,
         inputs=[frame_slider, panel_state],
         outputs=display_outputs,
+        show_progress="hidden",
     )
 
     _reprocess_outputs = [panel_state, reprocess_status, reprocess_btn]
