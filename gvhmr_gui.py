@@ -1002,13 +1002,18 @@ def run_multi_person_pipeline(
         if csv_path.exists():
             confidence_csv_files.append(str(csv_path))
 
-    # Initialize identity panel state
+    # Initialize identity panel state — needs tracks at minimum, identity_tracks optional
     panel_state_dict = None
-    if result.identity_tracks:
+    if result.all_tracks:
+        # If identity verification failed, create stub IdentityTracks from tracks
+        id_tracks = result.identity_tracks
+        if not id_tracks:
+            from identity_tracking import IdentityTrack
+            id_tracks = [IdentityTrack(person_id=t["track_id"]) for t in result.all_tracks]
         try:
             panel_state_dict = init_panel_state(
                 video_path=video_path,
-                identity_tracks=result.identity_tracks,
+                identity_tracks=id_tracks,
                 all_tracks=result.all_tracks,
                 person_dirs=result.person_dirs,
                 fps=fps if fps > 0 else 30.0,
