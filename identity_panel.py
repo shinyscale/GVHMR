@@ -24,9 +24,8 @@ import numpy as np
 
 import gradio as gr
 
-from identity_confidence import TrackConfidence, confidence_to_array, compute_bbox_iou
-from identity_tracking import IdentityTrack, IdentityKeyframe, merge_identity_tracks, split_identity_track
-from identity_reid import ShapeReIdentifier
+from identity_confidence import TrackConfidence, confidence_to_array
+from identity_tracking import IdentityTrack, IdentityKeyframe
 from pose_correction import CorrectionTrack
 from pose_correction_panel import (
     build_pose_correction_panel,
@@ -182,13 +181,9 @@ def _render_confidence_plot(
     current_frame: int,
     keyframe_frames: list[int],
     num_frames: int,
-    issues: list[dict] | None = None,
 ) -> plt.Figure:
-    """Render confidence heatmap timeline as matplotlib figure.
-
-    Optional issue markers drawn above the confidence heatmap.
-    """
-    fig, ax = plt.subplots(figsize=(14, 1.2))
+    """Render confidence heatmap timeline as matplotlib figure."""
+    fig, ax = plt.subplots(figsize=(14, 1.0))
     fig.patch.set_facecolor("#1a1a2e")
     ax.set_facecolor("#1a1a2e")
 
@@ -202,28 +197,11 @@ def _render_confidence_plot(
         if 0 <= kf < num_frames:
             ax.plot(kf, 1.08, "D", color="#60a5fa", markersize=5, zorder=5)
 
-    # Issue markers (Phase 1.4)
-    if issues:
-        for issue in issues:
-            f = issue.get("frame", 0)
-            if f < 0 or f >= num_frames:
-                continue
-            itype = issue.get("type", "")
-            if itype == "potential_swap":
-                ax.plot(f, 1.13, "v", color="#ea4335", markersize=6, zorder=6)
-            elif itype == "shape_drift":
-                ax.plot(f, 1.13, "s", color="#ff9800", markersize=5, zorder=6)
-            elif itype == "track_gap":
-                span = issue.get("span")
-                if span:
-                    ax.axvspan(span[0], span[1], ymin=0.85, ymax=0.95,
-                               color="#ff5722", alpha=0.4, zorder=4)
-
     # Playhead
     ax.axvline(current_frame, color="white", lw=1.5, zorder=10)
 
     ax.set_xlim(0, max(num_frames, 1))
-    ax.set_ylim(0, 1.25)
+    ax.set_ylim(0, 1.2)
     ax.axis("off")
     fig.tight_layout(pad=0.1)
     return fig
@@ -340,256 +318,6 @@ def _person_choices(session_id: str) -> list[str]:
     sd = _SESSION_DATA.get(session_id, {})
     tracks = sd.get("identity_tracks", [])
     return [f"Person {t.person_id}" for t in tracks]
-
-
-# ── Phase 1: Confidence-Guided Review ──
-
-
-def compute_review_issues(session_id: str) -> list[dict]:
-    """Scan all persons for identity problems. Returns sorted issue list.
-
-    Each issue: {
-        "type": "low_confidence" | "potential_swap" | "track_gap" | "shape_drift",
-        "frame": int,
-        "person_id": int,
-        "severity": float,  # 0-1, higher = worse
-        "description": str,
-        "span": (int, int) | None,
-    }
-    """
-    sd = _SESSION_DATA.get(session_id, {})
-    identity_tracks = sd.get("identity_tracks", [])
-    all_confs = sd.get("confidences", {})
-    all_bboxes = sd.get("all_bboxes", {})
-    num_frames = sd.get("num_frames", 0)
-    issues: list[dict] = []
-
-    for id_track in identity_tracks:
-        pid = id_track.person_id
-        confs = all_confs.get(pid, [])
-        if not confs:
-            continue
-
-        # 1. Low-confidence spans
-        spans = id_track.low_confidence_spans(confs, threshold=0.4)
-        for start, end in spans:
-            span_confs = [confs[f].overall for f in range(start, min(end + 1, len(confs)))]
-            mean_conf = np.mean(span_confs) if span_confs else 0.0
-            mid = (start + end) // 2
-            issues.append({
-                "type": "low_confidence",
-                "frame": mid,
-                "person_id": pid,
-                "severity": 1.0 - mean_conf,
-                "description": f"Person {pid}: low confidence frames {start}-{end} (mean {mean_conf:.2f})",
-                "span": (start, end),
-            })
-
-        # 3. Track gaps: contiguous False spans > 15 frames in detection_mask
-        track_data = None
-        pid_to_index = sd.get("pid_to_index", {})
-        idx = pid_to_index.get(pid)
-        all_tracks = sd.get("all_tracks", [])
-        if idx is not None and idx < len(all_tracks):
-            track_data = all_tracks[idx]
-
-        if track_data is not None:
-            import torch
-            det_mask = track_data.get("detection_mask")
-            if det_mask is not None:
-                if isinstance(det_mask, torch.Tensor):
-                    det_mask = det_mask.numpy()
-                in_gap = False
-                gap_start = 0
-                for f in range(len(det_mask)):
-                    if not det_mask[f]:
-                        if not in_gap:
-                            gap_start = f
-                            in_gap = True
-                    else:
-                        if in_gap and f - gap_start > 15:
-                            mid = (gap_start + f - 1) // 2
-                            issues.append({
-                                "type": "track_gap",
-                                "frame": mid,
-                                "person_id": pid,
-                                "severity": min(1.0, (f - gap_start) / 60.0),
-                                "description": f"Person {pid}: lost tracking frames {gap_start}-{f - 1} ({f - gap_start} frames)",
-                                "span": (gap_start, f - 1),
-                            })
-                        in_gap = False
-                if in_gap and len(det_mask) - gap_start > 15:
-                    mid = (gap_start + len(det_mask) - 1) // 2
-                    issues.append({
-                        "type": "track_gap",
-                        "frame": mid,
-                        "person_id": pid,
-                        "severity": min(1.0, (len(det_mask) - gap_start) / 60.0),
-                        "description": f"Person {pid}: lost tracking frames {gap_start}-{len(det_mask) - 1}",
-                        "span": (gap_start, len(det_mask) - 1),
-                    })
-
-    # Build ShapeReIdentifier from tracks (used by swaps + drift checks)
-    reid = ShapeReIdentifier(identity_tracks)
-
-    # 2. Potential swaps: check pairs at frames with bbox overlap > 0.3
-    pids = [t.person_id for t in identity_tracks]
-    if len(pids) >= 2:
-        for i in range(len(pids)):
-            for j in range(i + 1, len(pids)):
-                pid_a, pid_b = pids[i], pids[j]
-                bboxes_a = all_bboxes.get(pid_a)
-                bboxes_b = all_bboxes.get(pid_b)
-                if bboxes_a is None or bboxes_b is None:
-                    continue
-
-                n = min(len(bboxes_a), len(bboxes_b), num_frames)
-                checked_swap = False
-                for f in range(n):
-                    iou = compute_bbox_iou(bboxes_a[f], bboxes_b[f])
-                    if iou > 0.3 and not checked_swap:
-                        # Check for swap at this overlap point
-                        per_person_betas = {}
-                        for check_pid in [pid_a, pid_b]:
-                            track = _get_identity_track(session_id, check_pid)
-                            if track and track.established_betas is not None:
-                                per_person_betas[check_pid] = track.established_betas
-                        swaps = reid.detect_swap(f, per_person_betas)
-                        if swaps:
-                            issues.append({
-                                "type": "potential_swap",
-                                "frame": f,
-                                "person_id": pid_a,
-                                "severity": 0.9,
-                                "description": f"Potential swap between Person {pid_a} and Person {pid_b} at frame {f}",
-                                "span": None,
-                            })
-                            checked_swap = True
-
-    # 4. Shape drift
-    for id_track in identity_tracks:
-        pid = id_track.person_id
-        if id_track.established_betas is None:
-            continue
-        # Get per-frame betas from SMPL params if available
-        pid_to_index = sd.get("pid_to_index", {})
-        idx = pid_to_index.get(pid)
-        person_dirs = sd.get("person_dirs", [])
-        if idx is not None and idx < len(person_dirs):
-            pdir = Path(person_dirs[idx])
-            pt_files = list(pdir.rglob("hmr4d_results.pt"))
-            if pt_files:
-                try:
-                    from smplx_to_bvh import extract_gvhmr_params
-                    params = extract_gvhmr_params(str(pt_files[0]))
-                    per_frame_betas = params["betas"]
-                    drift_frames = reid.verify_track_consistency(pid, per_frame_betas)
-                    for f in drift_frames:
-                        issues.append({
-                            "type": "shape_drift",
-                            "frame": f,
-                            "person_id": pid,
-                            "severity": 0.6,
-                            "description": f"Person {pid}: shape drift at frame {f}",
-                            "span": None,
-                        })
-                except Exception:
-                    pass
-
-    # Sort by severity descending
-    issues.sort(key=lambda x: x["severity"], reverse=True)
-    return issues
-
-
-# ── Phase 2: Visual ReID Gallery ──
-
-
-def _extract_thumbnails(
-    video_path: str,
-    bboxes: np.ndarray,
-    keyframes: list[IdentityKeyframe],
-    confidences: list[TrackConfidence],
-    max_thumbnails: int = 3,
-    target_size: tuple[int, int] = (128, 192),
-    padding_ratio: float = 0.2,
-) -> list[tuple[int, np.ndarray]]:
-    """Extract cropped thumbnails at highest-confidence keyframe locations.
-    Returns [(frame_idx, rgb_array), ...] sorted by frame order.
-    """
-    # Find best keyframe frames by confidence
-    kf_confs = []
-    for kf in keyframes:
-        if kf.confidence:
-            kf_confs.append((kf.frame_index, kf.confidence.overall))
-    if not kf_confs:
-        # Fall back to evenly spaced frames from high-confidence regions
-        overall = confidence_to_array(confidences) if confidences else np.zeros(0)
-        if len(overall) > 0:
-            top_frames = np.argsort(overall)[-max_thumbnails:]
-            kf_confs = [(int(f), float(overall[f])) for f in top_frames]
-        else:
-            return []
-
-    kf_confs.sort(key=lambda x: x[1], reverse=True)
-    selected = kf_confs[:max_thumbnails]
-
-    thumbnails = []
-    cap = cv2.VideoCapture(video_path)
-    tw, th = target_size
-
-    for frame_idx, _ in selected:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-        ret, frame = cap.read()
-        if not ret or frame_idx >= len(bboxes):
-            continue
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        bbox = bboxes[frame_idx]
-        x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
-
-        # Add padding
-        bw, bh = x2 - x1, y2 - y1
-        pad_x = int(bw * padding_ratio)
-        pad_y = int(bh * padding_ratio)
-        x1 = max(0, x1 - pad_x)
-        y1 = max(0, y1 - pad_y)
-        x2 = min(frame_rgb.shape[1], x2 + pad_x)
-        y2 = min(frame_rgb.shape[0], y2 + pad_y)
-
-        crop = frame_rgb[y1:y2, x1:x2]
-        if crop.size == 0:
-            continue
-        crop = cv2.resize(crop, (tw, th))
-        thumbnails.append((frame_idx, crop))
-
-    cap.release()
-    thumbnails.sort(key=lambda x: x[0])
-    return thumbnails
-
-
-def _build_gallery_items(session_id: str, selected_person: int) -> list[tuple[np.ndarray, str]]:
-    """Build gallery items. Selected person's thumbnails first (highlighted in caption).
-    Then other persons' thumbnails for reference.
-    """
-    sd = _SESSION_DATA.get(session_id, {})
-    all_thumbs = sd.get("thumbnails", {})
-    identity_tracks = sd.get("identity_tracks", [])
-    items = []
-
-    # Selected person first
-    thumbs = all_thumbs.get(selected_person, [])
-    for frame_idx, img in thumbs:
-        items.append((img, f">> Person {selected_person} (f{frame_idx})"))
-
-    # Other persons
-    for track in identity_tracks:
-        pid = track.person_id
-        if pid == selected_person:
-            continue
-        other_thumbs = all_thumbs.get(pid, [])
-        for frame_idx, img in other_thumbs[:2]:  # limit to 2 per other person
-            items.append((img, f"Person {pid} (f{frame_idx})"))
-
-    return items
 
 
 # ── Public API ──
@@ -711,31 +439,7 @@ def init_panel_state(
         "img_height": img_height,
         "pid_to_dir": pid_to_dir,
         "pid_to_index": pid_to_index,
-        "operation_log": [],
-        "archived_persons": {},
-        "thumbnails": {},
-        "review_issues": [],
-        "review_index": -1,
     }
-
-    # Extract thumbnails for gallery (Phase 2)
-    sd = _SESSION_DATA[session_id]
-    for id_track in identity_tracks:
-        pid = id_track.person_id
-        bboxes = all_bboxes.get(pid)
-        confs = all_confidences.get(pid, [])
-        if bboxes is not None:
-            try:
-                thumbs = _extract_thumbnails(video_path, bboxes, id_track.keyframes, confs)
-                sd["thumbnails"][pid] = thumbs
-            except Exception:
-                sd["thumbnails"][pid] = []
-
-    # Compute review issues (Phase 1)
-    try:
-        sd["review_issues"] = compute_review_issues(session_id)
-    except Exception:
-        sd["review_issues"] = []
 
     # Load per-person SMPL params and correction tracks for pose correction
     smplx_params = {}
@@ -863,10 +567,7 @@ def update_frame_display(frame_idx, state):
     overall_array = confidence_to_array(all_confs) if all_confs else np.zeros(num_frames)
     track = _get_identity_track(session_id, selected_person)
     kf_frames = [kf.frame_index for kf in track.keyframes] if track else []
-    # Filter issues for selected person
-    all_issues = sd.get("review_issues", [])
-    person_issues = [i for i in all_issues if i.get("person_id") == selected_person]
-    fig = _render_confidence_plot(overall_array, frame_idx, kf_frames, num_frames, issues=person_issues)
+    fig = _render_confidence_plot(overall_array, frame_idx, kf_frames, num_frames)
 
     # Keyframe DataFrame
     kf_data = _keyframe_dataframe(session_id, selected_person)
@@ -887,9 +588,9 @@ def update_frame_display(frame_idx, state):
 
 
 def on_person_change(person_str, frame_idx, state):
-    """Callback when person dropdown changes. Returns state + display_outputs + gallery."""
+    """Callback when person dropdown changes."""
     if not person_str or state is None:
-        return state, *update_frame_display(frame_idx, state), []
+        return state, *update_frame_display(frame_idx, state)
 
     # Parse "Person N" -> N
     try:
@@ -898,9 +599,7 @@ def on_person_change(person_str, frame_idx, state):
         pid = 0
 
     state["selected_person"] = pid
-    session_id = state.get("session_id", "")
-    gallery = _build_gallery_items(session_id, pid)
-    return (state, *update_frame_display(frame_idx, state), gallery)
+    return (state, *update_frame_display(frame_idx, state))
 
 
 def on_verify(frame_idx, state):
@@ -1046,18 +745,6 @@ def on_swap_ids(frame_idx, person_a_str, person_b_str, state):
             timestamp=frame_idx / sd.get("fps", 30.0),
             metadata={"swap_with": pid_b if pid == pid_a else pid_a},
         )
-
-    # Re-establish identity betas for both tracks (Phase 4.1)
-    track_a.establish_identity()
-    track_b.establish_identity()
-
-    # Log swap for undo (Phase 4.1)
-    sd.setdefault("operation_log", []).append({
-        "operation": "swap",
-        "frame": frame_idx,
-        "pid_a": pid_a,
-        "pid_b": pid_b,
-    })
 
     # Mark both persons as dirty — SMPL params need reprocessing to match swapped bboxes
     sd.setdefault("dirty_persons", set()).update({pid_a, pid_b})
@@ -1339,407 +1026,6 @@ def on_apply_keyframes(state):
     return status, state, gr.update(value=_reprocess_btn_label(session_id))
 
 
-# ── Phase 1 Callbacks: Confidence-Guided Review ──
-
-
-def on_refresh_issues(state):
-    """Rescan all persons for identity problems."""
-    if state is None:
-        return "No session"
-    session_id = state.get("session_id", "")
-    sd = _SESSION_DATA.get(session_id)
-    if sd is None:
-        return "No session data"
-
-    issues = compute_review_issues(session_id)
-    sd["review_issues"] = issues
-    sd["review_index"] = -1
-
-    if not issues:
-        return "No issues found"
-
-    # Summarize by type
-    counts: dict[str, int] = {}
-    for iss in issues:
-        counts[iss["type"]] = counts.get(iss["type"], 0) + 1
-    parts = []
-    for t, c in counts.items():
-        label = t.replace("_", " ")
-        parts.append(f"{c} {label}")
-    return f"{len(issues)} issues: {', '.join(parts)}"
-
-
-def on_next_issue(frame_idx, state):
-    """Navigate to next review issue."""
-    if state is None:
-        return int(frame_idx), "No session", gr.update()
-    session_id = state.get("session_id", "")
-    sd = _SESSION_DATA.get(session_id)
-    if sd is None:
-        return int(frame_idx), "No session data", gr.update()
-
-    issues = sd.get("review_issues", [])
-    if not issues:
-        return int(frame_idx), "No issues — run Scan first", gr.update()
-
-    idx = sd.get("review_index", -1) + 1
-    if idx >= len(issues):
-        idx = 0
-    sd["review_index"] = idx
-
-    issue = issues[idx]
-    state["selected_person"] = issue["person_id"]
-    choices = _person_choices(session_id)
-    person_str = f"Person {issue['person_id']}"
-
-    summary = f"Issue {idx + 1}/{len(issues)}: {issue['description']}"
-    return (
-        issue["frame"],
-        summary,
-        gr.update(value=person_str if person_str in choices else choices[0] if choices else None),
-    )
-
-
-def on_prev_issue(frame_idx, state):
-    """Navigate to previous review issue."""
-    if state is None:
-        return int(frame_idx), "No session", gr.update()
-    session_id = state.get("session_id", "")
-    sd = _SESSION_DATA.get(session_id)
-    if sd is None:
-        return int(frame_idx), "No session data", gr.update()
-
-    issues = sd.get("review_issues", [])
-    if not issues:
-        return int(frame_idx), "No issues — run Scan first", gr.update()
-
-    idx = sd.get("review_index", 0) - 1
-    if idx < 0:
-        idx = len(issues) - 1
-    sd["review_index"] = idx
-
-    issue = issues[idx]
-    state["selected_person"] = issue["person_id"]
-    choices = _person_choices(session_id)
-    person_str = f"Person {issue['person_id']}"
-
-    summary = f"Issue {idx + 1}/{len(issues)}: {issue['description']}"
-    return (
-        issue["frame"],
-        summary,
-        gr.update(value=person_str if person_str in choices else choices[0] if choices else None),
-    )
-
-
-# ── Phase 3 Callbacks: Track Merge ──
-
-
-def on_merge_tracks(person_a_str, merge_target_str, state, progress=gr.Progress()):
-    """Merge merge_target into selected person (primary)."""
-    empty_display = update_frame_display(0, state)
-
-    if state is None or not merge_target_str:
-        return (state, "Select a merge target", gr.update(), gr.update(), gr.update(),
-                gr.update(), gr.update(), gr.update(), *empty_display)
-
-    session_id = state.get("session_id", "")
-    sd = _SESSION_DATA.get(session_id)
-    if sd is None:
-        return (state, "No session data", gr.update(), gr.update(), gr.update(),
-                gr.update(), gr.update(), gr.update(), *empty_display)
-
-    try:
-        pid_a = int(person_a_str.split()[-1])
-        pid_b = int(merge_target_str.split()[-1])
-    except (ValueError, IndexError):
-        return (state, "Invalid person selection", gr.update(), gr.update(), gr.update(),
-                gr.update(), gr.update(), gr.update(), *empty_display)
-
-    if pid_a == pid_b:
-        return (state, "Cannot merge person with itself", gr.update(), gr.update(),
-                gr.update(), gr.update(), gr.update(), gr.update(), *empty_display)
-
-    pid_to_index = sd.get("pid_to_index", {})
-    idx_a = pid_to_index.get(pid_a)
-    idx_b = pid_to_index.get(pid_b)
-    if idx_a is None or idx_b is None:
-        return (state, "Person not found", gr.update(), gr.update(), gr.update(),
-                gr.update(), gr.update(), gr.update(), *empty_display)
-
-    from multi_person_split import merge_persons
-
-    progress(0.1, desc=f"Merging Person {pid_b} into Person {pid_a}...")
-
-    try:
-        merge_record = merge_persons(
-            video_path=sd["video_path"],
-            primary_index=idx_a,
-            secondary_index=idx_b,
-            person_dirs=sd["person_dirs"],
-            all_tracks=sd["all_tracks"],
-            slam_path=str(Path(sd["output_dir"]) / "shared_slam.pt"),
-            masks_dir=str(Path(sd["output_dir"]) / "masks"),
-            output_dir=sd["output_dir"],
-            static_cam=sd.get("pipeline_params", {}).get("static_cam", False),
-            use_dpvo=sd.get("pipeline_params", {}).get("use_dpvo", False),
-            progress_callback=lambda f, m: progress(0.1 + f * 0.8, desc=m),
-        )
-    except Exception as e:
-        return (state, f"Merge failed: {e}", gr.update(), gr.update(), gr.update(),
-                gr.update(), gr.update(), gr.update(), *empty_display)
-
-    # Update session data: remove secondary
-    # Remove secondary from identity_tracks
-    sd["identity_tracks"] = [t for t in sd["identity_tracks"] if t.person_id != pid_b]
-
-    # Update primary's identity track and confidences
-    if merge_record.get("merged_identity_track"):
-        for i, t in enumerate(sd["identity_tracks"]):
-            if t.person_id == pid_a:
-                sd["identity_tracks"][i] = merge_record["merged_identity_track"]
-                break
-    if merge_record.get("merged_confidences"):
-        sd["confidences"][pid_a] = merge_record["merged_confidences"]
-
-    # Remove secondary from all data
-    sd["all_bboxes"].pop(pid_b, None)
-    sd["original_bboxes"].pop(pid_b, None)
-    sd["confidences"].pop(pid_b, None)
-    sd["thumbnails"].pop(pid_b, None)
-    sd["pid_to_dir"].pop(pid_b, None)
-    sd["pid_to_index"].pop(pid_b, None)
-
-    # Rebuild pid_to_index (indices may have shifted)
-    for i, track in enumerate(sd["all_tracks"]):
-        pid = track.get("track_id", i)
-        sd["pid_to_index"][pid] = i
-
-    # Log for undo
-    sd["operation_log"].append(merge_record)
-
-    # Re-extract thumbnails for merged person
-    bboxes = sd["all_bboxes"].get(pid_a)
-    confs = sd["confidences"].get(pid_a, [])
-    merged_track = _get_identity_track(session_id, pid_a)
-    if bboxes is not None and merged_track:
-        try:
-            sd["thumbnails"][pid_a] = _extract_thumbnails(
-                sd["video_path"], bboxes, merged_track.keyframes, confs,
-            )
-        except Exception:
-            pass
-
-    # Rescan issues
-    try:
-        sd["review_issues"] = compute_review_issues(session_id)
-        sd["review_index"] = -1
-    except Exception:
-        pass
-
-    progress(1.0, desc="Merge complete")
-
-    # Update UI
-    choices = _person_choices(session_id)
-    frame_idx = state.get("current_frame", 0)
-    gallery = _build_gallery_items(session_id, pid_a)
-    issue_summary = f"{len(sd.get('review_issues', []))} issues" if sd.get("review_issues") else "No issues"
-
-    display = update_frame_display(frame_idx, state)
-    return (
-        state,
-        f"Merged Person {pid_b} into Person {pid_a}",
-        gr.update(value=_reprocess_btn_label(session_id)),
-        gr.update(choices=choices, value=f"Person {pid_a}" if f"Person {pid_a}" in choices else None),
-        gr.update(choices=choices),
-        gr.update(choices=choices),
-        gallery,
-        issue_summary,
-        *display,
-    )
-
-
-def on_undo_last(state):
-    """Single-level undo. Handles merge and swap operations."""
-    if state is None:
-        return state, "No session"
-
-    session_id = state.get("session_id", "")
-    sd = _SESSION_DATA.get(session_id)
-    if sd is None:
-        return state, "No session data"
-
-    log = sd.get("operation_log", [])
-    if not log:
-        return state, "Nothing to undo"
-
-    record = log.pop()
-    op_type = record.get("operation")
-
-    if op_type == "swap":
-        # Swap is its own inverse — just re-run the swap at the same frame
-        pid_a = record["pid_a"]
-        pid_b = record["pid_b"]
-        frame = record["frame"]
-        on_swap_ids(frame, f"Person {pid_a}", f"Person {pid_b}", state)
-        # Remove the new swap entry from the log (undo shouldn't stack)
-        if sd["operation_log"] and sd["operation_log"][-1].get("operation") == "swap":
-            sd["operation_log"].pop()
-        return state, f"Undid swap of Person {pid_a} and Person {pid_b}"
-
-    elif op_type == "merge":
-        # Restore archived secondary dir
-        import shutil
-        archived_dir = record.get("archived_dir")
-        secondary_index = record.get("secondary_index")
-        primary_index = record.get("primary_index")
-        secondary_tid = record.get("secondary_track_id")
-
-        if archived_dir and Path(archived_dir).exists():
-            # Restore secondary dir
-            original_dir = archived_dir.replace(".archived", "")
-            if not Path(original_dir).exists():
-                Path(archived_dir).rename(original_dir)
-
-        # Restore primary bboxes
-        primary_bboxes = record.get("primary_original_bboxes")
-        all_tracks = sd.get("all_tracks", [])
-        if primary_bboxes is not None and primary_index < len(all_tracks):
-            import torch
-            all_tracks[primary_index]["bbx_xyxy"] = torch.from_numpy(primary_bboxes)
-
-        return state, f"Undid merge (Person {secondary_tid} restored). Re-run pipeline to complete."
-
-    return state, f"Unknown operation type: {op_type}"
-
-
-# ── Phase 5 Callbacks: Track Split ──
-
-
-def on_split_track(frame_idx, state, progress=gr.Progress()):
-    """Split selected person at current frame into two tracks."""
-    empty_display = update_frame_display(0, state)
-
-    if state is None:
-        return (state, "No session", gr.update(), gr.update(), gr.update(),
-                gr.update(), gr.update(), gr.update(), *empty_display)
-
-    session_id = state.get("session_id", "")
-    sd = _SESSION_DATA.get(session_id)
-    if sd is None:
-        return (state, "No session data", gr.update(), gr.update(), gr.update(),
-                gr.update(), gr.update(), gr.update(), *empty_display)
-
-    pid = state.get("selected_person", 0)
-    frame_idx = int(frame_idx)
-    pid_to_index = sd.get("pid_to_index", {})
-    idx = pid_to_index.get(pid)
-    if idx is None:
-        return (state, "Person not found", gr.update(), gr.update(), gr.update(),
-                gr.update(), gr.update(), gr.update(), *empty_display)
-
-    from multi_person_split import split_person
-
-    progress(0.1, desc=f"Splitting Person {pid} at frame {frame_idx}...")
-
-    try:
-        split_record = split_person(
-            video_path=sd["video_path"],
-            person_index=idx,
-            split_frame=frame_idx,
-            person_dirs=sd["person_dirs"],
-            all_tracks=sd["all_tracks"],
-            slam_path=str(Path(sd["output_dir"]) / "shared_slam.pt"),
-            masks_dir=str(Path(sd["output_dir"]) / "masks"),
-            output_dir=sd["output_dir"],
-            static_cam=sd.get("pipeline_params", {}).get("static_cam", False),
-            use_dpvo=sd.get("pipeline_params", {}).get("use_dpvo", False),
-            progress_callback=lambda f, m: progress(0.1 + f * 0.8, desc=m),
-        )
-    except Exception as e:
-        return (state, f"Split failed: {e}", gr.update(), gr.update(), gr.update(),
-                gr.update(), gr.update(), gr.update(), *empty_display)
-
-    new_pid = split_record["new_person_id"]
-    new_dir = split_record["new_person_dir"]
-
-    # Add new person to session data
-    sd["person_dirs"].append(new_dir)
-    new_track = sd["all_tracks"][-1]  # split_person appended it
-    sd["pid_to_dir"][new_pid] = new_dir
-    sd["pid_to_index"][new_pid] = len(sd["all_tracks"]) - 1
-
-    # Create identity track for new person
-    new_bboxes = new_track["bbx_xyxy"]
-    if hasattr(new_bboxes, "numpy"):
-        new_bboxes = new_bboxes.numpy()
-    sd["all_bboxes"][new_pid] = new_bboxes
-    sd["original_bboxes"][new_pid] = new_bboxes.copy()
-
-    # Update original person's bboxes
-    orig_track = sd["all_tracks"][idx]
-    orig_bboxes = orig_track["bbx_xyxy"]
-    if hasattr(orig_bboxes, "numpy"):
-        orig_bboxes = orig_bboxes.numpy()
-    sd["all_bboxes"][pid] = orig_bboxes
-    sd["original_bboxes"][pid] = orig_bboxes.copy()
-
-    # Create identity tracks for both
-    result_a = split_record.get("result_a", {})
-    result_b = split_record.get("result_b", {})
-
-    if result_a.get("identity_track"):
-        for i, t in enumerate(sd["identity_tracks"]):
-            if t.person_id == pid:
-                sd["identity_tracks"][i] = result_a["identity_track"]
-                break
-    if result_a.get("confidences"):
-        sd["confidences"][pid] = result_a["confidences"]
-
-    new_id_track = result_b.get("identity_track", IdentityTrack(person_id=new_pid))
-    sd["identity_tracks"].append(new_id_track)
-    if result_b.get("confidences"):
-        sd["confidences"][new_pid] = result_b["confidences"]
-
-    # Extract thumbnails for both
-    for p in [pid, new_pid]:
-        bx = sd["all_bboxes"].get(p)
-        co = sd["confidences"].get(p, [])
-        tr = _get_identity_track(session_id, p)
-        if bx is not None and tr:
-            try:
-                sd["thumbnails"][p] = _extract_thumbnails(sd["video_path"], bx, tr.keyframes, co)
-            except Exception:
-                pass
-
-    sd["operation_log"].append(split_record)
-
-    # Rescan issues
-    try:
-        sd["review_issues"] = compute_review_issues(session_id)
-        sd["review_index"] = -1
-    except Exception:
-        pass
-
-    progress(1.0, desc="Split complete")
-
-    choices = _person_choices(session_id)
-    gallery = _build_gallery_items(session_id, pid)
-    issue_summary = f"{len(sd.get('review_issues', []))} issues" if sd.get("review_issues") else "No issues"
-    display = update_frame_display(frame_idx, state)
-
-    return (
-        state,
-        f"Split Person {pid} at frame {frame_idx} — new Person {new_pid}",
-        gr.update(value=_reprocess_btn_label(session_id)),
-        gr.update(choices=choices, value=f"Person {pid}"),
-        gr.update(choices=choices),
-        gr.update(choices=choices),
-        gallery,
-        issue_summary,
-        *display,
-    )
-
-
 def on_reprocess_all_dirty(state, progress=gr.Progress(track_tqdm=False),
                            regenerate_preview: bool = False):
     """Reprocess all persons with pending bbox edits."""
@@ -1938,27 +1224,6 @@ def build_identity_panel(scene_preview_video=None) -> dict[str, Any]:
             visible=True,
         )
 
-    # Phase 3: Merge / Undo / Split row
-    with gr.Row():
-        merge_target = gr.Dropdown(
-            label="Merge into selected", choices=[], interactive=True, scale=1,
-        )
-        merge_btn = gr.Button("Merge Tracks", size="sm", scale=0, min_width=120,
-                              variant="secondary")
-        split_btn = gr.Button("Split Here", size="sm", scale=0, min_width=100)
-        undo_btn = gr.Button("Undo Last", size="sm", scale=0, min_width=100)
-        merge_status = gr.Textbox(label="", value="", interactive=False, scale=2)
-
-    # Phase 2: Gallery
-    reid_gallery = gr.Gallery(
-        label="Person Reference",
-        columns=6,
-        rows=1,
-        height=160,
-        object_fit="contain",
-        show_label=True,
-    )
-
     # CSS to prevent native browser image drag (otherwise misclicks
     # drag a thumbnail of the video frame around instead of editing)
     gr.HTML(
@@ -2006,16 +1271,6 @@ def build_identity_panel(scene_preview_video=None) -> dict[str, Any]:
     )
 
     confidence_plot = gr.Plot(label="Confidence Timeline")
-
-    # Phase 1: Review navigation row
-    with gr.Row():
-        review_summary = gr.Textbox(
-            label="Issues", value="Run Scan to detect problems",
-            interactive=False, scale=2,
-        )
-        prev_issue_btn = gr.Button("< Prev Issue", size="sm", scale=0, min_width=110)
-        next_issue_btn = gr.Button("Next Issue >", size="sm", scale=0, min_width=110)
-        refresh_issues_btn = gr.Button("Scan", size="sm", scale=0, min_width=70)
 
     # Keyframes + confidence breakdown side by side
     with gr.Row():
@@ -2077,11 +1332,11 @@ def build_identity_panel(scene_preview_video=None) -> dict[str, Any]:
         outputs=display_outputs,
     )
 
-    # Person dropdown → update display + gallery
+    # Person dropdown → update display
     person_dropdown.change(
         fn=on_person_change,
         inputs=[person_dropdown, frame_slider, panel_state],
-        outputs=[panel_state] + display_outputs + [reid_gallery],
+        outputs=[panel_state] + display_outputs,
     )
 
     # Transport buttons → update slider (which triggers display update)
@@ -2158,53 +1413,6 @@ def build_identity_panel(scene_preview_video=None) -> dict[str, Any]:
         outputs=[bbox_edit_status, panel_state, reprocess_btn],
     )
 
-    # Phase 1: Review navigation callbacks
-    refresh_issues_btn.click(
-        fn=on_refresh_issues,
-        inputs=[panel_state],
-        outputs=[review_summary],
-    )
-    next_issue_btn.click(
-        fn=on_next_issue,
-        inputs=[frame_slider, panel_state],
-        outputs=[frame_slider, review_summary, person_dropdown],
-    )
-    prev_issue_btn.click(
-        fn=on_prev_issue,
-        inputs=[frame_slider, panel_state],
-        outputs=[frame_slider, review_summary, person_dropdown],
-    )
-
-    # Phase 2: Gallery updates on person change (piggyback via existing callback)
-    # Gallery is updated separately via merge/split/reprocess outputs
-
-    # Phase 3: Merge callbacks
-    _merge_split_outputs = [
-        panel_state, merge_status, reprocess_btn,
-        person_dropdown, swap_target, merge_target,
-        reid_gallery, review_summary,
-    ] + display_outputs
-
-    merge_btn.click(
-        fn=on_merge_tracks,
-        inputs=[person_dropdown, merge_target, panel_state],
-        outputs=_merge_split_outputs,
-    )
-
-    # Phase 3: Undo callback
-    undo_btn.click(
-        fn=on_undo_last,
-        inputs=[panel_state],
-        outputs=[panel_state, merge_status],
-    )
-
-    # Phase 5: Split callback
-    split_btn.click(
-        fn=on_split_track,
-        inputs=[frame_slider, panel_state],
-        outputs=_merge_split_outputs,
-    )
-
     _reprocess_outputs = [panel_state, reprocess_status, reprocess_btn]
     if scene_preview_video is not None:
         _reprocess_outputs.append(scene_preview_video)
@@ -2237,13 +1445,6 @@ def build_identity_panel(scene_preview_video=None) -> dict[str, Any]:
         "conf_motion": conf_motion,
         "conf_overall": conf_overall,
         "pose_panel": pose_panel,
-        # Phase 1: Review
-        "review_summary": review_summary,
-        # Phase 2: Gallery
-        "reid_gallery": reid_gallery,
-        # Phase 3: Merge / Split / Undo
-        "merge_target": merge_target,
-        "merge_status": merge_status,
     }
 
 
@@ -2253,34 +1454,18 @@ def populate_panel(
     """Generate initial values for panel components after init_panel_state.
 
     Returns tuple of Gradio updates for:
-    (state, person_dropdown, swap_target, frame_slider, frame_label,
-     + 9 display_outputs, review_summary, reid_gallery, merge_target)
+    (state, person_dropdown, swap_target, frame_slider, frame_label, + display_outputs)
     """
     if state_dict is None:
-        return (None,) * 17
+        return (None,) * 14
 
     session_id = state_dict.get("session_id", "")
     sd = _SESSION_DATA.get(session_id, {})
     num_frames = sd.get("num_frames", 1)
     choices = _person_choices(session_id)
-    selected_pid = state_dict.get("selected_person", 0)
 
     # Initial display at frame 0
     display = update_frame_display(0, state_dict)
-
-    # Review summary (Phase 1)
-    issues = sd.get("review_issues", [])
-    if issues:
-        counts: dict[str, int] = {}
-        for iss in issues:
-            counts[iss["type"]] = counts.get(iss["type"], 0) + 1
-        parts = [f"{c} {t.replace('_', ' ')}" for t, c in counts.items()]
-        review_text = f"{len(issues)} issues: {', '.join(parts)}"
-    else:
-        review_text = "No issues found"
-
-    # Gallery (Phase 2)
-    gallery = _build_gallery_items(session_id, selected_pid)
 
     return (
         state_dict,                                     # state
@@ -2289,7 +1474,4 @@ def populate_panel(
         gr.update(maximum=max(num_frames - 1, 1), value=0),  # frame_slider
         f"Frame 0/{num_frames - 1}" if num_frames > 0 else "Frame 0/0",  # frame_label
         *display,                                       # 9 display outputs
-        review_text,                                    # review_summary
-        gallery,                                        # reid_gallery
-        gr.update(choices=choices),                     # merge_target
     )
