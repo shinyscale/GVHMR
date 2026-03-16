@@ -1398,6 +1398,10 @@ with gr.Blocks(
                     id_panel["conf_motion"], id_panel["conf_overall"],
                     id_panel["confidence_plot"],
                     id_panel["kf_dataframe"],
+                    # Phase 1-3 new outputs:
+                    id_panel["review_summary"],
+                    id_panel["reid_gallery"],
+                    id_panel["merge_target"],
                 ],
             )
 
