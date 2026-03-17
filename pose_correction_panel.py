@@ -85,6 +85,41 @@ def _extract_frame_cached(video_path: str, frame_idx: int, session_id: str) -> n
     return _extract_frame(video_path, frame_idx, session_id)
 
 
+def _pc_person_choices(session_id: str) -> list[str]:
+    """Return person dropdown choices from the pose session."""
+    sd = _POSE_SESSION.get(session_id)
+    if sd is None:
+        return []
+    return [f"ID {pid}" for pid in sorted(sd["smplx_params"].keys())]
+
+
+def get_pc_person_choices_update(state: dict | None) -> "gr.update":
+    """Return a gr.update for pc_person_dropdown after session load."""
+    if state is None:
+        return gr.update()
+    session_id = state.get("session_id", "")
+    choices = _pc_person_choices(session_id)
+    selected = state.get("selected_person", 0)
+    value = f"ID {selected}" if f"ID {selected}" in choices else (choices[0] if choices else None)
+    return gr.update(choices=choices, value=value)
+
+
+def _camera_space_params(params: dict) -> dict:
+    """Remap camera-space arrays to default keys for rendering/editing.
+
+    GVHMR params store world-space in default keys and camera-space
+    in suffixed keys. The pose corrector works in camera space (what
+    the user sees on the video), so we swap before FK + projection.
+    """
+    if "global_orient_cam" not in params:
+        return params
+    p = dict(params)
+    p["global_orient"] = params["global_orient_cam"]
+    p["body_pose"] = params["body_pose_cam"]
+    p["transl"] = params["transl_cam"]
+    return p
+
+
 # ── Core rendering callback ──
 
 
@@ -105,6 +140,8 @@ def _render_skeleton_preview(
     params = sd["smplx_params"].get(person_id)
     if params is None:
         return None, None
+
+    params = _camera_space_params(params)
 
     video_path = sd["video_path"]
     frame = _extract_frame_cached(video_path, frame_idx, session_id)
@@ -137,6 +174,8 @@ def _get_joint_euler(
     params = sd["smplx_params"].get(person_id)
     if params is None:
         return 0.0, 0.0, 0.0
+
+    params = _camera_space_params(params)
 
     ct = sd["correction_tracks"].get(person_id)
     if ct is not None:
@@ -196,6 +235,20 @@ def _corrections_dataframe(session_id: str, person_id: int) -> list[list]:
 
 
 # ── Gradio Callbacks ──
+
+
+def on_pc_person_change(person_str, frame_idx, state):
+    """Handle person selection within pose corrector."""
+    if state is None or not person_str:
+        return state, None, [], 0.0, 0.0, 0.0
+    try:
+        pid = int(person_str.split()[-1])
+    except (ValueError, IndexError):
+        return state, None, [], 0.0, 0.0, 0.0
+    state = dict(state)
+    state["selected_person"] = pid
+    img, df_data, ex, ey, ez = on_pose_frame_change(frame_idx, state)
+    return state, img, df_data, ex, ey, ez
 
 
 def on_skeleton_click(evt: gr.SelectData, frame_idx, state):
@@ -409,6 +462,7 @@ def on_flip_whole_body(frame_idx, state):
     if params is None:
         return None, [], 0.0, 0.0, 0.0, state
 
+    params = _camera_space_params(params)
     new_go = flip_global_orient(params, frame_idx, axis="yaw")
 
     ct = sd["correction_tracks"].get(person_id)
@@ -451,6 +505,7 @@ def on_invert_upright(frame_idx, state):
     if params is None:
         return None, [], 0.0, 0.0, 0.0, state
 
+    params = _camera_space_params(params)
     new_go = flip_global_orient(params, frame_idx, axis="pitch")
 
     ct = sd["correction_tracks"].get(person_id)
@@ -492,6 +547,7 @@ def on_mirror_lr(frame_idx, state):
     if params is None:
         return None, [], state
 
+    params = _camera_space_params(params)
     mirrored = mirror_lr_pose(params, frame_idx)
 
     ct = sd["correction_tracks"].get(person_id)
@@ -527,6 +583,8 @@ def on_copy_from_frame(src_frame_num, frame_idx, state):
     params = sd["smplx_params"].get(person_id)
     if params is None:
         return None, [], state
+
+    params = _camera_space_params(params)
 
     try:
         src_frame = int(src_frame_num)
@@ -685,9 +743,9 @@ def on_reexport_fbx(frame_idx, state, progress=gr.Progress(track_tqdm=False)):
 
 
 def on_pose_frame_change(frame_idx, state):
-    """Update skeleton preview when frame changes."""
+    """Update skeleton preview and euler sliders when frame changes."""
     if state is None:
-        return None, []
+        return None, [], 0.0, 0.0, 0.0
 
     session_id = state.get("session_id", "")
     person_id = state.get("selected_person", 0)
@@ -696,7 +754,12 @@ def on_pose_frame_change(frame_idx, state):
 
     img, _ = _render_skeleton_preview(session_id, person_id, frame_idx, joint_idx)
     df_data = _corrections_dataframe(session_id, person_id)
-    return img, df_data
+
+    ex, ey, ez = 0.0, 0.0, 0.0
+    if joint_idx is not None:
+        ex, ey, ez = _get_joint_euler(session_id, person_id, frame_idx, joint_idx)
+
+    return img, df_data, ex, ey, ez
 
 
 def _space_overrides_dataframe(session_id: str, person_id: int) -> list[list]:
@@ -808,6 +871,22 @@ def build_pose_correction_panel(
     """
     with gr.Accordion("Pose Corrector", open=False) as pose_accordion:
 
+        # Frame navigation (local to pose corrector)
+        with gr.Row():
+            pc_person_dropdown = gr.Dropdown(
+                label="Person",
+                choices=[],
+                interactive=True,
+                scale=1,
+            )
+
+        with gr.Row():
+            pc_prev_btn = gr.Button("< Prev", size="sm", scale=0, min_width=70)
+            pc_frame_num = gr.Number(
+                label="Frame", precision=0, value=0, scale=1, min_width=80,
+            )
+            pc_next_btn = gr.Button("Next >", size="sm", scale=0, min_width=70)
+
         with gr.Row():
             # Left: Skeleton preview
             with gr.Column(scale=2):
@@ -916,6 +995,13 @@ def build_pose_correction_panel(
             corrected_fbx_file = gr.File(label="Corrected FBX", visible=True)
 
     # ── Wire callbacks ──
+
+    # Person dropdown within pose corrector
+    pc_person_dropdown.change(
+        fn=on_pc_person_change,
+        inputs=[pc_person_dropdown, frame_slider, panel_state],
+        outputs=[panel_state, skeleton_image, corrections_df, euler_x, euler_y, euler_z],
+    )
 
     # Click on skeleton image to select joint
     skeleton_image.select(
@@ -1038,15 +1124,46 @@ def build_pose_correction_panel(
         outputs=[corrected_bvh_file, corrected_fbx_file],
     )
 
-    # Update skeleton when frame slider changes
+    # Update skeleton + euler sliders when frame slider changes
     frame_slider.change(
         fn=on_pose_frame_change,
         inputs=[frame_slider, panel_state],
-        outputs=[skeleton_image, corrections_df],
+        outputs=[skeleton_image, corrections_df, euler_x, euler_y, euler_z],
+    )
+
+    # Sync shared frame_slider → local frame number display
+    frame_slider.change(
+        fn=lambda f: int(f),
+        inputs=[frame_slider],
+        outputs=[pc_frame_num],
+    )
+
+    # Local frame nav → update shared frame_slider
+    pc_prev_btn.click(
+        fn=lambda f: max(0, int(f) - 1),
+        inputs=[frame_slider],
+        outputs=[frame_slider],
+    )
+    pc_next_btn.click(
+        fn=lambda f, s: min(
+            _POSE_SESSION.get((s or {}).get("session_id", ""), {}).get("num_frames", 1) - 1,
+            int(f) + 1,
+        ),
+        inputs=[frame_slider, panel_state],
+        outputs=[frame_slider],
+    )
+    pc_frame_num.submit(
+        fn=lambda f, s: max(0, min(
+            int(f or 0),
+            _POSE_SESSION.get((s or {}).get("session_id", ""), {}).get("num_frames", 1) - 1,
+        )),
+        inputs=[pc_frame_num, panel_state],
+        outputs=[frame_slider],
     )
 
     return {
         "accordion": pose_accordion,
+        "pc_person_dropdown": pc_person_dropdown,
         "skeleton_image": skeleton_image,
         "joint_dropdown": joint_dropdown,
         "euler_x": euler_x,

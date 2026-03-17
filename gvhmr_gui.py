@@ -25,6 +25,7 @@ from bvh_to_fbx import convert_bvh_to_fbx
 from visualize_skeleton import render_skeleton_video, render_world_views, render_hand_overlay_video
 from multi_person_split import split_multi_person_video, MultiPersonResult
 from identity_panel import build_identity_panel, init_panel_state, populate_panel
+from pose_correction_panel import get_pc_person_choices_update
 
 GVHMR_DIR = Path(__file__).resolve().parent
 DEMO_SCRIPT = GVHMR_DIR / "tools" / "demo" / "demo.py"
@@ -1409,6 +1410,10 @@ with gr.Blocks(
                     id_panel["crossing_spans_df"],
                     id_panel["reid_gallery"],
                 ],
+            ).then(
+                fn=get_pc_person_choices_update,
+                inputs=[id_panel["state"]],
+                outputs=[id_panel["pose_panel"]["pc_person_dropdown"]],
             )
 
             # Restore saved params when a video path is entered

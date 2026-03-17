@@ -32,6 +32,7 @@ from pose_correction import CorrectionTrack
 from pose_correction_panel import (
     build_pose_correction_panel,
     init_pose_session,
+    on_pose_frame_change,
 )
 
 matplotlib.use("Agg")
@@ -2230,6 +2231,20 @@ def build_identity_panel(scene_preview_video=None) -> dict[str, Any]:
         fn=_refresh_gallery,
         inputs=[panel_state],
         outputs=[reid_gallery],
+    ).then(
+        fn=on_pose_frame_change,
+        inputs=[frame_slider, panel_state],
+        outputs=[
+            pose_panel["skeleton_image"],
+            pose_panel["corrections_df"],
+            pose_panel["euler_x"],
+            pose_panel["euler_y"],
+            pose_panel["euler_z"],
+        ],
+    ).then(
+        fn=lambda p: gr.update(value=p),
+        inputs=[person_dropdown],
+        outputs=[pose_panel["pc_person_dropdown"]],
     )
 
     # Transport buttons → update slider (which triggers display update)
