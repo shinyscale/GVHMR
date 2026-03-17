@@ -2174,29 +2174,41 @@ def build_identity_panel(scene_preview_video=None) -> dict[str, Any]:
         show_progress="hidden",
     )
 
-    # Play/Pause — JS in HTML, button click just toggles via DOM event
+    # Play/Pause — JS in HTML, button click toggles interval on slider
     gr.HTML("""<script>
     document.addEventListener('click', function(e) {
-        const btn = e.target.closest('#play_pause_btn');
-        if (!btn) return;
+        // Match click on the play button or anything inside it
+        const wrapper = e.target.closest('#play_pause_btn');
+        if (!wrapper) return;
+        // Find the slider range input
         const slider = document.querySelector('#frame_slider input[type=range]');
-        if (!slider) return;
+        if (!slider) {
+            console.warn('[Play] Could not find #frame_slider input[type=range]');
+            return;
+        }
+        // Find the visible button text element
+        const btnEl = wrapper.querySelector('button') || wrapper;
         if (window._playInterval) {
             clearInterval(window._playInterval);
             window._playInterval = null;
-            btn.querySelector('button').textContent = 'Play';
+            btnEl.textContent = 'Play';
         } else {
-            btn.querySelector('button').textContent = 'Pause';
+            btnEl.textContent = 'Pause';
             window._playInterval = setInterval(() => {
                 let val = parseInt(slider.value) + 1;
-                if (val > parseInt(slider.max)) {
+                let max = parseInt(slider.max);
+                if (val > max) {
                     clearInterval(window._playInterval);
                     window._playInterval = null;
-                    btn.querySelector('button').textContent = 'Play';
+                    btnEl.textContent = 'Play';
                     return;
                 }
-                slider.value = val;
+                // Set value via native setter to trigger Gradio's change detection
+                const nativeSetter = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value').set;
+                nativeSetter.call(slider, val);
                 slider.dispatchEvent(new Event('input', {bubbles: true}));
+                slider.dispatchEvent(new Event('change', {bubbles: true}));
             }, 100);
         }
     });
