@@ -118,6 +118,31 @@ def render_multi_person_incam(
         if "smpl_params_incam" not in pred:
             continue
 
+        # Apply pose corrections if they exist for this person
+        corr_path = pdir / "pose_corrections.json"
+        if corr_path.exists():
+            try:
+                from pose_correction import CorrectionTrack, apply_corrections
+                ct = CorrectionTrack.load_json(str(corr_path))
+                if ct.corrections:
+                    ic = pred["smpl_params_incam"]
+                    n = ic["body_pose"].shape[0]
+                    corr_params = {
+                        "global_orient": np.array(ic["global_orient"]).reshape(n, 3),
+                        "body_pose": np.array(ic["body_pose"]).reshape(n, 21, 3),
+                        "transl": np.array(ic["transl"]).reshape(n, 3),
+                        "num_frames": n,
+                    }
+                    corrected = apply_corrections(corr_params, ct)
+                    ic["global_orient"] = torch.from_numpy(
+                        corrected["global_orient"].reshape(n, 3)).float()
+                    ic["body_pose"] = torch.from_numpy(
+                        corrected["body_pose"].reshape(n, -1)).float()
+                    ic["transl"] = torch.from_numpy(
+                        corrected["transl"].reshape(n, 3)).float()
+            except Exception as e:
+                print(f"[scene_preview] Failed to apply corrections for person {i}: {e}")
+
         # Compute SMPL vertices in camera space
         smplx_out = smplx_model(**to_cuda(pred["smpl_params_incam"]))
         verts = torch.stack([
