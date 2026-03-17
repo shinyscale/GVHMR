@@ -1044,36 +1044,60 @@ def split_multi_person_video(
                     bridge_result = bridge.bake(body_pose, global_orient, transl, confidences)
                 bridged_frames = bridge_result["bridged_frames"]
 
-                # Save bridged params back to hmr4d_results.pt
-                if bridged_frames:
+                # Determine if we need to modify pt_data
+                verified_kfs = [kf for kf in id_track.keyframes
+                                if kf.bbox is not None and kf.verified]
+                need_position_constraints = bool(verified_kfs)
+                need_save = bool(bridged_frames) or need_position_constraints
+
+                if need_save:
                     pt_data = torch.load(str(pt_files[0]), map_location="cpu", weights_only=False)
-                    g = pt_data["smpl_params_global"]
 
-                    bridged_bp = bridge_result["body_pose"]     # (N, 21, 3)
-                    bridged_go = bridge_result["global_orient"]  # (N, 3)
-                    bridged_tr = bridge_result["transl"]         # (N, 3)
+                    if bridged_frames:
+                        g = pt_data["smpl_params_global"]
 
-                    g["body_pose"] = torch.from_numpy(bridged_bp.reshape(num_person_frames, -1)).float()
-                    g["global_orient"] = torch.from_numpy(bridged_go.reshape(num_person_frames, -1)).float()
-                    g["transl"] = torch.from_numpy(bridged_tr).float()
+                        bridged_bp = bridge_result["body_pose"]     # (N, 21, 3)
+                        bridged_go = bridge_result["global_orient"]  # (N, 3)
+                        bridged_tr = bridge_result["transl"]         # (N, 3)
 
-                    # Also bridge smpl_params_incam so scene preview shows corrected poses
-                    if crossing_spans and "smpl_params_incam" in pt_data:
-                        ic = pt_data["smpl_params_incam"]
-                        ic_bp = np.array(ic["body_pose"]).reshape(num_person_frames, -1, 3)
-                        ic_go = np.array(ic["global_orient"]).reshape(num_person_frames, 3)
-                        ic_tr = np.array(ic["transl"]).reshape(num_person_frames, 3)
-                        ic_result = bridge.bridge_with_spans(ic_bp, ic_go, ic_tr, crossing_spans)
-                        ic["body_pose"] = torch.from_numpy(
-                            ic_result["body_pose"].reshape(num_person_frames, -1)).float()
-                        ic["global_orient"] = torch.from_numpy(
-                            ic_result["global_orient"].reshape(num_person_frames, -1)).float()
-                        ic["transl"] = torch.from_numpy(ic_result["transl"]).float()
+                        g["body_pose"] = torch.from_numpy(bridged_bp.reshape(num_person_frames, -1)).float()
+                        g["global_orient"] = torch.from_numpy(bridged_go.reshape(num_person_frames, -1)).float()
+                        g["transl"] = torch.from_numpy(bridged_tr).float()
+
+                        # Also bridge smpl_params_incam so scene preview shows corrected poses
+                        if crossing_spans and "smpl_params_incam" in pt_data:
+                            ic = pt_data["smpl_params_incam"]
+                            ic_bp = np.array(ic["body_pose"]).reshape(num_person_frames, -1, 3)
+                            ic_go = np.array(ic["global_orient"]).reshape(num_person_frames, 3)
+                            ic_tr = np.array(ic["transl"]).reshape(num_person_frames, 3)
+                            ic_result = bridge.bridge_with_spans(ic_bp, ic_go, ic_tr, crossing_spans)
+                            ic["body_pose"] = torch.from_numpy(
+                                ic_result["body_pose"].reshape(num_person_frames, -1)).float()
+                            ic["global_orient"] = torch.from_numpy(
+                                ic_result["global_orient"].reshape(num_person_frames, -1)).float()
+                            ic["transl"] = torch.from_numpy(ic_result["transl"]).float()
+
+                    # Apply identity keyframe position constraints
+                    if need_position_constraints:
+                        from world_assembly import apply_identity_position_constraints
+                        K_fullimg = pt_data.get("K_fullimg")
+                        if K_fullimg is not None:
+                            K_np = np.array(K_fullimg[0])
+                        else:
+                            _, w, h = get_video_lwh(video_path)
+                            K_np = estimate_K(w, h).numpy()
+                        apply_identity_position_constraints(
+                            pt_data, verified_kfs, K_np, num_person_frames)
 
                     torch.save(pt_data, str(pt_files[0]))
 
+                    parts = []
+                    if bridged_frames:
+                        parts.append(f"{len(bridged_frames)} frames bridged")
+                    if need_position_constraints:
+                        parts.append(f"{len(verified_kfs)} position constraints applied")
                     _progress(0.82 + i / max(len(person_dirs), 1) * 0.03,
-                              f"Person {i}: {len(bridged_frames)} frames bridged and saved")
+                              f"Person {i}: {', '.join(parts)}, saved")
 
                 summary = summarize_bridging(confidences, bridged_frames)
                 bridging_summaries.append(summary)
@@ -1449,27 +1473,46 @@ def reprocess_person(
                 bridge_result = bridge.bake(body_pose, global_orient, transl, confidences)
             bridged_frames = bridge_result["bridged_frames"]
 
-            # Save bridged params back to .pt
-            if bridged_frames:
-                pt_data = torch.load(pt_path, map_location="cpu", weights_only=False)
-                g = pt_data["smpl_params_global"]
-                g["body_pose"] = torch.from_numpy(
-                    bridge_result["body_pose"].reshape(num_person_frames, -1)).float()
-                g["global_orient"] = torch.from_numpy(
-                    bridge_result["global_orient"].reshape(num_person_frames, -1)).float()
-                g["transl"] = torch.from_numpy(bridge_result["transl"]).float()
+            # Determine if we need to modify pt_data
+            verified_kfs = [kf for kf in id_track.keyframes
+                            if kf.bbox is not None and kf.verified]
+            need_position_constraints = bool(verified_kfs)
+            need_save = bool(bridged_frames) or need_position_constraints
 
-                if crossing_spans and "smpl_params_incam" in pt_data:
-                    ic = pt_data["smpl_params_incam"]
-                    ic_bp = np.array(ic["body_pose"]).reshape(num_person_frames, -1, 3)
-                    ic_go = np.array(ic["global_orient"]).reshape(num_person_frames, 3)
-                    ic_tr = np.array(ic["transl"]).reshape(num_person_frames, 3)
-                    ic_result = bridge.bridge_with_spans(ic_bp, ic_go, ic_tr, crossing_spans)
-                    ic["body_pose"] = torch.from_numpy(
-                        ic_result["body_pose"].reshape(num_person_frames, -1)).float()
-                    ic["global_orient"] = torch.from_numpy(
-                        ic_result["global_orient"].reshape(num_person_frames, -1)).float()
-                    ic["transl"] = torch.from_numpy(ic_result["transl"]).float()
+            if need_save:
+                pt_data = torch.load(pt_path, map_location="cpu", weights_only=False)
+
+                if bridged_frames:
+                    g = pt_data["smpl_params_global"]
+                    g["body_pose"] = torch.from_numpy(
+                        bridge_result["body_pose"].reshape(num_person_frames, -1)).float()
+                    g["global_orient"] = torch.from_numpy(
+                        bridge_result["global_orient"].reshape(num_person_frames, -1)).float()
+                    g["transl"] = torch.from_numpy(bridge_result["transl"]).float()
+
+                    if crossing_spans and "smpl_params_incam" in pt_data:
+                        ic = pt_data["smpl_params_incam"]
+                        ic_bp = np.array(ic["body_pose"]).reshape(num_person_frames, -1, 3)
+                        ic_go = np.array(ic["global_orient"]).reshape(num_person_frames, 3)
+                        ic_tr = np.array(ic["transl"]).reshape(num_person_frames, 3)
+                        ic_result = bridge.bridge_with_spans(ic_bp, ic_go, ic_tr, crossing_spans)
+                        ic["body_pose"] = torch.from_numpy(
+                            ic_result["body_pose"].reshape(num_person_frames, -1)).float()
+                        ic["global_orient"] = torch.from_numpy(
+                            ic_result["global_orient"].reshape(num_person_frames, -1)).float()
+                        ic["transl"] = torch.from_numpy(ic_result["transl"]).float()
+
+                # Apply identity keyframe position constraints
+                if need_position_constraints:
+                    from world_assembly import apply_identity_position_constraints
+                    K_fullimg = pt_data.get("K_fullimg")
+                    if K_fullimg is not None:
+                        K_np = np.array(K_fullimg[0])
+                    else:
+                        _, w, h = get_video_lwh(video_path)
+                        K_np = estimate_K(w, h).numpy()
+                    apply_identity_position_constraints(
+                        pt_data, verified_kfs, K_np, num_person_frames)
 
                 torch.save(pt_data, pt_path)
 

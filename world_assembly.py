@@ -96,6 +96,98 @@ def estimate_depth_from_bbox_height(bbox_xyxy, K, assumed_height_m=1.7):
     return float(depth)
 
 
+def bbox_to_incam_translation(bbox_xyxy, K, assumed_height_m=1.7):
+    """Convert 2D bbox to 3D camera-space root translation.
+
+    Uses bbox center as approximate pelvis projection,
+    depth from bbox height via pinhole camera model.
+    """
+    depth = estimate_depth_from_bbox_height(bbox_xyxy, K, assumed_height_m)
+    cx = (bbox_xyxy[0] + bbox_xyxy[2]) / 2.0
+    cy = (bbox_xyxy[1] + bbox_xyxy[3]) / 2.0
+    fx, fy = float(K[0, 0]), float(K[1, 1])
+    px, py = float(K[0, 2]), float(K[1, 2])
+    X = (cx - px) * depth / fx
+    Y = (cy - py) * depth / fy
+    return np.array([X, Y, depth], dtype=np.float32)
+
+
+def apply_identity_position_constraints(pt_data, identity_keyframes, K, num_frames):
+    """Apply identity keyframe bbox positions as root translation constraints.
+
+    Computes target camera-space translation from each keyframe bbox,
+    LERPs deltas between keyframes, applies to both incam and global params.
+    Modifies pt_data in-place and returns it.
+    """
+    kf_list = [(kf.frame_index, kf.bbox) for kf in identity_keyframes
+               if kf.bbox is not None and 0 <= kf.frame_index < num_frames]
+    kf_list.sort(key=lambda x: x[0])
+
+    if not kf_list:
+        return pt_data
+
+    if isinstance(K, torch.Tensor):
+        K = K.cpu().numpy()
+
+    ic = pt_data.get("smpl_params_incam")
+    if ic is None:
+        return pt_data
+
+    current_transl = np.array(ic["transl"]).reshape(num_frames, 3)
+
+    # Compute delta at each keyframe: target position minus current
+    kf_deltas = {}
+    for frame_idx, bbox in kf_list:
+        target = bbox_to_incam_translation(bbox, K)
+        kf_deltas[frame_idx] = target - current_transl[frame_idx]
+
+    sorted_frames = sorted(kf_deltas.keys())
+
+    # Build per-frame delta array via LERP (same pattern as interpolate_bbox_corrections)
+    deltas = np.zeros((num_frames, 3), dtype=np.float32)
+
+    # Before first keyframe: hold constant
+    first_f = sorted_frames[0]
+    first_delta = kf_deltas[first_f]
+    for f in range(first_f):
+        deltas[f] = first_delta
+
+    # At keyframe positions
+    for f in sorted_frames:
+        deltas[f] = kf_deltas[f]
+
+    # Between keyframes: LERP
+    for i in range(len(sorted_frames) - 1):
+        f_a = sorted_frames[i]
+        f_b = sorted_frames[i + 1]
+        delta_a = kf_deltas[f_a]
+        delta_b = kf_deltas[f_b]
+        span = f_b - f_a
+        for f in range(f_a + 1, f_b):
+            t = (f - f_a) / span
+            deltas[f] = (1 - t) * delta_a + t * delta_b
+
+    # After last keyframe: hold constant
+    last_f = sorted_frames[-1]
+    last_delta = kf_deltas[last_f]
+    for f in range(last_f + 1, num_frames):
+        deltas[f] = last_delta
+
+    # Apply to incam translations
+    ic["transl"] = torch.from_numpy(current_transl + deltas).float()
+
+    # Apply X,Z components to global translations
+    # (camera X ≈ world X, camera Z ≈ world Z for roughly front-facing cameras)
+    g = pt_data.get("smpl_params_global")
+    if g is not None:
+        global_transl = np.array(g["transl"]).reshape(num_frames, 3)
+        global_transl[:, 0] += deltas[:, 0]  # X
+        global_transl[:, 2] += deltas[:, 2]  # Z
+        g["transl"] = torch.from_numpy(global_transl).float()
+
+    return pt_data
+
+
 def compute_person_offsets(
     all_tracks,
     camera_K,
