@@ -33,7 +33,9 @@ _MODEL_CONFIGS = {
 }
 
 # Default checkpoint search paths
+_GVHMR_ROOT = Path(__file__).resolve().parent
 _CHECKPOINT_DIRS = [
+    _GVHMR_ROOT / "inputs" / "checkpoints" / "sam2",
     Path("inputs/checkpoints/sam2"),
     Path.home() / ".cache" / "sam2",
     Path("/mnt/f/models/sam2"),

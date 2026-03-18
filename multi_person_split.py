@@ -727,6 +727,7 @@ def split_multi_person_video(
                 if use_inpainting:
                     raise RuntimeError(
                         "SAM2 inpainting was requested, but segmentation could not start. "
+                        f"Underlying error: {e!r}. "
                         "Install/configure SAM2 instead of falling back to bbox blackout."
                     ) from e
                 _progress(0.35, f"SAM2 not available ({e}). Using bbox-only isolation (no inpainting).")
