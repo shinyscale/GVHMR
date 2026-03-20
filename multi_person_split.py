@@ -584,15 +584,15 @@ def run_person_pipeline_gemx(
     if bbx_override_path and Path(bbx_override_path).is_file():
         dst_bbx = preprocess_dir / "bbx.pt"
         try:
-                bbx_data = torch.load(str(bbx_override_path), map_location="cpu", weights_only=False)
-                bbx_xyxy = bbx_data.get("bbx_xyxy", bbx_data) if isinstance(bbx_data, dict) else bbx_data
-                if isinstance(bbx_xyxy, np.ndarray):
-                    bbx_xyxy = torch.from_numpy(bbx_xyxy)
-                bbx_xys = get_bbx_xys_from_xyxy(bbx_xyxy)
-                torch.save({"bbx_xyxy": bbx_xyxy, "bbx_xys": bbx_xys}, str(dst_bbx))
-                log_lines.append(f"  Pre-staged bbox: {dst_bbx}")
-            except Exception as e:
-                log_lines.append(f"  WARNING: bbox pre-staging failed: {e}")
+            bbx_data = torch.load(str(bbx_override_path), map_location="cpu", weights_only=False)
+            bbx_xyxy = bbx_data.get("bbx_xyxy", bbx_data) if isinstance(bbx_data, dict) else bbx_data
+            if isinstance(bbx_xyxy, np.ndarray):
+                bbx_xyxy = torch.from_numpy(bbx_xyxy)
+            bbx_xys = get_bbx_xys_from_xyxy(bbx_xyxy)
+            torch.save({"bbx_xyxy": bbx_xyxy, "bbx_xys": bbx_xys}, str(dst_bbx))
+            log_lines.append(f"  Pre-staged bbox: {dst_bbx}")
+        except Exception as e:
+            log_lines.append(f"  WARNING: bbox pre-staging failed: {e}")
 
     # Build GEM-X command
     cmd = [
