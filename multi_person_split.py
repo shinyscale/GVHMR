@@ -630,17 +630,23 @@ def run_person_pipeline_gemx(
 
     proc.wait()
 
-    if proc.returncode != 0:
-        log_lines.append(f"\n[Person {person_id}] ERROR: GEM-X exited with code {proc.returncode}")
-        return None, log_lines
-
-    # Find the output hpe_results.pt
+    # Check for hpe_results.pt even on non-zero exit — GEM-X may crash
+    # during the render step after estimation completes successfully.
     demo_out = gemx_output_root / video_stem
     if demo_out.is_dir():
         pt_files = list(demo_out.rglob("hpe_results.pt"))
         if pt_files:
+            if proc.returncode != 0:
+                log_lines.append(
+                    f"[Person {person_id}] GEM-X exited with code {proc.returncode} "
+                    f"but hpe_results.pt found — render crash after estimation"
+                )
             log_lines.append(f"[Person {person_id}] GEM-X output: {pt_files[0]}")
             return str(pt_files[0]), log_lines
+
+    if proc.returncode != 0:
+        log_lines.append(f"\n[Person {person_id}] ERROR: GEM-X exited with code {proc.returncode}")
+        return None, log_lines
 
     log_lines.append(f"\n[Person {person_id}] ERROR: hpe_results.pt not found")
     return None, log_lines

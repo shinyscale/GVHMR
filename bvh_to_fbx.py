@@ -109,8 +109,9 @@ def convert_bvh_to_fbx(
 
     if is_windows:
         # WSL2 cannot directly exec a Windows .exe via subprocess; use cmd.exe
+        # Quote the path for cmd.exe since it likely contains spaces
         blender_win = _to_win_path(blender)
-        cmd = ["cmd.exe", "/c", blender_win] + blender_args
+        cmd = ["cmd.exe", "/c", f'"{blender_win}"'] + blender_args
     else:
         cmd = [blender] + blender_args
 
