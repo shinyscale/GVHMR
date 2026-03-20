@@ -580,10 +580,10 @@ def run_person_pipeline_gemx(
             log_lines.append(f"  Pre-staged SLAM: {dst_slam}")
 
     # Pre-stage bboxes: convert GVHMR format to GEM-X format
+    # Always overwrite — corrected bboxes from reprocessing must replace stale ones
     if bbx_override_path and Path(bbx_override_path).is_file():
         dst_bbx = preprocess_dir / "bbx.pt"
-        if not dst_bbx.exists():
-            try:
+        try:
                 bbx_data = torch.load(str(bbx_override_path), map_location="cpu", weights_only=False)
                 bbx_xyxy = bbx_data.get("bbx_xyxy", bbx_data) if isinstance(bbx_data, dict) else bbx_data
                 if isinstance(bbx_xyxy, np.ndarray):
@@ -1530,12 +1530,16 @@ def reprocess_person(
     # 2. Back up stale outputs (restore on failure, delete on success)
     isolated_video = person_dir / "isolated_video.mp4"
     demo_dir = person_dir / "demo"
+    gemx_dir = person_dir / "gemx_demo"
     bak_video = person_dir / "isolated_video.mp4.bak"
     bak_demo = person_dir / "demo.bak"
+    bak_gemx = person_dir / "gemx_demo.bak"
     if isolated_video.exists():
         isolated_video.rename(bak_video)
     if demo_dir.exists():
         demo_dir.rename(bak_demo)
+    if gemx_dir.exists():
+        gemx_dir.rename(bak_gemx)
 
     # 3. Re-isolate person
     if progress_callback:
@@ -1598,6 +1602,8 @@ def reprocess_person(
             bak_video.rename(isolated_video)
         if bak_demo.exists():
             bak_demo.rename(demo_dir)
+        if bak_gemx.exists():
+            bak_gemx.rename(gemx_dir)
         return {}
 
     # 4. Re-run estimation pipeline
@@ -1650,6 +1656,8 @@ def reprocess_person(
             bak_video.rename(isolated_video)
         if bak_demo.exists() and not demo_dir.exists():
             bak_demo.rename(demo_dir)
+        if bak_gemx.exists() and not gemx_dir.exists():
+            bak_gemx.rename(gemx_dir)
         return {}
 
     if pt_path is None:
@@ -1658,11 +1666,14 @@ def reprocess_person(
             bak_video.rename(isolated_video)
         if bak_demo.exists() and not demo_dir.exists():
             bak_demo.rename(demo_dir)
+        if bak_gemx.exists() and not gemx_dir.exists():
+            bak_gemx.rename(gemx_dir)
         return {}
 
     # Pipeline succeeded — clean up backups
     bak_video.unlink(missing_ok=True)
     shutil.rmtree(str(bak_demo), ignore_errors=True)
+    shutil.rmtree(str(bak_gemx), ignore_errors=True)
 
     # 5. Re-compute confidence & identity
     if progress_callback:
