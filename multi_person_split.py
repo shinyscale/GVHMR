@@ -1504,8 +1504,9 @@ def reprocess_person(
     static_cam: bool = False,
     use_dpvo: bool = False,
     progress_callback=None,
+    estimation_backend: str = "gvhmr",
 ) -> dict:
-    """Re-run isolation + GVHMR for a single person after bbox corrections.
+    """Re-run isolation + estimation for a single person after bbox corrections.
 
     Caches shared SLAM and SAM2 masks. Only re-runs isolation + pipeline.
 
@@ -1593,9 +1594,10 @@ def reprocess_person(
             bak_demo.rename(demo_dir)
         return {}
 
-    # 4. Re-run GVHMR pipeline
+    # 4. Re-run estimation pipeline
+    _backend_label = "GEM-X" if estimation_backend == "gemx" else "GVHMR"
     if progress_callback:
-        progress_callback(0.4, f"Running GVHMR for person {person_index}...")
+        progress_callback(0.4, f"Running {_backend_label} for person {person_index}...")
 
     bbox_override_path = _save_bbox_override(
         person_dir, track, crop_bbox=(isolation_result or {}).get("crop_bbox"),
@@ -1614,18 +1616,29 @@ def reprocess_person(
             json.dump(isolation_result.get("debug", {}), f, indent=2)
 
     try:
-        pt_path, _ = run_person_pipeline(
-            video_path=str(isolated_video),
-            person_id=tid,
-            output_dir=person_dir,
-            slam_override_path=slam_path if not static_cam else None,
-            bbx_override_path=str(bbox_override_path),
-            static_cam=static_cam,
-            use_dpvo=use_dpvo,
-            skip_render=True,
-        )
+        if estimation_backend == "gemx":
+            pt_path, _ = run_person_pipeline_gemx(
+                video_path=str(isolated_video),
+                person_id=tid,
+                output_dir=person_dir,
+                slam_override_path=slam_path if not static_cam else None,
+                bbx_override_path=str(bbox_override_path),
+                static_cam=static_cam,
+                progress_callback=progress_callback,
+            )
+        else:
+            pt_path, _ = run_person_pipeline(
+                video_path=str(isolated_video),
+                person_id=tid,
+                output_dir=person_dir,
+                slam_override_path=slam_path if not static_cam else None,
+                bbx_override_path=str(bbox_override_path),
+                static_cam=static_cam,
+                use_dpvo=use_dpvo,
+                skip_render=True,
+            )
     except Exception as e:
-        print(f"[reprocess_person] Pipeline crashed for person {person_index}: {e}")
+        print(f"[reprocess_person] {_backend_label} crashed for person {person_index}: {e}")
         # Restore backups
         if bak_video.exists() and not isolated_video.exists():
             bak_video.rename(isolated_video)
