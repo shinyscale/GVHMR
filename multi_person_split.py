@@ -546,6 +546,7 @@ def run_person_pipeline_gemx(
     slam_override_path=None,
     bbx_override_path=None,
     static_cam=False,
+    progress_callback=None,
 ):
     """Run GEM-X single-person pipeline on an isolated person video.
 
@@ -622,7 +623,10 @@ def run_person_pipeline_gemx(
     )
 
     for line in proc.stdout:
-        log_lines.append(line.rstrip())
+        stripped = line.rstrip()
+        log_lines.append(stripped)
+        if progress_callback and stripped:
+            progress_callback(-1, f"[GEM-X P{person_id}] {stripped}")
 
     proc.wait()
 
@@ -656,13 +660,18 @@ def extract_gemx_params(hpe_results_path: str) -> dict:
     data = torch.load(hpe_results_path, map_location="cpu", weights_only=False)
     bp = data["body_params_global"]
 
-    body_pose = np.array(bp["body_pose"])     # (L, 63)
+    body_pose = np.array(bp["body_pose"])     # (L, J*3) — 63 or 228
     global_orient = np.array(bp["global_orient"])  # (L, 3)
     transl = np.array(bp["transl"])            # (L, 3)
     n_frames = body_pose.shape[0]
+    n_pose_joints = body_pose.shape[1] // 3   # 21 or 76
+
+    # Extract first 21 body joints for compatibility with identity verification / BVH
+    body_pose_3 = body_pose.reshape(n_frames, n_pose_joints, 3)
+    body_pose_21 = body_pose_3[:, :21, :]
 
     result = {
-        "body_pose": body_pose.reshape(n_frames, 21, 3).astype(np.float32),
+        "body_pose": body_pose_21.astype(np.float32),
         "global_orient": global_orient.astype(np.float32),
         "transl": transl.astype(np.float32),
         "num_frames": n_frames,
@@ -1092,6 +1101,7 @@ def split_multi_person_video(
                 slam_override_path=str(slam_path) if not static_cam else None,
                 bbx_override_path=str(bbox_override_path),
                 static_cam=static_cam,
+                progress_callback=progress_callback,
             )
         else:
             pt_path, person_log = run_person_pipeline(
