@@ -28,6 +28,14 @@ def _log_vram(label: str):
 
 GVHMR_DIR = Path(__file__).resolve().parent
 DEMO_SCRIPT = GVHMR_DIR / "tools" / "demo" / "demo.py"
+
+
+def _find_gvhmr_python() -> str:
+    """Return path to the gvhmr conda env Python, falling back to current interpreter."""
+    candidate = Path("/home/shinyscale/miniconda3/envs/gvhmr/bin/python")
+    if candidate.exists():
+        return str(candidate)
+    return sys.executable
 GEMX_DIR = GVHMR_DIR.parent / "GEM-X"
 GEMX_DEMO_SCRIPT = GEMX_DIR / "scripts" / "demo" / "demo_soma.py"
 PERSON_META_FILENAME = "person_meta.json"
@@ -407,10 +415,6 @@ def compute_shared_slam(
         torch.save(R_identity, str(output_path))
         return str(output_path)
 
-    # Run SLAM via the existing pipeline utilities
-    from hmr4d.utils.preproc import SimpleVO
-    from hmr4d.utils.geo.hmr_cam import estimate_K, convert_K_to_K4
-
     # Check DPVO availability — must test the full import chain that slam.py needs,
     # not just dpvo.config. slam.py has a bare `except: pass` that silently leaves
     # cfg undefined if dpvo.dpvo.DPVO fails to import (e.g. build mismatch).
@@ -425,11 +429,35 @@ def compute_shared_slam(
             print(f"[SLAM] DPVO not available ({e}) — falling back to SimpleVO.")
 
     if not use_dpvo or not dpvo_available:
-        simple_vo = SimpleVO(str(video_path), scale=0.5, step=8, method="sift", f_mm=f_mm)
-        vo_results = simple_vo.compute()
-        torch.save(vo_results, str(output_path))
+        # Run SimpleVO as subprocess to avoid import-chain issues (yacs, pycolmap)
+        # when called from environments without the full hmr4d dependency chain.
+        vo_script = GVHMR_DIR / "tools" / "compute_vo.py"
+        gvhmr_python = _find_gvhmr_python()
+        cmd = [
+            gvhmr_python,
+            str(vo_script),
+            f"--video={video_path}",
+            f"--output={output_path}",
+        ]
+        if f_mm is not None:
+            cmd.append(f"--f_mm={f_mm}")
+        print(f"[SLAM] Running SimpleVO subprocess: {' '.join(cmd)}")
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, cwd=str(GVHMR_DIR),
+        )
+        for line in proc.stdout:
+            print(line.rstrip())
+        proc.wait()
+        if proc.returncode != 0 or not Path(output_path).exists():
+            print(f"[SLAM] SimpleVO subprocess failed (exit {proc.returncode}) — falling back to identity")
+            length = get_video_lwh(video_path)[0]
+            R_identity = np.eye(4)[None].repeat(length, axis=0).astype(np.float32)
+            torch.save(R_identity, str(output_path))
+            return str(output_path)
     else:
         from hmr4d.utils.preproc.slam import SLAMModel
+        from hmr4d.utils.geo.hmr_cam import convert_K_to_K4
         from tqdm import tqdm
 
         length, width, height = get_video_lwh(video_path)
@@ -1077,6 +1105,26 @@ def split_multi_person_video(
             meta["bbox_override_path"] = str(bbox_override_path)
             _save_person_meta(person_dir, meta)
             person_meta_by_tid[tid] = meta
+
+        # GEM-X: ensure GVHMR world-grounding exists (even if GEM-X already ran).
+        # Must run BEFORE the cache check so re-runs pick up missing GVHMR results.
+        if _use_gemx and not list(person_dir.rglob("hmr4d_results.pt")):
+            _progress(
+                0.50 + i / len(all_tracks) * 0.30,
+                f"Running GVHMR (world-grounding) for person {i}...",
+            )
+            run_person_pipeline(
+                video_path=person_video,
+                person_id=tid,
+                output_dir=person_dir,
+                slam_override_path=str(slam_path) if not static_cam else None,
+                bbx_override_path=str(bbox_override_path),
+                static_cam=static_cam,
+                use_dpvo=use_dpvo,
+                f_mm=f_mm,
+                skip_render=True,
+                render_incam_only=False,
+            )
 
         # Check if already processed (check for backend-specific output)
         existing_pt = list(person_dir.rglob(_result_filename))
