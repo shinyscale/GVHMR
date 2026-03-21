@@ -1583,10 +1583,16 @@ def reprocess_person(
     bak_demo = person_dir / "demo.bak"
     bak_gemx = person_dir / "gemx_demo.bak"
     if isolated_video.exists():
+        if bak_video.exists():
+            bak_video.unlink()
         isolated_video.rename(bak_video)
     if demo_dir.exists():
+        if bak_demo.exists():
+            shutil.rmtree(bak_demo)
         demo_dir.rename(bak_demo)
     if gemx_dir.exists():
+        if bak_gemx.exists():
+            shutil.rmtree(bak_gemx)
         gemx_dir.rename(bak_gemx)
 
     # 3. Re-isolate person
