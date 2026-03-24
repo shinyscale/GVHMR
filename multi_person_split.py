@@ -485,8 +485,13 @@ def run_person_pipeline(
     """
     output_dir = Path(output_dir)
 
+    # Use GVHMR's own venv Python if available (bodypipe's sys.executable
+    # doesn't have torch when running with separate venvs on DGX Spark).
+    gvhmr_python = GVHMR_DIR / ".venv" / "bin" / "python"
+    python_exe = str(gvhmr_python) if gvhmr_python.exists() else sys.executable
+
     cmd = [
-        sys.executable, str(DEMO_SCRIPT),
+        python_exe, str(DEMO_SCRIPT),
         f"--video={video_path}",
         f"--output_root={output_dir / 'demo'}",
     ]
@@ -537,6 +542,83 @@ def run_person_pipeline(
     return None, log_lines
 
 
+def run_gemx_pipeline(
+    video_path,
+    person_id,
+    output_dir,
+    static_cam=False,
+    skip_render=True,
+):
+    """Run GEM-X (SOMA) estimation on a single isolated video.
+
+    Parallel to run_person_pipeline() but uses GEM-X's demo_soma.py
+    to produce SOMA-77 params with identity_coeffs and scale_params.
+
+    Returns:
+        (pt_path, log_lines) tuple — path to hpe_results.pt or None
+    """
+    output_dir = Path(output_dir)
+    gemx_root = GVHMR_DIR.parent / "GEM-X"
+    demo_script = gemx_root / "scripts" / "demo" / "demo_soma.py"
+
+    if not demo_script.is_file():
+        return None, [f"[Person {person_id}] ERROR: GEM-X not found at {gemx_root}"]
+
+    # Use GEM-X venv Python
+    gemx_python = gemx_root / ".venv" / "bin" / "python"
+    python_exe = str(gemx_python) if gemx_python.exists() else sys.executable
+
+    # GEM-X output goes into person_dir directly (output_root)
+    cmd = [
+        python_exe, str(demo_script),
+        f"--video={video_path}",
+        f"--output_root={output_dir}",
+    ]
+    if static_cam:
+        cmd.append("--static_cam")
+
+    log_lines = [f"[Person {person_id}] Running GEM-X: {' '.join(cmd)}", ""]
+
+    # GEM-X needs its own PYTHONPATH for submodule imports
+    import os
+    env = os.environ.copy()
+    existing = env.get("PYTHONPATH", "")
+    extra_paths = [str(gemx_root)]
+    # Add GEM-X third_party dirs
+    tp = gemx_root / "third_party"
+    if tp.is_dir():
+        for d in tp.iterdir():
+            if d.is_dir() and (d / "__init__.py").exists() or (d / "setup.py").exists():
+                extra_paths.append(str(d))
+    env["PYTHONPATH"] = ":".join(extra_paths + ([existing] if existing else []))
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        cwd=str(gemx_root),
+        env=env,
+        bufsize=1,
+    )
+
+    for line in proc.stdout:
+        log_lines.append(line.rstrip())
+
+    proc.wait()
+
+    if proc.returncode != 0:
+        log_lines.append(f"\n[Person {person_id}] ERROR: GEM-X exited with code {proc.returncode}")
+        return None, log_lines
+
+    # Find hpe_results.pt in output
+    for pt_file in sorted(output_dir.rglob("hpe_results.pt")):
+        return str(pt_file), log_lines
+
+    log_lines.append(f"\n[Person {person_id}] ERROR: hpe_results.pt not found")
+    return None, log_lines
+
+
 def split_multi_person_video(
     video_path,
     output_dir,
@@ -548,6 +630,7 @@ def split_multi_person_video(
     render_overlays=False,
     use_inpainting=False,
     progress_callback=None,
+    estimation_backend="gvhmr",
 ):
     """Full multi-person isolation pipeline.
 
@@ -913,8 +996,8 @@ def split_multi_person_video(
             _save_person_meta(person_dir, meta)
             person_meta_by_tid[tid] = meta
 
-        # Check if already processed
-        existing_pt = list(person_dir.rglob("hmr4d_results.pt"))
+        # Check if already processed (either GVHMR or GEM-X output)
+        existing_pt = list(person_dir.rglob("hmr4d_results.pt")) + list(person_dir.rglob("hpe_results.pt"))
         isolated_mtime = Path(person_video).stat().st_mtime if Path(person_video).exists() else 0.0
         newest_pt_mtime = max((pt.stat().st_mtime for pt in existing_pt), default=0.0)
         if existing_pt and newest_pt_mtime >= isolated_mtime:
@@ -926,32 +1009,41 @@ def split_multi_person_video(
         if existing_pt:
             _progress(
                 0.50 + i / len(all_tracks) * 0.30,
-                f"Person {i} isolation changed; re-running GVHMR",
+                f"Person {i} isolation changed; re-running estimation",
             )
 
+        backend_label = "GEM-X" if estimation_backend == "gemx" else "GVHMR"
         _progress(
             0.50 + i / len(all_tracks) * 0.30,
-            f"Running GVHMR for person {i}...",
+            f"Running {backend_label} for person {i}...",
         )
 
-        pt_path, person_log = run_person_pipeline(
-            video_path=person_video,
-            person_id=tid,
-            output_dir=person_dir,
-            slam_override_path=str(slam_path) if not static_cam else None,
-            bbx_override_path=str(bbox_override_path),
-            static_cam=static_cam,
-            use_dpvo=use_dpvo,
-            f_mm=f_mm,
-            skip_render=not render_overlays,
-            render_incam_only=render_overlays,
-        )
+        if estimation_backend == "gemx":
+            pt_path, person_log = run_gemx_pipeline(
+                video_path=person_video,
+                person_id=tid,
+                output_dir=person_dir,
+                static_cam=static_cam,
+            )
+        else:
+            pt_path, person_log = run_person_pipeline(
+                video_path=person_video,
+                person_id=tid,
+                output_dir=person_dir,
+                slam_override_path=str(slam_path) if not static_cam else None,
+                bbx_override_path=str(bbox_override_path),
+                static_cam=static_cam,
+                use_dpvo=use_dpvo,
+                f_mm=f_mm,
+                skip_render=not render_overlays,
+                render_incam_only=render_overlays,
+            )
 
         if pt_path is None:
             log_lines.extend(person_log)
             _progress(
                 0.50 + (i + 1) / len(all_tracks) * 0.30,
-                f"Person {i} GVHMR FAILED",
+                f"Person {i} {backend_label} FAILED",
             )
 
     # ── Step 5.5: Identity verification & occlusion bridging ──
@@ -1168,24 +1260,54 @@ def split_multi_person_video(
     # ── Step 5.7: Generate per-person BVH ──
     _progress(0.85, "Generating BVH files...")
 
-    try:
-        from smplx_to_bvh import convert_params_to_bvh, extract_gvhmr_params as _extract_gvhmr
+    for i, person_dir in enumerate(person_dirs):
+        bvh_path = person_dir / "body.bvh"
+        try:
+            # Try GEM-X/SOMA output first
+            hpe_files = list(person_dir.rglob("hpe_results.pt"))
+            if hpe_files:
+                import torch as _torch
+                data = _torch.load(str(hpe_files[0]), map_location="cpu", weights_only=False)
+                bp = data.get("body_params_incam") or data.get("body_params_global") or {}
+                body_pose = bp.get("body_pose")
+                if body_pose is not None and body_pose.shape[-1] // 3 > 21:
+                    # SOMA-77 format → use bodypipe's SOMA BVH exporter
+                    import numpy as _np
+                    n_frames = body_pose.shape[0]
+                    body_pose_3 = _np.array(body_pose).reshape(n_frames, -1, 3)
+                    go_3 = _np.array(bp["global_orient"]).reshape(n_frames, 1, 3)
+                    poses = _np.concatenate([go_3, body_pose_3[:, :76]], axis=1).astype(_np.float32)
+                    soma_params = {
+                        "poses": poses,
+                        "transl": _np.array(bp["transl"]).astype(_np.float32),
+                    }
+                    if "identity_coeffs" in bp:
+                        soma_params["identity_coeffs"] = _np.array(bp["identity_coeffs"]).astype(_np.float32)
+                    if "scale_params" in bp:
+                        soma_params["scale_params"] = _np.array(bp["scale_params"]).astype(_np.float32)
 
-        for i, person_dir in enumerate(person_dirs):
+                    # Import bodypipe's SOMA BVH exporter
+                    bodypipe_dir = GVHMR_DIR.parent / "bodypipe"
+                    if str(bodypipe_dir) not in sys.path:
+                        sys.path.insert(0, str(bodypipe_dir))
+                    from workers.soma_bvh_export import convert_soma_to_bvh
+                    convert_soma_to_bvh(soma_params, bvh_path)
+                    _progress(0.85 + (i + 1) / len(person_dirs) * 0.05,
+                              f"Person {i} BVH exported (SOMA)")
+                    continue
+
+            # Fall back to GVHMR/SMPL-X BVH export
             pt_files = list(person_dir.rglob("hmr4d_results.pt"))
             if not pt_files:
                 continue
-            bvh_path = person_dir / "body.bvh"
-            try:
-                params = _extract_gvhmr(str(pt_files[0]))
-                convert_params_to_bvh(params, str(bvh_path), skip_world_grounding=True)
-                _progress(0.85 + (i + 1) / len(person_dirs) * 0.05,
-                          f"Person {i} BVH exported")
-            except Exception as e:
-                _progress(0.85 + (i + 1) / len(person_dirs) * 0.05,
-                          f"Person {i} BVH failed: {e}")
-    except Exception as e:
-        _progress(0.90, f"BVH generation skipped: {e}")
+            from smplx_to_bvh import convert_params_to_bvh, extract_gvhmr_params as _extract_gvhmr
+            params = _extract_gvhmr(str(pt_files[0]))
+            convert_params_to_bvh(params, str(bvh_path), skip_world_grounding=True)
+            _progress(0.85 + (i + 1) / len(person_dirs) * 0.05,
+                      f"Person {i} BVH exported")
+        except Exception as e:
+            _progress(0.85 + (i + 1) / len(person_dirs) * 0.05,
+                      f"Person {i} BVH failed: {e}")
 
     # ── Step 6: World-space assembly ──
     _progress(0.90, "Assembling world-space results...")
