@@ -548,6 +548,7 @@ def run_gemx_pipeline(
     output_dir,
     static_cam=False,
     skip_render=True,
+    bbx_override_path=None,
 ):
     """Run GEM-X (SOMA) estimation on a single isolated video.
 
@@ -574,6 +575,8 @@ def run_gemx_pipeline(
         f"--video={video_path}",
         f"--output_root={output_dir}",
     ]
+    if bbx_override_path:
+        cmd.append(f"--bbx_override={bbx_override_path}")
     if static_cam:
         cmd.append("--static_cam")
 
@@ -1024,6 +1027,7 @@ def split_multi_person_video(
                 person_id=tid,
                 output_dir=person_dir,
                 static_cam=static_cam,
+                bbx_override_path=str(bbox_override_path),
             )
         else:
             pt_path, person_log = run_person_pipeline(
@@ -1381,10 +1385,13 @@ def reprocess_person(
     static_cam: bool = False,
     use_dpvo: bool = False,
     progress_callback=None,
+    estimation_backend: str = "gvhmr",
+    verified_identity_keyframes: list[dict] | None = None,
 ) -> dict:
-    """Re-run isolation + GVHMR for a single person after bbox corrections.
+    """Re-run isolation + estimation for a single person after bbox corrections.
 
     Caches shared SLAM and SAM2 masks. Only re-runs isolation + pipeline.
+    Supports both GVHMR and GEM-X backends via estimation_backend param.
 
     Returns dict with keys: identity_track, confidences, pt_path (or empty on failure).
     """
@@ -1393,6 +1400,9 @@ def reprocess_person(
 
     track = all_tracks[person_index]
     tid = track.get("track_id", person_index)
+
+    print(f"[reprocess_person] START person_index={person_index}, tid={tid}, "
+          f"backend={estimation_backend}, bboxes={updated_bboxes.shape}")
 
     # 1. Update track bboxes in-place
     track["bbx_xyxy"] = torch.from_numpy(updated_bboxes)
@@ -1462,7 +1472,15 @@ def reprocess_person(
             other_bboxes=other_bb, detection_mask=_track_detection_mask(track, len(updated_bboxes)),
         )
 
+    if isolation_result is not None:
+        method = "inpaint" if masks else "crop"
+        print(f"[reprocess_person] Isolation complete (method={method}), "
+              f"video exists={isolated_video.exists()}")
+    else:
+        print(f"[reprocess_person] Isolation returned None")
+
     if not isolated_video.exists():
+        print(f"[reprocess_person] FAIL: isolated video not created, restoring backups")
         # Restore backups — isolation failed
         if bak_video.exists():
             bak_video.rename(isolated_video)
@@ -1470,9 +1488,10 @@ def reprocess_person(
             bak_demo.rename(demo_dir)
         return {}
 
-    # 4. Re-run GVHMR pipeline
+    # 4. Re-run estimation pipeline
+    backend_label = "GEM-X" if estimation_backend == "gemx" else "GVHMR"
     if progress_callback:
-        progress_callback(0.4, f"Running GVHMR for person {person_index}...")
+        progress_callback(0.4, f"Running {backend_label} for person {person_index}...")
 
     bbox_override_path = _save_bbox_override(
         person_dir, track, crop_bbox=(isolation_result or {}).get("crop_bbox"),
@@ -1490,19 +1509,34 @@ def reprocess_person(
         with open(person_dir / "isolation_debug.json", "w") as f:
             json.dump(isolation_result.get("debug", {}), f, indent=2)
 
+    backend_label = "GEM-X" if estimation_backend == "gemx" else "GVHMR"
+    print(f"[reprocess_person] Running {backend_label} pipeline for person {person_index}...")
+
     try:
-        pt_path, _ = run_person_pipeline(
-            video_path=str(isolated_video),
-            person_id=tid,
-            output_dir=person_dir,
-            slam_override_path=slam_path if not static_cam else None,
-            bbx_override_path=str(bbox_override_path),
-            static_cam=static_cam,
-            use_dpvo=use_dpvo,
-            skip_render=True,
-        )
+        if estimation_backend == "gemx":
+            pt_path, _ = run_gemx_pipeline(
+                video_path=str(isolated_video),
+                person_id=tid,
+                output_dir=person_dir,
+                static_cam=static_cam,
+                skip_render=True,
+                bbx_override_path=str(bbox_override_path),
+            )
+        else:
+            pt_path, _ = run_person_pipeline(
+                video_path=str(isolated_video),
+                person_id=tid,
+                output_dir=person_dir,
+                slam_override_path=slam_path if not static_cam else None,
+                bbx_override_path=str(bbox_override_path),
+                static_cam=static_cam,
+                use_dpvo=use_dpvo,
+                skip_render=True,
+            )
     except Exception as e:
         print(f"[reprocess_person] Pipeline crashed for person {person_index}: {e}")
+        import traceback
+        traceback.print_exc()
         # Restore backups
         if bak_video.exists() and not isolated_video.exists():
             bak_video.rename(isolated_video)
@@ -1511,6 +1545,7 @@ def reprocess_person(
         return {}
 
     if pt_path is None:
+        print(f"[reprocess_person] FAIL: {backend_label} returned no pt_path, restoring backups")
         # Pipeline failed — restore backups
         if bak_video.exists() and not isolated_video.exists():
             bak_video.rename(isolated_video)
@@ -1519,6 +1554,7 @@ def reprocess_person(
         return {}
 
     # Pipeline succeeded — clean up backups
+    print(f"[reprocess_person] {backend_label} succeeded, pt_path={pt_path}")
     bak_video.unlink(missing_ok=True)
     shutil.rmtree(str(bak_demo), ignore_errors=True)
 
@@ -1563,7 +1599,6 @@ def reprocess_person(
 
         id_track = IdentityTrack(person_id=tid)
         bboxes = updated_bboxes[:num_person_frames]
-
         auto_generate_keyframes(
             track=id_track,
             confidences=initial_confidences,
@@ -1571,6 +1606,27 @@ def reprocess_person(
             per_frame_bboxes=bboxes,
             per_frame_poses=params.get("body_pose", params.get("body_pose_world")),
         )
+        manual_verified = verified_identity_keyframes or []
+        poses = params.get("body_pose", params.get("body_pose_world"))
+        for entry in manual_verified:
+            frame_idx = int(entry.get("frame", -1))
+            if frame_idx < 0 or frame_idx >= num_person_frames:
+                continue
+            bbox = np.asarray(entry.get("bbox"), dtype=np.float32)
+            if bbox.shape != (4,):
+                continue
+            pose = poses[frame_idx] if poses is not None else None
+            conf = initial_confidences[frame_idx] if frame_idx < len(initial_confidences) else None
+            id_track.add_keyframe(
+                frame_index=frame_idx,
+                bbox=bbox,
+                betas=np.asarray(per_frame_betas[frame_idx], dtype=np.float32),
+                body_pose=pose,
+                confidence=conf,
+                verified=bool(entry.get("verified", True)),
+                timestamp=frame_idx / 30.0,
+                metadata={"source": "bodypipe_reprocess"},
+            )
         id_track.establish_identity()
         confidences = compute_all_confidences(
             track_idx=person_index,
