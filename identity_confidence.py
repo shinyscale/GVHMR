@@ -123,6 +123,7 @@ def compute_bbox_overlap(
     track_idx: int,
     all_tracks: list[dict],
     num_frames: int,
+    ignored_track_ids: set[int] | None = None,
 ) -> np.ndarray:
     """Compute max IoU with other people's bboxes per frame.
 
@@ -140,6 +141,9 @@ def compute_bbox_overlap(
 
     for i, other_track in enumerate(all_tracks):
         if i == track_idx:
+            continue
+        other_tid = int(other_track.get("track_id", i))
+        if ignored_track_ids and other_tid in ignored_track_ids:
             continue
         other_boxes = other_track["bbx_xyxy"]
         if isinstance(other_boxes, torch.Tensor):
@@ -159,6 +163,39 @@ def compute_bbox_overlap(
             overlap[f] = max(overlap[f], iou)
 
     return overlap
+
+
+def smooth_signal(values: np.ndarray, window: int = 5) -> np.ndarray:
+    """Light temporal smoothing for noisy per-frame confidence terms."""
+    arr = np.asarray(values, dtype=np.float32)
+    if arr.size == 0 or window <= 1:
+        return arr
+    radius = max(0, window // 2)
+    out = np.zeros_like(arr)
+    for i in range(len(arr)):
+        lo = max(0, i - radius)
+        hi = min(len(arr), i + radius + 1)
+        out[i] = float(arr[lo:hi].mean())
+    return out
+
+
+def compute_anchor_support(
+    num_frames: int,
+    anchor_frames: set[int] | None = None,
+    radius: int = 24,
+) -> np.ndarray:
+    """Dense 0-1 support signal from sparse manual/verified anchor frames."""
+    support = np.zeros(num_frames, dtype=np.float32)
+    if not anchor_frames or num_frames <= 0:
+        return support
+    radius = max(1, int(radius))
+    anchors = sorted(f for f in anchor_frames if 0 <= f < num_frames)
+    if not anchors:
+        return support
+    for f in range(num_frames):
+        dist = min(abs(f - anchor) for anchor in anchors)
+        support[f] = max(0.0, 1.0 - float(dist) / float(radius))
+    return smooth_signal(support, window=5)
 
 
 def compute_motion_consistency(
@@ -203,6 +240,7 @@ def compute_motion_consistency(
 def compute_shape_consistency(
     per_frame_betas: np.ndarray,
     established_betas: np.ndarray | None,
+    stable_reference_frames: int = 0,
 ) -> np.ndarray:
     """Compute per-frame shape consistency from SMPL betas.
 
@@ -217,8 +255,10 @@ def compute_shape_consistency(
         return np.zeros(len(per_frame_betas), dtype=np.float32)
 
     distances = np.linalg.norm(per_frame_betas - established_betas[None], axis=1)
-    # Typical beta distances are 0-5, normalize
-    return np.clip(distances / 5.0, 0.0, 1.0).astype(np.float32)
+    # Typical beta distances are noisy frame-to-frame; only trust this term
+    # strongly once identity has a stable reference set.
+    reference_scale = min(1.0, max(0.0, stable_reference_frames / 5.0))
+    return np.clip((distances / 7.5) * reference_scale, 0.0, 1.0).astype(np.float32)
 
 
 def compute_all_confidences(
@@ -228,6 +268,11 @@ def compute_all_confidences(
     vitpose: np.ndarray | None = None,
     per_frame_betas: np.ndarray | None = None,
     established_betas: np.ndarray | None = None,
+    overlap_signal: np.ndarray | None = None,
+    verified_frames: set[int] | None = None,
+    anchor_frames: set[int] | None = None,
+    stable_reference_frames: int = 0,
+    ignored_track_ids: set[int] | None = None,
 ) -> list[TrackConfidence]:
     """Compute full per-frame confidence for a tracked person.
 
@@ -236,8 +281,29 @@ def compute_all_confidences(
     track = all_tracks[track_idx]
 
     det_conf = compute_detection_confidence(track, num_frames)
-    overlap = compute_bbox_overlap(track_idx, all_tracks, num_frames)
+    anchor_support = compute_anchor_support(num_frames, anchor_frames)
+    overlap = compute_bbox_overlap(
+        track_idx,
+        all_tracks,
+        num_frames,
+        ignored_track_ids=ignored_track_ids,
+    )
+    if overlap_signal is not None:
+        overlap_signal = np.asarray(overlap_signal, dtype=np.float32)
+        if len(overlap_signal) < num_frames:
+            overlap_signal = np.pad(overlap_signal, (0, num_frames - len(overlap_signal)))
+        else:
+            overlap_signal = overlap_signal[:num_frames]
+        # Prefer finer mask-derived overlap where available.
+        overlap = np.clip(overlap_signal, 0.0, 1.0)
+    overlap = smooth_signal(overlap, window=7)
+
     motion = compute_motion_consistency(track, num_frames)
+    # Legitimate crossings and mirrored choreography inflate constant-velocity
+    # residuals, so damp motion penalty during heavy overlap.
+    motion *= (1.0 - 0.7 * np.clip(overlap, 0.0, 1.0))
+    motion *= (1.0 - 0.5 * anchor_support)
+    motion = smooth_signal(motion, window=5)
 
     if vitpose is not None:
         kp_vis = compute_keypoint_visibility(vitpose)
@@ -248,24 +314,48 @@ def compute_all_confidences(
             kp_vis = kp_vis[:num_frames]
     else:
         kp_vis = det_conf.copy()  # Approximate from detection conf
+    # Manual/verified anchors are strong identity evidence even when the 2D
+    # keypoint detector is noisy, so raise the visibility floor near anchors.
+    kp_floor = np.clip(0.45 * det_conf + 0.55 * anchor_support, 0.0, 1.0)
+    kp_vis = np.maximum(kp_vis, kp_floor)
 
     if per_frame_betas is not None:
-        shape_dist = compute_shape_consistency(per_frame_betas, established_betas)
+        shape_dist = compute_shape_consistency(
+            per_frame_betas,
+            established_betas,
+            stable_reference_frames=stable_reference_frames,
+        )
         if len(shape_dist) < num_frames:
             shape_dist = np.pad(shape_dist, (0, num_frames - len(shape_dist)))
         else:
             shape_dist = shape_dist[:num_frames]
     else:
         shape_dist = np.zeros(num_frames, dtype=np.float32)
+    shape_dist *= (1.0 - 0.35 * anchor_support)
+    shape_dist = smooth_signal(shape_dist, window=9)
 
     confidences = []
+    verified_frames = verified_frames or set()
     for f in range(num_frames):
+        overlap_term = float(overlap[f])
+        motion_term = float(motion[f])
+        shape_term = float(shape_dist[f])
+        kp_term = float(kp_vis[f])
+        if anchor_support[f] > 0.0:
+            overlap_term *= (1.0 - 0.5 * float(anchor_support[f]))
+            motion_term *= (1.0 - 0.35 * float(anchor_support[f]))
+            shape_term *= (1.0 - 0.25 * float(anchor_support[f]))
+        if f in verified_frames:
+            overlap_term *= 0.25
+            motion_term *= 0.25
+            shape_term *= 0.5
+            kp_term = max(kp_term, 0.9)
         confidences.append(TrackConfidence(
             detection_score=float(det_conf[f]),
-            visible_keypoints=float(kp_vis[f]),
-            bbox_overlap=float(overlap[f]),
-            shape_consistency=float(shape_dist[f]),
-            motion_consistency=float(motion[f]),
+            visible_keypoints=kp_term,
+            bbox_overlap=overlap_term,
+            shape_consistency=shape_term,
+            motion_consistency=motion_term,
         ))
 
     return confidences

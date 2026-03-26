@@ -16,6 +16,7 @@ import torch
 
 from hmr4d.utils.video_io_utils import get_video_lwh
 from hmr4d.utils.geo.hmr_cam import estimate_K, get_bbx_xys_from_xyxy
+from reprocess_tracking import regenerate_dense_track
 
 
 def _log_vram(label: str):
@@ -29,6 +30,7 @@ def _log_vram(label: str):
 GVHMR_DIR = Path(__file__).resolve().parent
 DEMO_SCRIPT = GVHMR_DIR / "tools" / "demo" / "demo.py"
 PERSON_META_FILENAME = "person_meta.json"
+TRACKING_VERSION = 4
 
 
 def _transform_crop_verts_to_fullframe(verts, K_crop, K_full, crop_x1, crop_y1):
@@ -239,6 +241,309 @@ def _track_detection_mask(track: dict, num_frames: int | None = None) -> np.ndar
     return mask
 
 
+def _track_detection_conf(track: dict, num_frames: int | None = None) -> np.ndarray:
+    conf = track.get("detection_conf")
+    if conf is None:
+        length = num_frames if num_frames is not None else len(track["bbx_xyxy"])
+        return np.zeros(length, dtype=np.float32)
+    if isinstance(conf, torch.Tensor):
+        conf = conf.cpu().numpy()
+    conf = np.asarray(conf, dtype=np.float32)
+    if num_frames is not None:
+        return conf[:num_frames]
+    return conf
+
+
+def _track_area_sum(track: dict) -> float:
+    boxes = _track_numpy_bboxes(track)
+    mask = _track_detection_mask(track, len(boxes))
+    if len(boxes) == 0 or not mask.any():
+        return 0.0
+    valid = boxes[mask]
+    wh = np.maximum(valid[:, 2:] - valid[:, :2], 0.0)
+    return float((wh[:, 0] * wh[:, 1]).sum())
+
+
+def _track_real_frame_ids(track: dict) -> np.ndarray:
+    mask = _track_detection_mask(track, len(track["bbx_xyxy"]))
+    return np.flatnonzero(mask)
+
+
+def _track_quality_key(track: dict) -> tuple[float, float, float]:
+    mask = _track_detection_mask(track, len(track["bbx_xyxy"]))
+    conf = _track_detection_conf(track, len(mask))
+    mean_conf = float(conf[mask].mean()) if mask.any() else 0.0
+    return (float(mask.sum()), _track_area_sum(track), mean_conf)
+
+
+def _duplicate_track_stats(
+    track_a: dict,
+    track_b: dict,
+    *,
+    high_iou_threshold: float = 0.9,
+) -> dict:
+    boxes_a = _track_numpy_bboxes(track_a)
+    boxes_b = _track_numpy_bboxes(track_b)
+    mask_a = _track_detection_mask(track_a, len(boxes_a))
+    mask_b = _track_detection_mask(track_b, len(boxes_b))
+    n = min(len(boxes_a), len(boxes_b), len(mask_a), len(mask_b))
+    if n <= 0:
+        return {"overlap_frames": 0, "high_iou_frames": 0, "mean_iou": 0.0}
+
+    ious = []
+    for f in range(n):
+        if not mask_a[f] or not mask_b[f]:
+            continue
+        ious.append(_bbox_iou(boxes_a[f], boxes_b[f]))
+    if not ious:
+        return {"overlap_frames": 0, "high_iou_frames": 0, "mean_iou": 0.0}
+
+    ious_arr = np.asarray(ious, dtype=np.float32)
+    return {
+        "overlap_frames": int(len(ious_arr)),
+        "high_iou_frames": int((ious_arr >= high_iou_threshold).sum()),
+        "mean_iou": float(ious_arr.mean()),
+    }
+
+
+def _is_duplicate_track_pair(
+    track_a: dict,
+    track_b: dict,
+    *,
+    min_overlap_frames: int = 30,
+    high_iou_threshold: float = 0.9,
+    min_high_iou_fraction: float = 0.8,
+    min_mean_iou: float = 0.85,
+) -> tuple[bool, dict]:
+    stats = _duplicate_track_stats(
+        track_a,
+        track_b,
+        high_iou_threshold=high_iou_threshold,
+    )
+    overlap_frames = stats["overlap_frames"]
+    if overlap_frames < min_overlap_frames:
+        return False, stats
+    high_fraction = stats["high_iou_frames"] / float(overlap_frames)
+    is_dup = high_fraction >= min_high_iou_fraction and stats["mean_iou"] >= min_mean_iou
+    return is_dup, stats
+
+
+def _duplicate_track_ids_for_target(
+    all_tracks: list[dict],
+    target_index: int,
+) -> set[int]:
+    if not (0 <= target_index < len(all_tracks)):
+        return set()
+    target = all_tracks[target_index]
+    ignored: set[int] = set()
+    for idx, other in enumerate(all_tracks):
+        if idx == target_index:
+            continue
+        is_dup, _ = _is_duplicate_track_pair(target, other)
+        if is_dup:
+            ignored.add(_track_id(other, idx))
+    return ignored
+
+
+def _merge_duplicate_tracks(
+    all_tracks: list[dict],
+) -> tuple[list[dict], list[tuple[int, int, int]]]:
+    """Merge near-identical duplicate tracks so one dancer keeps one ID."""
+    if len(all_tracks) < 2:
+        return all_tracks, []
+
+    from person_tracker import merge_tracks
+
+    num_frames = len(_track_numpy_bboxes(all_tracks[0]))
+    ordered_indices = sorted(
+        range(len(all_tracks)),
+        key=lambda idx: _track_quality_key(all_tracks[idx]),
+        reverse=True,
+    )
+    consumed: set[int] = set()
+    merged_tracks: list[dict] = []
+    merged_pairs: list[tuple[int, int, int]] = []
+
+    for idx in ordered_indices:
+        if idx in consumed:
+            continue
+        primary = all_tracks[idx]
+        for jdx in ordered_indices:
+            if jdx == idx or jdx in consumed:
+                continue
+            secondary = all_tracks[jdx]
+            is_dup, stats = _is_duplicate_track_pair(primary, secondary)
+            if not is_dup:
+                continue
+            primary = merge_tracks(primary, secondary, num_frames)
+            consumed.add(jdx)
+            merged_pairs.append(
+                (
+                    _track_id(primary, idx),
+                    _track_id(secondary, jdx),
+                    int(stats["high_iou_frames"]),
+                )
+            )
+        merged_tracks.append(primary)
+
+    merged_tracks.sort(key=_track_quality_key, reverse=True)
+    return merged_tracks, merged_pairs
+
+
+def _fragment_stitch_stats(
+    earlier_track: dict,
+    later_track: dict,
+) -> dict:
+    earlier_ids = _track_real_frame_ids(earlier_track)
+    later_ids = _track_real_frame_ids(later_track)
+    if len(earlier_ids) == 0 or len(later_ids) == 0:
+        return {
+            "gap_frames": None,
+            "temporal_overlap_frames": 0,
+            "combined_coverage_ratio": 0.0,
+            "boundary_y_delta_ratio": float("inf"),
+            "boundary_height_ratio": float("inf"),
+            "boundary_width_ratio": float("inf"),
+        }
+
+    earlier_boxes = _track_numpy_bboxes(earlier_track)
+    later_boxes = _track_numpy_bboxes(later_track)
+    num_frames = max(len(earlier_boxes), len(later_boxes))
+
+    earlier_set = set(int(f) for f in earlier_ids.tolist())
+    later_set = set(int(f) for f in later_ids.tolist())
+    temporal_overlap_frames = len(earlier_set & later_set)
+    gap_frames = int(later_ids[0] - earlier_ids[-1] - 1)
+    combined_coverage_ratio = len(earlier_set | later_set) / float(max(1, num_frames))
+
+    e_window = earlier_boxes[earlier_ids[-10:]]
+    l_window = later_boxes[later_ids[:10]]
+    e_center = np.stack(
+        [(e_window[:, 0] + e_window[:, 2]) / 2, (e_window[:, 1] + e_window[:, 3]) / 2],
+        axis=1,
+    )
+    l_center = np.stack(
+        [(l_window[:, 0] + l_window[:, 2]) / 2, (l_window[:, 1] + l_window[:, 3]) / 2],
+        axis=1,
+    )
+    e_size = np.maximum(e_window[:, 2:] - e_window[:, :2], 1.0)
+    l_size = np.maximum(l_window[:, 2:] - l_window[:, :2], 1.0)
+    mean_height = float((e_size[:, 1].mean() + l_size[:, 1].mean()) / 2.0)
+    boundary_y_delta_ratio = float(abs(l_center[:, 1].mean() - e_center[:, 1].mean()) / max(mean_height, 1.0))
+    boundary_height_ratio = float(max(e_size[:, 1].mean(), l_size[:, 1].mean()) / max(min(e_size[:, 1].mean(), l_size[:, 1].mean()), 1.0))
+    boundary_width_ratio = float(max(e_size[:, 0].mean(), l_size[:, 0].mean()) / max(min(e_size[:, 0].mean(), l_size[:, 0].mean()), 1.0))
+
+    return {
+        "gap_frames": gap_frames,
+        "temporal_overlap_frames": temporal_overlap_frames,
+        "combined_coverage_ratio": combined_coverage_ratio,
+        "boundary_y_delta_ratio": boundary_y_delta_ratio,
+        "boundary_height_ratio": boundary_height_ratio,
+        "boundary_width_ratio": boundary_width_ratio,
+    }
+
+
+def _is_fragment_stitch_candidate(
+    earlier_track: dict,
+    later_track: dict,
+    *,
+    max_gap_frames: int = 45,
+    max_temporal_overlap_frames: int = 15,
+    min_combined_coverage_ratio: float = 0.8,
+    max_individual_coverage_ratio: float = 0.75,
+    max_boundary_y_delta_ratio: float = 0.2,
+    max_boundary_height_ratio: float = 1.8,
+    max_boundary_width_ratio: float = 1.8,
+) -> tuple[bool, dict]:
+    stats = _fragment_stitch_stats(earlier_track, later_track)
+    if stats["gap_frames"] is None:
+        return False, stats
+
+    num_frames = max(len(earlier_track["bbx_xyxy"]), len(later_track["bbx_xyxy"]))
+    earlier_cov = len(_track_real_frame_ids(earlier_track)) / float(max(1, num_frames))
+    later_cov = len(_track_real_frame_ids(later_track)) / float(max(1, num_frames))
+
+    is_candidate = (
+        0 <= stats["gap_frames"] <= max_gap_frames
+        and stats["temporal_overlap_frames"] <= max_temporal_overlap_frames
+        and stats["combined_coverage_ratio"] >= min_combined_coverage_ratio
+        and earlier_cov <= max_individual_coverage_ratio
+        and later_cov <= max_individual_coverage_ratio
+        and stats["boundary_y_delta_ratio"] <= max_boundary_y_delta_ratio
+        and stats["boundary_height_ratio"] <= max_boundary_height_ratio
+        and stats["boundary_width_ratio"] <= max_boundary_width_ratio
+    )
+    return is_candidate, stats
+
+
+def _stitch_fragmented_tracks(
+    all_tracks: list[dict],
+) -> tuple[list[dict], list[tuple[int, int, int]]]:
+    """Stitch sequential fragments that likely belong to the same dancer."""
+    if len(all_tracks) < 2:
+        return all_tracks, []
+
+    from person_tracker import merge_tracks
+
+    num_frames = len(_track_numpy_bboxes(all_tracks[0]))
+    ordered_indices = sorted(
+        range(len(all_tracks)),
+        key=lambda idx: _track_real_frame_ids(all_tracks[idx])[0]
+        if len(_track_real_frame_ids(all_tracks[idx])) > 0 else num_frames,
+    )
+    consumed: set[int] = set()
+    stitched_tracks: list[dict] = []
+    stitched_pairs: list[tuple[int, int, int]] = []
+
+    for pos, idx in enumerate(ordered_indices):
+        if idx in consumed:
+            continue
+        current = all_tracks[idx]
+        current_ids = _track_real_frame_ids(current)
+        if len(current_ids) == 0:
+            stitched_tracks.append(current)
+            continue
+
+        while True:
+            current_last = _track_real_frame_ids(current)
+            next_match = None
+            next_stats = None
+            for jdx in ordered_indices:
+                if jdx == idx or jdx in consumed:
+                    continue
+                candidate = all_tracks[jdx]
+                candidate_ids = _track_real_frame_ids(candidate)
+                if len(candidate_ids) == 0 or candidate_ids[0] <= current_last[-1]:
+                    continue
+                ok, stats = _is_fragment_stitch_candidate(current, candidate)
+                if not ok:
+                    continue
+                if next_match is None or stats["gap_frames"] < next_stats["gap_frames"]:
+                    next_match = jdx
+                    next_stats = stats
+            if next_match is None:
+                break
+            candidate = all_tracks[next_match]
+            primary, secondary = (
+                (current, candidate)
+                if _track_quality_key(current) >= _track_quality_key(candidate)
+                else (candidate, current)
+            )
+            current = merge_tracks(primary, secondary, num_frames)
+            consumed.add(next_match)
+            stitched_pairs.append(
+                (
+                    _track_id(primary, idx),
+                    _track_id(secondary, next_match),
+                    int(next_stats["gap_frames"]),
+                )
+            )
+        stitched_tracks.append(current)
+
+    stitched_tracks.sort(key=_track_quality_key, reverse=True)
+    return stitched_tracks, stitched_pairs
+
+
 def _person_meta_path(person_dir: str | Path) -> Path:
     return Path(person_dir) / PERSON_META_FILENAME
 
@@ -267,6 +572,7 @@ def _make_person_meta(
     source_index: int,
     isolation_result: dict | None = None,
     bbox_override_path: str | None = None,
+    estimation_backend: str | None = None,
 ) -> dict:
     meta = {
         "binding_version": 1,
@@ -282,6 +588,8 @@ def _make_person_meta(
         meta["warnings"] = isolation_result.get("warnings", [])
     if bbox_override_path:
         meta["bbox_override_path"] = str(bbox_override_path)
+    if estimation_backend:
+        meta["estimation_backend"] = str(estimation_backend)
     return meta
 
 
@@ -336,6 +644,75 @@ def _save_bbox_override(
     )
     torch.save(payload, override_path)
     return override_path
+
+
+def _invalidate_reprocess_outputs(person_dir: Path, estimation_backend: str) -> None:
+    """Remove cached artifacts that can make incremental reruns stale."""
+    demo_dir = person_dir / "demo"
+    preprocess_dirs = [
+        demo_dir / "isolated_video" / "preprocess",
+        person_dir / "preprocess",
+    ]
+    artifact_paths = [
+        person_dir / "body.bvh",
+        person_dir / "confidence.csv",
+        person_dir / "hpe_results.pt",
+        person_dir / "0_kp2d77_overlay.mp4",
+        person_dir / "isolated_video_1_incam.mp4",
+        person_dir / "isolated_video_2_global.mp4",
+        person_dir / "isolated_video_3_incam_global_horiz.mp4",
+        person_dir / "demo" / "isolated_video" / "hmr4d_results.pt",
+        person_dir / "demo" / "isolated_video" / "1_incam.mp4",
+        person_dir / "demo" / "isolated_video" / "2_global.mp4",
+        person_dir / "demo" / "isolated_video" / "isolated_video_3_incam_global_horiz.mp4",
+    ]
+
+    for path in artifact_paths:
+        path.unlink(missing_ok=True)
+    for preprocess_dir in preprocess_dirs:
+        if preprocess_dir.is_dir():
+            shutil.rmtree(str(preprocess_dir), ignore_errors=True)
+
+
+def _export_person_bvh(person_dir: Path) -> Path | None:
+    """Regenerate per-person BVH from the freshest solver output."""
+    bvh_path = person_dir / "body.bvh"
+    # Try GEM-X/SOMA output first.
+    hpe_files = list(person_dir.rglob("hpe_results.pt"))
+    if hpe_files:
+        data = torch.load(str(hpe_files[0]), map_location="cpu", weights_only=False)
+        bp = data.get("body_params_incam") or data.get("body_params_global") or {}
+        body_pose = bp.get("body_pose")
+        if body_pose is not None and body_pose.shape[-1] // 3 > 21:
+            n_frames = body_pose.shape[0]
+            body_pose_3 = np.array(body_pose).reshape(n_frames, -1, 3)
+            go_3 = np.array(bp["global_orient"]).reshape(n_frames, 1, 3)
+            poses = np.concatenate([go_3, body_pose_3[:, :76]], axis=1).astype(np.float32)
+            soma_params = {
+                "poses": poses,
+                "transl": np.array(bp["transl"]).astype(np.float32),
+            }
+            if "identity_coeffs" in bp:
+                soma_params["identity_coeffs"] = np.array(bp["identity_coeffs"]).astype(np.float32)
+            if "scale_params" in bp:
+                soma_params["scale_params"] = np.array(bp["scale_params"]).astype(np.float32)
+
+            bodypipe_dir = GVHMR_DIR.parent / "bodypipe"
+            if str(bodypipe_dir) not in sys.path:
+                sys.path.insert(0, str(bodypipe_dir))
+            from workers.soma_bvh_export import convert_soma_to_bvh
+
+            convert_soma_to_bvh(soma_params, bvh_path)
+            return bvh_path
+
+    pt_files = list(person_dir.rglob("hmr4d_results.pt"))
+    if not pt_files:
+        return None
+    from smplx_to_bvh import convert_params_to_bvh, extract_gvhmr_params as _extract_gvhmr
+
+    params = _extract_gvhmr(str(pt_files[0]))
+    convert_params_to_bvh(params, str(bvh_path), skip_world_grounding=True)
+    return bvh_path
 
 
 def _bbox_iou(box_a: np.ndarray, box_b: np.ndarray) -> float:
@@ -465,6 +842,8 @@ def run_person_pipeline(
     f_mm=None,
     skip_render=False,
     render_incam_only=False,
+    force_preprocess=False,
+    force_infer=False,
 ):
     """Run the existing single-person GVHMR pipeline on an isolated person video.
 
@@ -509,6 +888,10 @@ def run_person_pipeline(
         cmd.append("--skip_render")
     elif render_incam_only:
         cmd.append("--render_incam_only")
+    if force_preprocess:
+        cmd.append("--force_preprocess")
+    if force_infer:
+        cmd.append("--force_infer")
 
     log_lines = [f"[Person {person_id}] Running GVHMR: {' '.join(cmd)}", ""]
 
@@ -549,6 +932,8 @@ def run_gemx_pipeline(
     static_cam=False,
     skip_render=True,
     bbx_override_path=None,
+    force_preprocess=False,
+    force_infer=False,
 ):
     """Run GEM-X (SOMA) estimation on a single isolated video.
 
@@ -579,6 +964,10 @@ def run_gemx_pipeline(
         cmd.append(f"--bbx_override={bbx_override_path}")
     if static_cam:
         cmd.append("--static_cam")
+    if force_preprocess:
+        cmd.append("--force_preprocess")
+    if force_infer:
+        cmd.append("--force_infer")
 
     log_lines = [f"[Person {person_id}] Running GEM-X: {' '.join(cmd)}", ""]
 
@@ -684,6 +1073,7 @@ def split_multi_person_video(
     tracks_path = detection_dir / "all_tracks.pt"
 
     all_tracks = None
+    all_tracks_data = None
     cache_reason = None
     current_tracker_backend = "unknown"
     if tracks_path.exists():
@@ -696,14 +1086,15 @@ def split_multi_person_video(
         cached_backend = cache_meta.get("tracker_backend")
         cached_version = int(cache_meta.get("tracking_version", 0))
 
-        if cached_version < 2:
-            cache_reason = "cached tracks predate current crossing fixes"
+        if cached_version < TRACKING_VERSION:
+            cache_reason = "cached tracks predate current duplicate/fragment merge fixes"
         elif cached_backend == "yolo" and current_tracker_backend == "ocsort":
             cache_reason = "cached tracks were generated without OC-SORT"
         else:
             all_tracks = cached_tracks
             _progress(0.10, f"Loaded {len(all_tracks)} cached tracks ({cached_backend or 'legacy cache'})")
 
+    tracks_cache_dirty = False
     if all_tracks is None:
         from person_tracker import PersonTracker, render_track_visualization
 
@@ -718,6 +1109,7 @@ def split_multi_person_video(
             {"tracks": all_tracks, "metadata": tracker.cache_metadata()},
             str(tracks_path),
         )
+        tracks_cache_dirty = True
         del tracker
         torch.cuda.empty_cache()
 
@@ -726,6 +1118,34 @@ def split_multi_person_video(
         render_track_visualization(video_path, all_tracks, str(viz_path))
 
         _progress(0.10, f"Detected {len(all_tracks)} people ({current_tracker_backend})")
+
+    merged_tracks, merged_pairs = _merge_duplicate_tracks(all_tracks)
+    if len(merged_tracks) != len(all_tracks):
+        summary = ", ".join(f"{a}<-{b} ({frames} hi-IoU frames)" for a, b, frames in merged_pairs)
+        _progress(0.10, f"Merged duplicate track fragments: {summary}")
+        all_tracks = merged_tracks
+        tracks_cache_dirty = True
+
+    stitched_tracks, stitched_pairs = _stitch_fragmented_tracks(all_tracks)
+    if len(stitched_tracks) != len(all_tracks):
+        summary = ", ".join(f"{a}<-{b} (gap {gap}f)" for a, b, gap in stitched_pairs)
+        _progress(0.10, f"Stitched sequential track fragments: {summary}")
+        all_tracks = stitched_tracks
+        tracks_cache_dirty = True
+
+    if tracks_cache_dirty:
+        if all_tracks_data is None and tracks_path.exists():
+            all_tracks_data = torch.load(str(tracks_path), map_location="cpu", weights_only=False)
+        cache_metadata = (
+            all_tracks_data.get("metadata", {})
+            if isinstance(all_tracks_data, dict)
+            else {}
+        )
+        cache_metadata = dict(cache_metadata)
+        cache_metadata["tracking_version"] = max(TRACKING_VERSION, int(cache_metadata.get("tracking_version", 0)))
+        cache_metadata["duplicate_merge_count"] = len(merged_pairs)
+        cache_metadata["fragment_stitch_count"] = len(stitched_pairs)
+        torch.save({"tracks": all_tracks, "metadata": cache_metadata}, str(tracks_path))
 
     # Cap to max_persons largest tracks (already sorted by area)
     inactive_tracks = []
@@ -945,6 +1365,7 @@ def split_multi_person_video(
             source_index=i,
             isolation_result=isolation_result,
             bbox_override_path=str(bbox_override_path),
+            estimation_backend=estimation_backend,
         )
         _save_person_meta(person_dir, meta)
         person_meta_by_tid[tid] = meta
@@ -1095,12 +1516,21 @@ def split_multi_person_video(
                     vitpose = vp
 
             # Compute confidence scores
+            ignored_track_ids = _duplicate_track_ids_for_target(all_tracks, i)
+            mask_overlap = _compute_track_mask_overlap(
+                target_person_id=tid,
+                all_masks=masks,
+                num_frames=num_person_frames,
+                ignored_track_ids=ignored_track_ids,
+            )
             initial_confidences = compute_all_confidences(
                 track_idx=i,
                 all_tracks=all_tracks,
                 num_frames=num_person_frames,
                 vitpose=vitpose,
                 per_frame_betas=per_frame_betas,
+                overlap_signal=mask_overlap,
+                ignored_track_ids=ignored_track_ids,
             )
 
             # Create identity track and auto-generate keyframes
@@ -1116,6 +1546,10 @@ def split_multi_person_video(
                 per_frame_poses=params.get("body_pose", params.get("body_pose_world")),
             )
             id_track.establish_identity()
+            verified_frames = {
+                kf.frame_index for kf in id_track.keyframes
+                if getattr(kf, "verified", False)
+            }
             confidences = compute_all_confidences(
                 track_idx=i,
                 all_tracks=all_tracks,
@@ -1123,6 +1557,10 @@ def split_multi_person_video(
                 vitpose=vitpose,
                 per_frame_betas=per_frame_betas,
                 established_betas=id_track.established_betas,
+                overlap_signal=mask_overlap,
+                verified_frames=verified_frames,
+                stable_reference_frames=len(id_track.keyframes),
+                ignored_track_ids=ignored_track_ids,
             )
             for kf in id_track.keyframes:
                 if 0 <= kf.frame_index < len(confidences):
@@ -1135,11 +1573,6 @@ def split_multi_person_video(
             transl = params.get("transl_world", params.get("transl"))
 
             if body_pose is not None and global_orient is not None and transl is not None:
-                mask_overlap = _compute_track_mask_overlap(
-                    target_person_id=tid,
-                    all_masks=masks,
-                    num_frames=num_person_frames,
-                )
                 if mask_overlap is not None:
                     crossing_spans = crossing_spans_from_signal(mask_overlap, threshold=0.10)
                 else:
@@ -1265,48 +1698,10 @@ def split_multi_person_video(
     _progress(0.85, "Generating BVH files...")
 
     for i, person_dir in enumerate(person_dirs):
-        bvh_path = person_dir / "body.bvh"
         try:
-            # Try GEM-X/SOMA output first
-            hpe_files = list(person_dir.rglob("hpe_results.pt"))
-            if hpe_files:
-                import torch as _torch
-                data = _torch.load(str(hpe_files[0]), map_location="cpu", weights_only=False)
-                bp = data.get("body_params_incam") or data.get("body_params_global") or {}
-                body_pose = bp.get("body_pose")
-                if body_pose is not None and body_pose.shape[-1] // 3 > 21:
-                    # SOMA-77 format → use bodypipe's SOMA BVH exporter
-                    import numpy as _np
-                    n_frames = body_pose.shape[0]
-                    body_pose_3 = _np.array(body_pose).reshape(n_frames, -1, 3)
-                    go_3 = _np.array(bp["global_orient"]).reshape(n_frames, 1, 3)
-                    poses = _np.concatenate([go_3, body_pose_3[:, :76]], axis=1).astype(_np.float32)
-                    soma_params = {
-                        "poses": poses,
-                        "transl": _np.array(bp["transl"]).astype(_np.float32),
-                    }
-                    if "identity_coeffs" in bp:
-                        soma_params["identity_coeffs"] = _np.array(bp["identity_coeffs"]).astype(_np.float32)
-                    if "scale_params" in bp:
-                        soma_params["scale_params"] = _np.array(bp["scale_params"]).astype(_np.float32)
-
-                    # Import bodypipe's SOMA BVH exporter
-                    bodypipe_dir = GVHMR_DIR.parent / "bodypipe"
-                    if str(bodypipe_dir) not in sys.path:
-                        sys.path.insert(0, str(bodypipe_dir))
-                    from workers.soma_bvh_export import convert_soma_to_bvh
-                    convert_soma_to_bvh(soma_params, bvh_path)
-                    _progress(0.85 + (i + 1) / len(person_dirs) * 0.05,
-                              f"Person {i} BVH exported (SOMA)")
-                    continue
-
-            # Fall back to GVHMR/SMPL-X BVH export
-            pt_files = list(person_dir.rglob("hmr4d_results.pt"))
-            if not pt_files:
+            bvh_path = _export_person_bvh(person_dir)
+            if bvh_path is None:
                 continue
-            from smplx_to_bvh import convert_params_to_bvh, extract_gvhmr_params as _extract_gvhmr
-            params = _extract_gvhmr(str(pt_files[0]))
-            convert_params_to_bvh(params, str(bvh_path), skip_world_grounding=True)
             _progress(0.85 + (i + 1) / len(person_dirs) * 0.05,
                       f"Person {i} BVH exported")
         except Exception as e:
@@ -1378,7 +1773,7 @@ def reprocess_person(
     video_path: str,
     person_index: int,
     person_dir: str,
-    updated_bboxes: np.ndarray,
+    original_bboxes: np.ndarray,
     all_tracks: list[dict],
     slam_path: str,
     masks_dir: str,
@@ -1386,6 +1781,7 @@ def reprocess_person(
     use_dpvo: bool = False,
     progress_callback=None,
     estimation_backend: str = "gvhmr",
+    manual_bbox_keyframes: dict[int, np.ndarray] | None = None,
     verified_identity_keyframes: list[dict] | None = None,
 ) -> dict:
     """Re-run isolation + estimation for a single person after bbox corrections.
@@ -1400,9 +1796,20 @@ def reprocess_person(
 
     track = all_tracks[person_index]
     tid = track.get("track_id", person_index)
+    regenerated = regenerate_dense_track(
+        all_tracks=all_tracks,
+        target_index=person_index,
+        original_bboxes=np.asarray(original_bboxes, dtype=np.float32),
+        manual_bbox_keyframes=manual_bbox_keyframes,
+        verified_identity_keyframes=verified_identity_keyframes,
+    )
+    track = regenerated.as_track_dict(track)
+    all_tracks[person_index] = track
+    updated_bboxes = regenerated.boxes
 
     print(f"[reprocess_person] START person_index={person_index}, tid={tid}, "
-          f"backend={estimation_backend}, bboxes={updated_bboxes.shape}")
+          f"backend={estimation_backend}, bboxes={updated_bboxes.shape}, "
+          f"anchors={len(regenerated.anchor_frames)}")
 
     # 1. Update track bboxes in-place
     track["bbx_xyxy"] = torch.from_numpy(updated_bboxes)
@@ -1416,6 +1823,7 @@ def reprocess_person(
         isolated_video.rename(bak_video)
     if demo_dir.exists():
         demo_dir.rename(bak_demo)
+    _invalidate_reprocess_outputs(person_dir, estimation_backend)
 
     # 3. Re-isolate person
     if progress_callback:
@@ -1503,6 +1911,7 @@ def reprocess_person(
             source_index=person_index,
             isolation_result=isolation_result,
             bbox_override_path=str(bbox_override_path),
+                estimation_backend=estimation_backend,
         ),
     )
     if isolation_result is not None:
@@ -1521,6 +1930,8 @@ def reprocess_person(
                 static_cam=static_cam,
                 skip_render=True,
                 bbx_override_path=str(bbox_override_path),
+                force_preprocess=True,
+                force_infer=True,
             )
         else:
             pt_path, _ = run_person_pipeline(
@@ -1532,6 +1943,8 @@ def reprocess_person(
                 static_cam=static_cam,
                 use_dpvo=use_dpvo,
                 skip_render=True,
+                force_preprocess=True,
+                force_infer=True,
             )
     except Exception as e:
         print(f"[reprocess_person] Pipeline crashed for person {person_index}: {e}")
@@ -1589,12 +2002,29 @@ def reprocess_person(
             elif isinstance(vp, np.ndarray):
                 vitpose = vp
 
+        anchor_frames = set(manual_bbox_keyframes.keys())
+        anchor_frames.update(
+            int(entry.get("frame", -1))
+            for entry in (verified_identity_keyframes or [])
+            if int(entry.get("frame", -1)) >= 0
+        )
+
+        ignored_track_ids = _duplicate_track_ids_for_target(all_tracks, person_index)
+        mask_overlap = _compute_track_mask_overlap(
+            target_person_id=tid,
+            all_masks=masks,
+            num_frames=num_person_frames,
+            ignored_track_ids=ignored_track_ids,
+        )
         initial_confidences = compute_all_confidences(
             track_idx=person_index,
             all_tracks=all_tracks,
             num_frames=num_person_frames,
             vitpose=vitpose,
             per_frame_betas=per_frame_betas,
+            overlap_signal=mask_overlap,
+            anchor_frames=anchor_frames,
+            ignored_track_ids=ignored_track_ids,
         )
 
         id_track = IdentityTrack(person_id=tid)
@@ -1628,6 +2058,11 @@ def reprocess_person(
                 metadata={"source": "bodypipe_reprocess"},
             )
         id_track.establish_identity()
+        verified_frames = {
+            kf.frame_index for kf in id_track.keyframes
+            if getattr(kf, "verified", False)
+        }
+        confidence_anchor_frames = set(anchor_frames) | set(verified_frames)
         confidences = compute_all_confidences(
             track_idx=person_index,
             all_tracks=all_tracks,
@@ -1635,6 +2070,11 @@ def reprocess_person(
             vitpose=vitpose,
             per_frame_betas=per_frame_betas,
             established_betas=id_track.established_betas,
+            overlap_signal=mask_overlap,
+            verified_frames=verified_frames,
+            anchor_frames=confidence_anchor_frames,
+            stable_reference_frames=max(len(id_track.keyframes), len(confidence_anchor_frames)),
+            ignored_track_ids=ignored_track_ids,
         )
         for kf in id_track.keyframes:
             if 0 <= kf.frame_index < len(confidences):
@@ -1648,11 +2088,6 @@ def reprocess_person(
 
         bridged_frames = set()
         if body_pose is not None and global_orient is not None and transl is not None:
-            mask_overlap = _compute_track_mask_overlap(
-                target_person_id=tid,
-                all_masks=masks,
-                num_frames=num_person_frames,
-            )
             if mask_overlap is not None:
                 crossing_spans = crossing_spans_from_signal(mask_overlap, threshold=0.10)
             else:
@@ -1730,6 +2165,10 @@ def reprocess_person(
 
         result["identity_track"] = id_track
         result["confidences"] = confidences
+        result["regenerated_track"] = track
+        bvh_path = _export_person_bvh(person_dir)
+        if bvh_path is not None:
+            result["bvh_path"] = str(bvh_path)
 
     except Exception as e:
         import traceback
@@ -1848,7 +2287,12 @@ def _merge_crossing_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]
     return merged
 
 
-def _compute_track_mask_overlap(target_person_id, all_masks, num_frames):
+def _compute_track_mask_overlap(
+    target_person_id,
+    all_masks,
+    num_frames,
+    ignored_track_ids: set[int] | None = None,
+):
     """Measure overlap of one person's mask against all others per frame.
 
     Returns a per-frame fraction based on intersection over the smaller mask area.
@@ -1866,6 +2310,8 @@ def _compute_track_mask_overlap(target_person_id, all_masks, num_frames):
     overlap = np.zeros(n, dtype=np.float32)
     for other_tid, other_masks in all_masks.items():
         if other_tid == target_person_id:
+            continue
+        if ignored_track_ids and int(other_tid) in ignored_track_ids:
             continue
         m = min(n, len(other_masks))
         for f in range(m):

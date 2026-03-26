@@ -1,7 +1,11 @@
 import cv2
 import numpy as np
 from dataclasses import dataclass
-import pycolmap
+try:
+    import pycolmap
+    _HAS_PYCOLMAP = True
+except ImportError:
+    _HAS_PYCOLMAP = False
 from .transformation_np import *
 
 
@@ -51,7 +55,11 @@ class Cv2RansacEssentialSolver:
         # Recover pose
         _, R, t, mask = cv2.recoverPose(E, pts0, pts1, self.camera_matrix, mask=mask)
 
-        return R, t
+        # Return as 4x4 transform matrix (same format as pycolmap solver)
+        T = np.eye(4, dtype=np.float32)
+        T[:3, :3] = R
+        T[:3, 3] = t.flatten()
+        return T
 
 
 class PycolmapRansacTwoViewGeometrySolver:
@@ -109,13 +117,16 @@ class PycolmapRansacTwoViewGeometrySolver:
 
 
 two_pair_solver_map = {
-    # "cv2": Cv2RansacEssentialSolver,  # This is not stable
-    "pycolmap": PycolmapRansacTwoViewGeometrySolver,  # Essential and Homography at the same time
+    "cv2": Cv2RansacEssentialSolver,
 }
+if _HAS_PYCOLMAP:
+    two_pair_solver_map["pycolmap"] = PycolmapRansacTwoViewGeometrySolver
 
 
 class TwoPairSolver:
-    def __init__(self, params: CameraParams, solver: str = "pycolmap"):
+    def __init__(self, params: CameraParams, solver: str = None):
+        if solver is None:
+            solver = "pycolmap" if _HAS_PYCOLMAP else "cv2"
         self.solver = two_pair_solver_map[solver](params)
 
     def get_K(self):

@@ -30,7 +30,7 @@ class SimpleVO:
 
         matcher: Matcher = Matcher(self.method)
         camera_params = CameraParams(W, H, focal_length=focal_length_from_mm(W, H, self.f_mm))
-        solver: TwoPairSolver = TwoPairSolver(camera_params, solver="pycolmap")
+        solver: TwoPairSolver = TwoPairSolver(camera_params)
 
         # TODO:We should use different pipelines for different methods
         T_w2c_list = self.process_video_T_w2c_list_np(frames, matcher, solver)

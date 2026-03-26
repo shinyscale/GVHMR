@@ -1,5 +1,13 @@
 import cv2
 import torch
+
+# PyTorch 2.12+ defaults weights_only=True which breaks YOLO/ultralytics
+_orig_torch_load = torch.load
+def _patched_torch_load(*args, **kwargs):
+    kwargs.setdefault("weights_only", False)
+    return _orig_torch_load(*args, **kwargs)
+torch.load = _patched_torch_load
+
 import pytorch_lightning as pl
 import numpy as np
 import argparse
@@ -54,6 +62,8 @@ def parse_args_to_cfg():
     parser.add_argument("--verbose", action="store_true", help="If true, draw intermediate results")
     parser.add_argument("--skip_render", action="store_true", help="Skip all video rendering (solve only)")
     parser.add_argument("--render_incam_only", action="store_true", help="Render in-camera overlay only (skip global)")
+    parser.add_argument("--force_preprocess", action="store_true", help="Recompute preprocess artifacts even if cached files exist.")
+    parser.add_argument("--force_infer", action="store_true", help="Recompute hmr4d_results.pt even if it already exists.")
     parser.add_argument(
         "--slam_override",
         type=str,
@@ -109,6 +119,8 @@ def parse_args_to_cfg():
     cfg.bbx_override = args.bbx_override
     cfg.skip_render = args.skip_render
     cfg.render_incam_only = args.render_incam_only
+    cfg.force_preprocess = args.force_preprocess
+    cfg.force_infer = args.force_infer
     OmegaConf.set_struct(cfg, True)
 
     # Copy raw-input-video to video_path
@@ -132,6 +144,7 @@ def run_preprocess(cfg):
     paths = cfg.paths
     static_cam = cfg.static_cam
     verbose = cfg.verbose
+    force_preprocess = bool(getattr(cfg, "force_preprocess", False))
 
     # Get bbx tracking result
     bbx_override = getattr(cfg, "bbx_override", None)
@@ -155,7 +168,7 @@ def run_preprocess(cfg):
             bbx_xys = bbx_xys.float()
         torch.save({"bbx_xyxy": bbx_xyxy, "bbx_xys": bbx_xys}, paths.bbx)
         Log.info(f"[Preprocess] bbx override from {bbx_override}")
-    elif not Path(paths.bbx).exists():
+    elif force_preprocess or not Path(paths.bbx).exists():
         tracker = Tracker()
         bbx_xyxy = tracker.get_one_track(video_path).float()  # (L, 4)
         bbx_xys = get_bbx_xys_from_xyxy(bbx_xyxy, base_enlarge=1.2).float()  # (L, 3) apply aspect ratio and enlarge
@@ -171,7 +184,7 @@ def run_preprocess(cfg):
         save_video(video_overlay, cfg.paths.bbx_xyxy_video_overlay)
 
     # Get VitPose
-    if not Path(paths.vitpose).exists():
+    if force_preprocess or not Path(paths.vitpose).exists():
         vitpose_extractor = VitPoseExtractor()
         vitpose = vitpose_extractor.extract(video_path, bbx_xys)
         torch.save(vitpose, paths.vitpose)
@@ -185,7 +198,7 @@ def run_preprocess(cfg):
         save_video(video_overlay, paths.vitpose_video_overlay)
 
     # Get vit features
-    if not Path(paths.vit_features).exists():
+    if force_preprocess or not Path(paths.vit_features).exists():
         extractor = Extractor()
         vit_features = extractor.extract_video_features(video_path, bbx_xys)
         torch.save(vit_features, paths.vit_features)
@@ -202,7 +215,7 @@ def run_preprocess(cfg):
             if str(Path(slam_override).resolve()) != str(Path(paths.slam).resolve()):
                 shutil.copy2(slam_override, paths.slam)
             Log.info(f"[Preprocess] slam override from {slam_override}")
-        elif not Path(paths.slam).exists():
+        elif force_preprocess or not Path(paths.slam).exists():
             if not cfg.use_dpvo:
                 simple_vo = SimpleVO(cfg.video_path, scale=0.5, step=8, method="sift", f_mm=cfg.f_mm)
                 vo_results = simple_vo.compute()  # (L, 4, 4), numpy
@@ -371,7 +384,7 @@ if __name__ == "__main__":
     data = load_data_dict(cfg)
 
     # ===== HMR4D ===== #
-    if not Path(paths.hmr4d_results).exists():
+    if getattr(cfg, "force_infer", False) or not Path(paths.hmr4d_results).exists():
         Log.info("[HMR4D] Predicting")
         model: DemoPL = hydra.utils.instantiate(cfg.model, _recursive_=False)
         model.load_pretrained_model(cfg.ckpt_path)
@@ -385,9 +398,12 @@ if __name__ == "__main__":
 
     # ===== Render ===== #
     if not getattr(cfg, "skip_render", False):
-        render_incam(cfg)
-        if not getattr(cfg, "render_incam_only", False):
-            render_global(cfg)
-            if not Path(paths.incam_global_horiz_video).exists():
-                Log.info("[Merge Videos]")
-                merge_videos_horizontal([paths.incam_video, paths.global_video], paths.incam_global_horiz_video)
+        try:
+            render_incam(cfg)
+            if not getattr(cfg, "render_incam_only", False):
+                render_global(cfg)
+                if not Path(paths.incam_global_horiz_video).exists():
+                    Log.info("[Merge Videos]")
+                    merge_videos_horizontal([paths.incam_video, paths.global_video], paths.incam_global_horiz_video)
+        except Exception as e:
+            Log.warning(f"[Render] Skipped (non-fatal): {e}")
