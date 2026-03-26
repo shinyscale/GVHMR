@@ -13,7 +13,7 @@ class DemoPL(pl.LightningModule):
         self.pipeline = instantiate(pipeline, _recursive_=False)
 
     @torch.no_grad()
-    def predict(self, data, static_cam=False):
+    def predict(self, data, static_cam=False, stabilize_global_orient=False):
         """auto add batch dim
         data: {
             "length": int, or Torch.Tensor,
@@ -35,7 +35,13 @@ class DemoPL(pl.LightningModule):
             "f_imgseq": data["f_imgseq"][None],
         }
         batch = {k: v.cuda() for k, v in batch.items()}
-        outputs = self.pipeline.forward(batch, train=False, postproc=True, static_cam=static_cam)
+        outputs = self.pipeline.forward(
+            batch,
+            train=False,
+            postproc=True,
+            static_cam=static_cam,
+            stabilize_global_orient=stabilize_global_orient,
+        )
 
         pred = {
             "smpl_params_global": {k: v[0] for k, v in outputs["pred_smpl_params_global"].items()},

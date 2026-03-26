@@ -782,6 +782,14 @@ def _normalize_world_space_motion(params: dict) -> dict:
     return normalized
 
 
+def normalize_world_space_motion(params: dict, fps: float | None = None) -> dict:
+    """Public wrapper for GVHMR-style world-space drift compensation."""
+    normalized = dict(params)
+    if fps is not None:
+        normalized["fps"] = fps
+    return _normalize_world_space_motion(normalized)
+
+
 def _compute_ground_offset_cm() -> float:
     """Compute the Y offset (cm) to add to the ROOT so feet rest at Y=0.
 
