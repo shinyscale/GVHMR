@@ -76,11 +76,6 @@ def parse_args_to_cfg():
         default=None,
         help="Path to pre-computed bounding boxes (.pt). Skips single-person retracking when provided.",
     )
-    parser.add_argument(
-        "--stabilize_global_orient",
-        action="store_true",
-        help="Rebuild world orientation from stabilized camera heading before IK/postprocess.",
-    )
     args = parser.parse_args()
 
     # Input
@@ -126,7 +121,6 @@ def parse_args_to_cfg():
     cfg.render_incam_only = args.render_incam_only
     cfg.force_preprocess = args.force_preprocess
     cfg.force_infer = args.force_infer
-    cfg.stabilize_global_orient = args.stabilize_global_orient
     OmegaConf.set_struct(cfg, True)
 
     # Copy raw-input-video to video_path
@@ -156,11 +150,9 @@ def run_preprocess(cfg):
     bbx_override = getattr(cfg, "bbx_override", None)
     if bbx_override and Path(bbx_override).exists():
         override_data = torch.load(bbx_override, map_location="cpu", weights_only=False)
-        override_k = None
         if isinstance(override_data, dict) and "bbx_xyxy" in override_data:
             bbx_xyxy = override_data["bbx_xyxy"]
             bbx_xys = override_data.get("bbx_xys")
-            override_k = override_data.get("K_fullimg")
         else:
             bbx_xyxy = override_data
             bbx_xys = None
@@ -174,14 +166,7 @@ def run_preprocess(cfg):
             bbx_xys = torch.from_numpy(bbx_xys).float()
         else:
             bbx_xys = bbx_xys.float()
-        if isinstance(override_k, np.ndarray):
-            override_k = torch.from_numpy(override_k).float()
-        elif override_k is not None:
-            override_k = override_k.float()
-        payload = {"bbx_xyxy": bbx_xyxy, "bbx_xys": bbx_xys}
-        if override_k is not None:
-            payload["K_fullimg"] = override_k
-        torch.save(payload, paths.bbx)
+        torch.save({"bbx_xyxy": bbx_xyxy, "bbx_xys": bbx_xys}, paths.bbx)
         Log.info(f"[Preprocess] bbx override from {bbx_override}")
     elif force_preprocess or not Path(paths.bbx).exists():
         tracker = Tracker()
@@ -260,7 +245,6 @@ def run_preprocess(cfg):
 def load_data_dict(cfg):
     paths = cfg.paths
     length, width, height = get_video_lwh(cfg.video_path)
-    bbx_data = torch.load(weights_only=False, f=paths.bbx)
     if cfg.static_cam:
         R_w2c = torch.eye(3).repeat(length, 1, 1)
     else:
@@ -270,24 +254,14 @@ def load_data_dict(cfg):
             R_w2c = quaternion_to_matrix(traj_quat).mT
         else:  # SimpleVO
             R_w2c = torch.from_numpy(traj[:, :3, :3])
-    override_k = bbx_data.get("K_fullimg")
-    if override_k is not None:
-        if isinstance(override_k, np.ndarray):
-            override_k = torch.from_numpy(override_k).float()
-        else:
-            override_k = override_k.float()
-        if override_k.ndim == 2:
-            K_fullimg = override_k.unsqueeze(0).repeat(length, 1, 1)
-        else:
-            K_fullimg = override_k[:length]
-    elif cfg.f_mm is not None:
+    if cfg.f_mm is not None:
         K_fullimg = create_camera_sensor(width, height, cfg.f_mm)[2].repeat(length, 1, 1)
     else:
         K_fullimg = estimate_K(width, height).repeat(length, 1, 1)
 
     data = {
         "length": torch.tensor(length),
-        "bbx_xys": bbx_data["bbx_xys"],
+        "bbx_xys": torch.load(weights_only=False, f=paths.bbx)["bbx_xys"],
         "kp2d": torch.load(weights_only=False, f=paths.vitpose),
         "K_fullimg": K_fullimg,
         "cam_angvel": compute_cam_angvel(R_w2c),
@@ -346,12 +320,6 @@ def render_global(cfg):
 
     debug_cam = False
     pred = torch.load(weights_only=False, f=cfg.paths.hmr4d_results)
-    from smplx_to_bvh import extract_gvhmr_params, normalize_world_space_motion
-
-    world_params = extract_gvhmr_params(str(cfg.paths.hmr4d_results))
-    world_params = normalize_world_space_motion(world_params, fps=30.0)
-    pred["smpl_params_global"]["global_orient"] = torch.from_numpy(world_params["global_orient"]).float()
-    pred["smpl_params_global"]["transl"] = torch.from_numpy(world_params["transl"]).float()
     smplx = make_smplx("supermotion").cuda()
     smplx2smpl = torch.load(weights_only=False, f="hmr4d/utils/body_model/smplx2smpl_sparse.pt").cuda()
     faces_smpl = make_smplx("smpl").faces
@@ -422,11 +390,7 @@ if __name__ == "__main__":
         model.load_pretrained_model(cfg.ckpt_path)
         model = model.eval().cuda()
         tic = Log.sync_time()
-        pred = model.predict(
-            data,
-            static_cam=cfg.static_cam,
-            stabilize_global_orient=bool(getattr(cfg, "stabilize_global_orient", False)),
-        )
+        pred = model.predict(data, static_cam=cfg.static_cam)
         pred = detach_to_cpu(pred)
         data_time = data["length"] / 30
         Log.info(f"[HMR4D] Elapsed: {Log.sync_time() - tic:.2f}s for data-length={data_time:.1f}s")

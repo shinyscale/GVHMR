@@ -16,68 +16,6 @@ from hmr4d.model.gvhmr.utils.endecoder import EnDecoder
 from hmr4d.utils.wis3d_utils import make_wis3d, add_motion_as_lines
 
 
-def _as_identity(R):
-    is_I = matrix_to_axis_angle(R).norm(dim=-1) < 1e-5
-    R = R.clone()
-    R[is_I] = torch.eye(3)[None].expand(is_I.sum(), -1, -1).to(R)
-    return R
-
-
-def _yaw_from_matrix(R):
-    forward = R[..., :, 2]
-    return torch.atan2(forward[..., 0], forward[..., 2])
-
-
-def _yaw_to_matrix(yaw):
-    zeros = torch.zeros_like(yaw)
-    ones = torch.ones_like(yaw)
-    cos_yaw = torch.cos(yaw)
-    sin_yaw = torch.sin(yaw)
-    row0 = torch.stack([cos_yaw, zeros, sin_yaw], dim=-1)
-    row1 = torch.stack([zeros, ones, zeros], dim=-1)
-    row2 = torch.stack([-sin_yaw, zeros, cos_yaw], dim=-1)
-    return torch.stack([row0, row1, row2], dim=-2)
-
-
-def _smooth_heading(heading, sigma):
-    sin_h = gaussian_smooth(torch.sin(heading), sigma=sigma, dim=-1)
-    cos_h = gaussian_smooth(torch.cos(heading), sigma=sigma, dim=-1)
-    return torch.atan2(sin_h, cos_h)
-
-
-@autocast(enabled=False)
-def get_stable_global_orient(global_orient_gv, global_orient_c, cam_angvel):
-    """Rebuild world yaw from a fused body-anchored and VO camera heading."""
-    B, L = cam_angvel.shape[:2]
-    R_gv = axis_angle_to_matrix(global_orient_gv)
-    R_c = axis_angle_to_matrix(global_orient_c)
-
-    # Absolute camera heading derived from the network's GV/body relationship.
-    R_c2gv = R_gv @ R_c.mT
-    heading_body = _yaw_from_matrix(R_c2gv)
-
-    # Relative camera motion from VO anchored to the first-frame camera heading.
-    R_t_to_tp1 = _as_identity(rotation_6d_to_matrix(cam_angvel.float()))
-    cam_to_world = [R_c2gv[:, 0]]
-    for i in range(1, L):
-        cam_to_world.append(cam_to_world[-1] @ R_t_to_tp1[:, i - 1].mT)
-    cam_to_world = torch.stack(cam_to_world, dim=1)
-    heading_vo = _yaw_from_matrix(cam_to_world)
-
-    # Blend a heavily smoothed absolute heading with a lighter VO heading so
-    # we keep real pans while rejecting long-horizon drift.
-    sigma_body = max(5, min(31, L // 48 or 5))
-    sigma_vo = max(3, min(15, L // 96 or 3))
-    heading_body = _smooth_heading(heading_body, sigma=sigma_body)
-    heading_vo = _smooth_heading(heading_vo, sigma=sigma_vo)
-    sin_heading = 0.75 * torch.sin(heading_body) + 0.25 * torch.sin(heading_vo)
-    cos_heading = 0.75 * torch.cos(heading_body) + 0.25 * torch.cos(heading_vo)
-    heading = torch.atan2(sin_heading, cos_heading)
-
-    global_orient = matrix_to_axis_angle(_yaw_to_matrix(heading) @ R_c)
-    return global_orient
-
-
 @autocast(enabled=False)
 def pp_static_joint(outputs, endecoder: EnDecoder):
     # Global FK

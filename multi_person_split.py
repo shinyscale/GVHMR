@@ -607,7 +607,6 @@ def _build_bbox_override_payload(
     bboxes_fullframe: np.ndarray,
     crop_bbox: list[int] | tuple[int, int, int, int] | None,
     output_size: tuple[int, int] | None = None,
-    K_fullimg: np.ndarray | torch.Tensor | None = None,
 ) -> dict:
     """Convert full-frame boxes into isolated-video coordinates for demo.py."""
     bboxes = np.asarray(bboxes_fullframe, dtype=np.float32).copy()
@@ -625,16 +624,10 @@ def _build_bbox_override_payload(
 
     bbx_xyxy = torch.from_numpy(bboxes).float()
     bbx_xys = get_bbx_xys_from_xyxy(bbx_xyxy, base_enlarge=1.2).float()
-    payload = {
+    return {
         "bbx_xyxy": bbx_xyxy,
         "bbx_xys": bbx_xys,
     }
-    if K_fullimg is not None:
-        if isinstance(K_fullimg, np.ndarray):
-            payload["K_fullimg"] = torch.from_numpy(K_fullimg).float()
-        else:
-            payload["K_fullimg"] = K_fullimg.float()
-    return payload
 
 
 def _save_bbox_override(
@@ -642,14 +635,12 @@ def _save_bbox_override(
     track: dict,
     crop_bbox: list[int] | tuple[int, int, int, int] | None,
     output_size: tuple[int, int] | None = None,
-    K_fullimg: np.ndarray | torch.Tensor | None = None,
 ) -> Path:
     override_path = Path(person_dir) / "bbox_override.pt"
     payload = _build_bbox_override_payload(
         _track_numpy_bboxes(track),
         crop_bbox=crop_bbox,
         output_size=output_size,
-        K_fullimg=K_fullimg,
     )
     torch.save(payload, override_path)
     return override_path
@@ -853,7 +844,6 @@ def run_person_pipeline(
     render_incam_only=False,
     force_preprocess=False,
     force_infer=False,
-    stabilize_global_orient=True,
 ):
     """Run the existing single-person GVHMR pipeline on an isolated person video.
 
@@ -894,8 +884,6 @@ def run_person_pipeline(
         cmd.append(f"--slam_override={slam_override_path}")
     if bbx_override_path:
         cmd.append(f"--bbx_override={bbx_override_path}")
-    if stabilize_global_orient:
-        cmd.append("--stabilize_global_orient")
     if skip_render:
         cmd.append("--skip_render")
     elif render_incam_only:
@@ -1066,8 +1054,6 @@ def split_multi_person_video(
     video_path = str(video_path)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    _, video_width, video_height = get_video_lwh(video_path)
-    original_K_fullimg = estimate_K(video_width, video_height)
 
     result = MultiPersonResult(output_dir=str(output_dir))
     log_lines = []
@@ -1291,12 +1277,7 @@ def split_multi_person_video(
 
         if can_reuse_isolation:
             crop_bbox = meta.get("crop_bbox") if meta else None
-            bbox_override_path = _save_bbox_override(
-                person_dir,
-                track,
-                crop_bbox=crop_bbox,
-                K_fullimg=original_K_fullimg,
-            )
+            bbox_override_path = _save_bbox_override(person_dir, track, crop_bbox=crop_bbox)
             if meta:
                 meta["bbox_override_path"] = str(bbox_override_path)
                 _save_person_meta(person_dir, meta)
@@ -1378,12 +1359,7 @@ def split_multi_person_video(
             person_video_paths.append(str(isolated_video))
 
         crop_bbox = isolation_result.get("crop_bbox") if isolation_result else None
-        bbox_override_path = _save_bbox_override(
-            person_dir,
-            track,
-            crop_bbox=crop_bbox,
-            K_fullimg=original_K_fullimg,
-        )
+        bbox_override_path = _save_bbox_override(person_dir, track, crop_bbox=crop_bbox)
         meta = _make_person_meta(
             track,
             source_index=i,
@@ -1438,12 +1414,7 @@ def split_multi_person_video(
         tid = track["track_id"]
         meta = _load_person_meta(person_dir)
         crop_bbox = meta.get("crop_bbox") if meta else None
-        bbox_override_path = _save_bbox_override(
-            person_dir,
-            track,
-            crop_bbox=crop_bbox,
-            K_fullimg=original_K_fullimg,
-        )
+        bbox_override_path = _save_bbox_override(person_dir, track, crop_bbox=crop_bbox)
         if meta is not None:
             meta["bbox_override_path"] = str(bbox_override_path)
             _save_person_meta(person_dir, meta)
@@ -1822,8 +1793,6 @@ def reprocess_person(
     """
     person_dir = Path(person_dir)
     person_dir.mkdir(parents=True, exist_ok=True)
-    _, video_width, video_height = get_video_lwh(video_path)
-    original_K_fullimg = estimate_K(video_width, video_height)
 
     track = all_tracks[person_index]
     tid = track.get("track_id", person_index)
@@ -1933,10 +1902,7 @@ def reprocess_person(
         progress_callback(0.4, f"Running {backend_label} for person {person_index}...")
 
     bbox_override_path = _save_bbox_override(
-        person_dir,
-        track,
-        crop_bbox=(isolation_result or {}).get("crop_bbox"),
-        K_fullimg=original_K_fullimg,
+        person_dir, track, crop_bbox=(isolation_result or {}).get("crop_bbox"),
     )
     _save_person_meta(
         person_dir,
