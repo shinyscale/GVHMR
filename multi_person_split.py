@@ -29,6 +29,16 @@ def _log_vram(label: str):
 
 GVHMR_DIR = Path(__file__).resolve().parent
 DEMO_SCRIPT = GVHMR_DIR / "tools" / "demo" / "demo.py"
+
+
+def _find_gvhmr_python() -> str:
+    """Return path to the gvhmr conda env Python, falling back to current interpreter."""
+    candidate = Path("/home/shinyscale/miniconda3/envs/gvhmr/bin/python")
+    if candidate.exists():
+        return str(candidate)
+    return sys.executable
+GEMX_DIR = GVHMR_DIR.parent / "GEM-X"
+GEMX_DEMO_SCRIPT = GEMX_DIR / "scripts" / "demo" / "demo_soma.py"
 PERSON_META_FILENAME = "person_meta.json"
 TRACKING_VERSION = 4
 
@@ -782,10 +792,6 @@ def compute_shared_slam(
         torch.save(R_identity, str(output_path))
         return str(output_path)
 
-    # Run SLAM via the existing pipeline utilities
-    from hmr4d.utils.preproc import SimpleVO
-    from hmr4d.utils.geo.hmr_cam import estimate_K, convert_K_to_K4
-
     # Check DPVO availability — must test the full import chain that slam.py needs,
     # not just dpvo.config. slam.py has a bare `except: pass` that silently leaves
     # cfg undefined if dpvo.dpvo.DPVO fails to import (e.g. build mismatch).
@@ -800,11 +806,35 @@ def compute_shared_slam(
             print(f"[SLAM] DPVO not available ({e}) — falling back to SimpleVO.")
 
     if not use_dpvo or not dpvo_available:
-        simple_vo = SimpleVO(str(video_path), scale=0.5, step=8, method="sift", f_mm=f_mm)
-        vo_results = simple_vo.compute()
-        torch.save(vo_results, str(output_path))
+        # Run SimpleVO as subprocess to avoid import-chain issues (yacs, pycolmap)
+        # when called from environments without the full hmr4d dependency chain.
+        vo_script = GVHMR_DIR / "tools" / "compute_vo.py"
+        gvhmr_python = _find_gvhmr_python()
+        cmd = [
+            gvhmr_python,
+            str(vo_script),
+            f"--video={video_path}",
+            f"--output={output_path}",
+        ]
+        if f_mm is not None:
+            cmd.append(f"--f_mm={f_mm}")
+        print(f"[SLAM] Running SimpleVO subprocess: {' '.join(cmd)}")
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, cwd=str(GVHMR_DIR),
+        )
+        for line in proc.stdout:
+            print(line.rstrip())
+        proc.wait()
+        if proc.returncode != 0 or not Path(output_path).exists():
+            print(f"[SLAM] SimpleVO subprocess failed (exit {proc.returncode}) — falling back to identity")
+            length = get_video_lwh(video_path)[0]
+            R_identity = np.eye(4)[None].repeat(length, axis=0).astype(np.float32)
+            torch.save(R_identity, str(output_path))
+            return str(output_path)
     else:
         from hmr4d.utils.preproc.slam import SLAMModel
+        from hmr4d.utils.geo.hmr_cam import convert_K_to_K4
         from tqdm import tqdm
 
         length, width, height = get_video_lwh(video_path)
@@ -925,90 +955,162 @@ def run_person_pipeline(
     return None, log_lines
 
 
-def run_gemx_pipeline(
+def run_person_pipeline_gemx(
     video_path,
     person_id,
     output_dir,
-    static_cam=False,
-    skip_render=True,
+    slam_override_path=None,
     bbx_override_path=None,
-    force_preprocess=False,
-    force_infer=False,
+    static_cam=False,
+    progress_callback=None,
 ):
-    """Run GEM-X (SOMA) estimation on a single isolated video.
+    """Run GEM-X single-person pipeline on an isolated person video.
 
-    Parallel to run_person_pipeline() but uses GEM-X's demo_soma.py
-    to produce SOMA-77 params with identity_coeffs and scale_params.
+    Pre-stages shared SLAM and bboxes into GEM-X's expected preprocess
+    directory so that GEM-X's ``run_preprocess()`` skips those steps.
+
+    Args:
+        video_path: path to the isolated single-person video
+        person_id: person track ID (for logging)
+        output_dir: root output directory for this person
+        slam_override_path: path to shared SLAM results (camera.pt)
+        bbx_override_path: path to pre-approved bounding boxes (GVHMR format)
+        static_cam: whether camera is static
 
     Returns:
-        (pt_path, log_lines) tuple — path to hpe_results.pt or None
+        (hpe_results_path, log_lines) tuple — path is None on failure
     """
     output_dir = Path(output_dir)
-    gemx_root = GVHMR_DIR.parent / "GEM-X"
-    demo_script = gemx_root / "scripts" / "demo" / "demo_soma.py"
+    video_stem = Path(video_path).stem
+    gemx_output_root = output_dir / "gemx_demo"
+    preprocess_dir = gemx_output_root / video_stem / "preprocess"
+    preprocess_dir.mkdir(parents=True, exist_ok=True)
 
-    if not demo_script.is_file():
-        return None, [f"[Person {person_id}] ERROR: GEM-X not found at {gemx_root}"]
+    log_lines = [f"[Person {person_id}] Running GEM-X pipeline"]
 
-    # Use GEM-X venv Python
-    gemx_python = gemx_root / ".venv" / "bin" / "python"
-    python_exe = str(gemx_python) if gemx_python.exists() else sys.executable
+    # Pre-stage shared SLAM as camera.pt (GEM-X skips SLAM if this exists)
+    if slam_override_path and Path(slam_override_path).is_file():
+        dst_slam = preprocess_dir / "camera.pt"
+        if not dst_slam.exists():
+            shutil.copy2(slam_override_path, dst_slam)
+            log_lines.append(f"  Pre-staged SLAM: {dst_slam}")
 
-    # GEM-X output goes into person_dir directly (output_root)
+    # Pre-stage bboxes: convert GVHMR format to GEM-X format
+    # Always overwrite — corrected bboxes from reprocessing must replace stale ones
+    if bbx_override_path and Path(bbx_override_path).is_file():
+        dst_bbx = preprocess_dir / "bbx.pt"
+        try:
+            bbx_data = torch.load(str(bbx_override_path), map_location="cpu", weights_only=False)
+            bbx_xyxy = bbx_data.get("bbx_xyxy", bbx_data) if isinstance(bbx_data, dict) else bbx_data
+            if isinstance(bbx_xyxy, np.ndarray):
+                bbx_xyxy = torch.from_numpy(bbx_xyxy)
+            bbx_xys = get_bbx_xys_from_xyxy(bbx_xyxy)
+            torch.save({"bbx_xyxy": bbx_xyxy, "bbx_xys": bbx_xys}, str(dst_bbx))
+            log_lines.append(f"  Pre-staged bbox: {dst_bbx}")
+        except Exception as e:
+            log_lines.append(f"  WARNING: bbox pre-staging failed: {e}")
+
+    # Build GEM-X command
     cmd = [
-        python_exe, str(demo_script),
+        sys.executable, str(GEMX_DEMO_SCRIPT),
         f"--video={video_path}",
-        f"--output_root={output_dir}",
+        f"--output_root={gemx_output_root}",
     ]
-    if bbx_override_path:
-        cmd.append(f"--bbx_override={bbx_override_path}")
     if static_cam:
         cmd.append("--static_cam")
-    if force_preprocess:
-        cmd.append("--force_preprocess")
-    if force_infer:
-        cmd.append("--force_infer")
 
-    log_lines = [f"[Person {person_id}] Running GEM-X: {' '.join(cmd)}", ""]
+    log_lines.append(f"  cmd: {' '.join(cmd)}")
+    log_lines.append(f"  cwd: {GEMX_DIR}")
 
-    # GEM-X needs its own PYTHONPATH for submodule imports
-    import os
-    env = os.environ.copy()
-    existing = env.get("PYTHONPATH", "")
-    extra_paths = [str(gemx_root)]
-    # Add GEM-X third_party dirs
-    tp = gemx_root / "third_party"
-    if tp.is_dir():
-        for d in tp.iterdir():
-            if d.is_dir() and (d / "__init__.py").exists() or (d / "setup.py").exists():
-                extra_paths.append(str(d))
-    env["PYTHONPATH"] = ":".join(extra_paths + ([existing] if existing else []))
+    if not GEMX_DIR.is_dir():
+        log_lines.append(f"\n[Person {person_id}] ERROR: GEM-X not found at {GEMX_DIR}")
+        return None, log_lines
+    if not GEMX_DEMO_SCRIPT.is_file():
+        log_lines.append(f"\n[Person {person_id}] ERROR: demo_soma.py not found at {GEMX_DEMO_SCRIPT}")
+        return None, log_lines
 
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
-        cwd=str(gemx_root),
-        env=env,
+        cwd=str(GEMX_DIR),
         bufsize=1,
     )
 
     for line in proc.stdout:
-        log_lines.append(line.rstrip())
+        stripped = line.rstrip()
+        log_lines.append(stripped)
+        if progress_callback and stripped:
+            progress_callback(-1, f"[GEM-X P{person_id}] {stripped}")
 
     proc.wait()
+
+    # Check for hpe_results.pt even on non-zero exit — GEM-X may crash
+    # during the render step after estimation completes successfully.
+    demo_out = gemx_output_root / video_stem
+    if demo_out.is_dir():
+        pt_files = list(demo_out.rglob("hpe_results.pt"))
+        if pt_files:
+            if proc.returncode != 0:
+                log_lines.append(
+                    f"[Person {person_id}] GEM-X exited with code {proc.returncode} "
+                    f"but hpe_results.pt found — render crash after estimation"
+                )
+            log_lines.append(f"[Person {person_id}] GEM-X output: {pt_files[0]}")
+            return str(pt_files[0]), log_lines
 
     if proc.returncode != 0:
         log_lines.append(f"\n[Person {person_id}] ERROR: GEM-X exited with code {proc.returncode}")
         return None, log_lines
 
-    # Find hpe_results.pt in output
-    for pt_file in sorted(output_dir.rglob("hpe_results.pt")):
-        return str(pt_file), log_lines
-
     log_lines.append(f"\n[Person {person_id}] ERROR: hpe_results.pt not found")
     return None, log_lines
+
+
+def extract_gemx_params(hpe_results_path: str) -> dict:
+    """Extract motion params from GEM-X hpe_results.pt for identity verification.
+
+    Returns dict compatible with extract_gvhmr_params() output:
+    - body_pose: (N, 21, 3)
+    - global_orient: (N, 3)
+    - transl: (N, 3)
+    - num_frames: int
+    - identity_coeffs: (1, 45) — replaces betas for shape matching
+    - betas: (N, 45) — identity_coeffs broadcast to all frames
+    """
+    data = torch.load(hpe_results_path, map_location="cpu", weights_only=False)
+    bp = data["body_params_global"]
+
+    body_pose = np.array(bp["body_pose"])     # (L, J*3) — 63 or 228
+    global_orient = np.array(bp["global_orient"])  # (L, 3)
+    transl = np.array(bp["transl"])            # (L, 3)
+    n_frames = body_pose.shape[0]
+    n_pose_joints = body_pose.shape[1] // 3   # 21 or 76
+
+    # Extract first 21 body joints for compatibility with identity verification / BVH
+    body_pose_3 = body_pose.reshape(n_frames, n_pose_joints, 3)
+    body_pose_21 = body_pose_3[:, :21, :]
+
+    result = {
+        "body_pose": body_pose_21.astype(np.float32),
+        "global_orient": global_orient.astype(np.float32),
+        "transl": transl.astype(np.float32),
+        "num_frames": n_frames,
+    }
+
+    # identity_coeffs: (1, 45) constant per person — broadcast to per-frame
+    if "identity_coeffs" in bp:
+        ic = np.array(bp["identity_coeffs"]).astype(np.float32)
+        if ic.ndim == 1:
+            ic = ic.reshape(1, -1)
+        result["identity_coeffs"] = ic
+        # Broadcast to per-frame for compatibility with betas-based code
+        result["betas"] = np.broadcast_to(ic, (n_frames, ic.shape[-1])).copy()
+    else:
+        result["betas"] = np.zeros((n_frames, 10), dtype=np.float32)
+
+    return result
 
 
 def split_multi_person_video(
@@ -1031,7 +1133,7 @@ def split_multi_person_video(
         2. Compute shared camera motion (SLAM) once on original video
         3. (If use_inpainting) Segment all people (SAM2) + inpaint overlaps
            (If not) Bbox crop with blackout — fast path, usually sufficient
-        4. Per-person: run existing GVHMR pipeline with shared SLAM
+        4. Per-person: run estimation pipeline (GVHMR or GEM-X) with shared SLAM
         5. Compute relative offsets and assemble world-space results
 
     Args:
@@ -1047,6 +1149,7 @@ def split_multi_person_video(
             (slow but better for heavy occlusion). When False, uses fast
             bbox-crop-and-blackout which is sufficient for most crossings.
         progress_callback: fn(frac, msg) for progress updates
+        estimation_backend: "gvhmr" or "gemx" — which estimation model to use
 
     Returns:
         MultiPersonResult
@@ -1407,7 +1510,10 @@ def split_multi_person_video(
     _log_vram("after isolation")
 
     # ── Step 5: Per-person pipeline execution ──
-    _progress(0.50, "Running per-person GVHMR pipelines...")
+    _use_gemx = estimation_backend == "gemx"
+    _backend_label = "GEM-X" if _use_gemx else "GVHMR"
+    _result_filename = "hpe_results.pt" if _use_gemx else "hmr4d_results.pt"
+    _progress(0.50, f"Running per-person {_backend_label} pipelines...")
 
     for i, (person_video, person_dir) in enumerate(zip(person_video_paths, person_dirs)):
         track = all_tracks[i]
@@ -1420,8 +1526,28 @@ def split_multi_person_video(
             _save_person_meta(person_dir, meta)
             person_meta_by_tid[tid] = meta
 
-        # Check if already processed (either GVHMR or GEM-X output)
-        existing_pt = list(person_dir.rglob("hmr4d_results.pt")) + list(person_dir.rglob("hpe_results.pt"))
+        # GEM-X: ensure GVHMR world-grounding exists (even if GEM-X already ran).
+        # Must run BEFORE the cache check so re-runs pick up missing GVHMR results.
+        if _use_gemx and not list(person_dir.rglob("hmr4d_results.pt")):
+            _progress(
+                0.50 + i / len(all_tracks) * 0.30,
+                f"Running GVHMR (world-grounding) for person {i}...",
+            )
+            run_person_pipeline(
+                video_path=person_video,
+                person_id=tid,
+                output_dir=person_dir,
+                slam_override_path=str(slam_path) if not static_cam else None,
+                bbx_override_path=str(bbox_override_path),
+                static_cam=static_cam,
+                use_dpvo=use_dpvo,
+                f_mm=f_mm,
+                skip_render=True,
+                render_incam_only=False,
+            )
+
+        # Check if already processed (check for backend-specific output)
+        existing_pt = list(person_dir.rglob(_result_filename))
         isolated_mtime = Path(person_video).stat().st_mtime if Path(person_video).exists() else 0.0
         newest_pt_mtime = max((pt.stat().st_mtime for pt in existing_pt), default=0.0)
         if existing_pt and newest_pt_mtime >= isolated_mtime:
@@ -1433,22 +1559,23 @@ def split_multi_person_video(
         if existing_pt:
             _progress(
                 0.50 + i / len(all_tracks) * 0.30,
-                f"Person {i} isolation changed; re-running estimation",
+                f"Person {i} isolation changed; re-running {_backend_label}",
             )
 
-        backend_label = "GEM-X" if estimation_backend == "gemx" else "GVHMR"
         _progress(
             0.50 + i / len(all_tracks) * 0.30,
-            f"Running {backend_label} for person {i}...",
+            f"Running {_backend_label} for person {i}...",
         )
 
-        if estimation_backend == "gemx":
-            pt_path, person_log = run_gemx_pipeline(
+        if _use_gemx:
+            pt_path, person_log = run_person_pipeline_gemx(
                 video_path=person_video,
                 person_id=tid,
                 output_dir=person_dir,
-                static_cam=static_cam,
+                slam_override_path=str(slam_path) if not static_cam else None,
                 bbx_override_path=str(bbox_override_path),
+                static_cam=static_cam,
+                progress_callback=progress_callback,
             )
         else:
             pt_path, person_log = run_person_pipeline(
@@ -1468,7 +1595,7 @@ def split_multi_person_video(
             log_lines.extend(person_log)
             _progress(
                 0.50 + (i + 1) / len(all_tracks) * 0.30,
-                f"Person {i} {backend_label} FAILED",
+                f"Person {i} {_backend_label} FAILED",
             )
 
     # ── Step 5.5: Identity verification & occlusion bridging ──
@@ -1496,13 +1623,19 @@ def split_multi_person_video(
             track = all_tracks[i]
             tid = track["track_id"]
 
-            # Load GVHMR results for this person
-            pt_files = list(person_dir.rglob("hmr4d_results.pt"))
-            if not pt_files:
-                continue
+            # Load estimation results for this person (GEM-X or GVHMR)
+            if _use_gemx:
+                pt_files = list(person_dir.rglob("hpe_results.pt"))
+                if not pt_files:
+                    continue
+                params = extract_gemx_params(str(pt_files[0]))
+            else:
+                pt_files = list(person_dir.rglob("hmr4d_results.pt"))
+                if not pt_files:
+                    continue
+                params = extract_gvhmr_params(str(pt_files[0]))
 
-            params = extract_gvhmr_params(str(pt_files[0]))
-            per_frame_betas = params["betas"]  # (N, 10)
+            per_frame_betas = params["betas"]  # (N, D) — 10 for GVHMR, 45 for GEM-X
             num_person_frames = params["num_frames"]
 
             # Load per-person ViTPose if available
@@ -1609,31 +1742,52 @@ def split_multi_person_video(
                     pt_data = torch.load(str(pt_files[0]), map_location="cpu", weights_only=False)
 
                     if bridged_frames:
-                        g = pt_data["smpl_params_global"]
-
                         bridged_bp = bridge_result["body_pose"]     # (N, 21, 3)
                         bridged_go = bridge_result["global_orient"]  # (N, 3)
                         bridged_tr = bridge_result["transl"]         # (N, 3)
 
-                        g["body_pose"] = torch.from_numpy(bridged_bp.reshape(num_person_frames, -1)).float()
-                        g["global_orient"] = torch.from_numpy(bridged_go.reshape(num_person_frames, -1)).float()
-                        g["transl"] = torch.from_numpy(bridged_tr).float()
+                        if _use_gemx:
+                            # GEM-X: body_params_global dict
+                            g = pt_data.get("body_params_global", {})
+                            g["body_pose"] = torch.from_numpy(bridged_bp.reshape(num_person_frames, -1)).float()
+                            g["global_orient"] = torch.from_numpy(bridged_go.reshape(num_person_frames, -1)).float()
+                            g["transl"] = torch.from_numpy(bridged_tr).float()
+                            pt_data["body_params_global"] = g
 
-                        # Also bridge smpl_params_incam so scene preview shows corrected poses
-                        if crossing_spans and "smpl_params_incam" in pt_data:
-                            ic = pt_data["smpl_params_incam"]
-                            ic_bp = np.array(ic["body_pose"]).reshape(num_person_frames, -1, 3)
-                            ic_go = np.array(ic["global_orient"]).reshape(num_person_frames, 3)
-                            ic_tr = np.array(ic["transl"]).reshape(num_person_frames, 3)
-                            ic_result = bridge.bridge_with_spans(ic_bp, ic_go, ic_tr, crossing_spans)
-                            ic["body_pose"] = torch.from_numpy(
-                                ic_result["body_pose"].reshape(num_person_frames, -1)).float()
-                            ic["global_orient"] = torch.from_numpy(
-                                ic_result["global_orient"].reshape(num_person_frames, -1)).float()
-                            ic["transl"] = torch.from_numpy(ic_result["transl"]).float()
+                            # Also bridge body_params_incam
+                            if crossing_spans and "body_params_incam" in pt_data:
+                                ic = pt_data["body_params_incam"]
+                                ic_bp = np.array(ic["body_pose"]).reshape(num_person_frames, -1, 3)
+                                ic_go = np.array(ic["global_orient"]).reshape(num_person_frames, 3)
+                                ic_tr = np.array(ic["transl"]).reshape(num_person_frames, 3)
+                                ic_result = bridge.bridge_with_spans(ic_bp, ic_go, ic_tr, crossing_spans)
+                                ic["body_pose"] = torch.from_numpy(
+                                    ic_result["body_pose"].reshape(num_person_frames, -1)).float()
+                                ic["global_orient"] = torch.from_numpy(
+                                    ic_result["global_orient"].reshape(num_person_frames, -1)).float()
+                                ic["transl"] = torch.from_numpy(ic_result["transl"]).float()
+                        else:
+                            # GVHMR: smpl_params_global dict
+                            g = pt_data["smpl_params_global"]
+                            g["body_pose"] = torch.from_numpy(bridged_bp.reshape(num_person_frames, -1)).float()
+                            g["global_orient"] = torch.from_numpy(bridged_go.reshape(num_person_frames, -1)).float()
+                            g["transl"] = torch.from_numpy(bridged_tr).float()
 
-                    # Apply identity keyframe position constraints
-                    if need_position_constraints:
+                            # Also bridge smpl_params_incam so scene preview shows corrected poses
+                            if crossing_spans and "smpl_params_incam" in pt_data:
+                                ic = pt_data["smpl_params_incam"]
+                                ic_bp = np.array(ic["body_pose"]).reshape(num_person_frames, -1, 3)
+                                ic_go = np.array(ic["global_orient"]).reshape(num_person_frames, 3)
+                                ic_tr = np.array(ic["transl"]).reshape(num_person_frames, 3)
+                                ic_result = bridge.bridge_with_spans(ic_bp, ic_go, ic_tr, crossing_spans)
+                                ic["body_pose"] = torch.from_numpy(
+                                    ic_result["body_pose"].reshape(num_person_frames, -1)).float()
+                                ic["global_orient"] = torch.from_numpy(
+                                    ic_result["global_orient"].reshape(num_person_frames, -1)).float()
+                                ic["transl"] = torch.from_numpy(ic_result["transl"]).float()
+
+                    # Apply identity keyframe position constraints (GVHMR only — GEM-X uses different format)
+                    if need_position_constraints and not _use_gemx:
                         from world_assembly import apply_identity_position_constraints
                         K_fullimg = pt_data.get("K_fullimg")
                         if K_fullimg is not None:
@@ -1748,21 +1902,25 @@ def split_multi_person_video(
     )
 
     # ── Step 7: Render combined incam overlay ──
-    _progress(0.92, "Rendering scene preview...")
-    try:
-        assembly_dir = output_dir / "assembly"
-        assembly_dir.mkdir(parents=True, exist_ok=True)
-        scene_preview_path = str(assembly_dir / "scene_preview.mp4")
-        render_multi_person_incam(
-            video_path=video_path,
-            person_dirs=person_dirs,
-            all_tracks=all_tracks,
-            output_path=scene_preview_path,
-            fps=30.0,
-            progress_callback=lambda f, m: _progress(0.92 + f * 0.07, m),
-        )
-    except Exception as e:
-        _progress(0.99, f"Scene preview failed: {e}")
+    if _use_gemx:
+        # GEM-X scene render not yet integrated — skip for now
+        _progress(0.99, "Scene preview skipped (GEM-X renderer not yet integrated)")
+    else:
+        _progress(0.92, "Rendering scene preview...")
+        try:
+            assembly_dir = output_dir / "assembly"
+            assembly_dir.mkdir(parents=True, exist_ok=True)
+            scene_preview_path = str(assembly_dir / "scene_preview.mp4")
+            render_multi_person_incam(
+                video_path=video_path,
+                person_dirs=person_dirs,
+                all_tracks=all_tracks,
+                output_path=scene_preview_path,
+                fps=30.0,
+                progress_callback=lambda f, m: _progress(0.92 + f * 0.07, m),
+            )
+        except Exception as e:
+            _progress(0.99, f"Scene preview failed: {e}")
 
     _progress(1.0, f"Multi-person pipeline complete. {result.num_persons} people processed.")
 
@@ -1817,12 +1975,22 @@ def reprocess_person(
     # 2. Back up stale outputs (restore on failure, delete on success)
     isolated_video = person_dir / "isolated_video.mp4"
     demo_dir = person_dir / "demo"
+    gemx_dir = person_dir / "gemx_demo"
     bak_video = person_dir / "isolated_video.mp4.bak"
     bak_demo = person_dir / "demo.bak"
+    bak_gemx = person_dir / "gemx_demo.bak"
     if isolated_video.exists():
+        if bak_video.exists():
+            bak_video.unlink()
         isolated_video.rename(bak_video)
     if demo_dir.exists():
+        if bak_demo.exists():
+            shutil.rmtree(bak_demo)
         demo_dir.rename(bak_demo)
+    if gemx_dir.exists():
+        if bak_gemx.exists():
+            shutil.rmtree(bak_gemx)
+        gemx_dir.rename(bak_gemx)
     _invalidate_reprocess_outputs(person_dir, estimation_backend)
 
     # 3. Re-isolate person
@@ -1894,6 +2062,8 @@ def reprocess_person(
             bak_video.rename(isolated_video)
         if bak_demo.exists():
             bak_demo.rename(demo_dir)
+        if bak_gemx.exists():
+            bak_gemx.rename(gemx_dir)
         return {}
 
     # 4. Re-run estimation pipeline
@@ -1923,15 +2093,14 @@ def reprocess_person(
 
     try:
         if estimation_backend == "gemx":
-            pt_path, _ = run_gemx_pipeline(
+            pt_path, _ = run_person_pipeline_gemx(
                 video_path=str(isolated_video),
                 person_id=tid,
                 output_dir=person_dir,
-                static_cam=static_cam,
-                skip_render=True,
+                slam_override_path=slam_path if not static_cam else None,
                 bbx_override_path=str(bbox_override_path),
-                force_preprocess=True,
-                force_infer=True,
+                static_cam=static_cam,
+                progress_callback=progress_callback,
             )
         else:
             pt_path, _ = run_person_pipeline(
@@ -1947,7 +2116,7 @@ def reprocess_person(
                 force_infer=True,
             )
     except Exception as e:
-        print(f"[reprocess_person] Pipeline crashed for person {person_index}: {e}")
+        print(f"[reprocess_person] {backend_label} crashed for person {person_index}: {e}")
         import traceback
         traceback.print_exc()
         # Restore backups
@@ -1955,6 +2124,8 @@ def reprocess_person(
             bak_video.rename(isolated_video)
         if bak_demo.exists() and not demo_dir.exists():
             bak_demo.rename(demo_dir)
+        if bak_gemx.exists() and not gemx_dir.exists():
+            bak_gemx.rename(gemx_dir)
         return {}
 
     if pt_path is None:
@@ -1964,12 +2135,15 @@ def reprocess_person(
             bak_video.rename(isolated_video)
         if bak_demo.exists() and not demo_dir.exists():
             bak_demo.rename(demo_dir)
+        if bak_gemx.exists() and not gemx_dir.exists():
+            bak_gemx.rename(gemx_dir)
         return {}
 
     # Pipeline succeeded — clean up backups
     print(f"[reprocess_person] {backend_label} succeeded, pt_path={pt_path}")
     bak_video.unlink(missing_ok=True)
     shutil.rmtree(str(bak_demo), ignore_errors=True)
+    shutil.rmtree(str(bak_gemx), ignore_errors=True)
 
     # 5. Re-compute confidence & identity
     if progress_callback:

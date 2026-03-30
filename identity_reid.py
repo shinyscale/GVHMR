@@ -21,10 +21,20 @@ class ShapeReIdentifier:
             if track.established_betas is not None:
                 self.known_betas[track.person_id] = track.established_betas
 
+    @staticmethod
+    def _confidence_threshold(dim: int) -> float:
+        """Scale the L2 distance→confidence denominator for shape vector dimensionality.
+
+        SMPL betas are 10-dim (threshold ~5.0); GEM-X identity_coeffs are
+        45-dim (higher L2 norms expected). Scale by sqrt(dim/10).
+        """
+        return 5.0 * (dim / 10) ** 0.5
+
     def match(self, detected_betas: np.ndarray) -> tuple[int, float]:
         """Match detected betas to known identity.
 
         Returns (person_id, confidence) where confidence is 0-1.
+        Works with any shape vector dimensionality (10 for SMPL, 45 for GEM-X).
         """
         if not self.known_betas:
             return -1, 0.0
@@ -34,8 +44,8 @@ class ShapeReIdentifier:
             for pid, known in self.known_betas.items()
         }
         best_id = min(distances, key=distances.get)
-        # Typical beta distances are 0-5
-        confidence = max(0.0, 1.0 - distances[best_id] / 5.0)
+        threshold = self._confidence_threshold(len(detected_betas.ravel()))
+        confidence = max(0.0, 1.0 - distances[best_id] / threshold)
         return best_id, confidence
 
     def match_all(
@@ -83,7 +93,9 @@ class ShapeReIdentifier:
             if best_i < 0:
                 break
 
-            confidence = max(0.0, 1.0 - best_cost / 5.0)
+            dim = len(detected_betas_per_person[det_ids[best_i]].ravel())
+            threshold = self._confidence_threshold(dim)
+            confidence = max(0.0, 1.0 - best_cost / threshold)
             assignments[det_ids[best_i]] = (known_ids[best_j], confidence)
             used_known.add(known_ids[best_j])
 

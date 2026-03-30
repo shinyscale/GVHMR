@@ -1,5 +1,6 @@
 """Convert BVH to FBX using Blender in headless mode."""
 
+import os
 import subprocess
 import shutil
 from pathlib import Path
@@ -42,10 +43,15 @@ def find_blender() -> tuple[str | None, bool]:
 
     Returns (blender_path, is_windows_exe).
     """
+    # Allow explicit override via environment variable
+    env_path = os.environ.get("BLENDER_PATH")
+    if env_path and Path(env_path).is_file():
+        return env_path, env_path.endswith(".exe")
+
     # Check PATH first (could be native Linux Blender)
     blender = shutil.which("blender")
     if blender:
-        return blender, not blender.endswith(".exe")
+        return blender, blender.endswith(".exe")
 
     # Check known Windows paths
     for candidate in BLENDER_CANDIDATES:
@@ -91,8 +97,7 @@ def convert_bvh_to_fbx(
         bvh_arg = str(bvh_path)
         fbx_arg = str(fbx_path)
 
-    cmd = [
-        blender,
+    blender_args = [
         "--background",
         "--python", script_path,
         "--",
@@ -101,6 +106,14 @@ def convert_bvh_to_fbx(
         "--fps", str(fps),
         "--naming", naming,
     ]
+
+    if is_windows:
+        # WSL2 cannot directly exec a Windows .exe via subprocess; use cmd.exe
+        # Quote the path for cmd.exe since it likely contains spaces
+        blender_win = _to_win_path(blender)
+        cmd = ["cmd.exe", "/c", f'"{blender_win}"'] + blender_args
+    else:
+        cmd = [blender] + blender_args
 
     try:
         result = subprocess.run(
