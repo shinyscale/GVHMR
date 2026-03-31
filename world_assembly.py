@@ -10,6 +10,90 @@ import torch
 from pathlib import Path
 
 
+def align_world_z_trajectories(person_dirs):
+    """Align world-Z across persons using incam relative depth.
+
+    Each person's GVHMR run produces an independent velocity prediction,
+    causing world-Z trajectories to drift apart even when persons share
+    the same scene and camera.
+
+    Fix: adopt the reference person's world-Z as the shared egomotion
+    baseline, then add each person's per-frame depth offset derived from
+    incam translations (where camera egomotion cancels in the difference).
+
+        corrected_z_p[f] = ref_world_z[f] + (p_incam_z[f] - ref_incam_z[f])
+
+    Modifies smpl_params_global["transl"] in each person's hmr4d_results.pt.
+    Skips files already marked with _z_aligned=True.
+
+    Args:
+        person_dirs: list of Path-like directories, one per person.
+
+    Returns:
+        Number of persons whose Z trajectory was corrected.
+    """
+    # Load all persons' data
+    persons = []
+    for person_dir in person_dirs:
+        person_dir = Path(person_dir)
+        pt_path = person_dir / "demo" / "isolated_video" / "hmr4d_results.pt"
+        if not pt_path.is_file():
+            persons.append(None)
+            continue
+        data = torch.load(pt_path, map_location="cpu", weights_only=False)
+        if data.get("_z_aligned"):
+            persons.append(None)
+            continue
+        incam = data.get("smpl_params_incam")
+        glob = data.get("smpl_params_global")
+        if (incam is None or glob is None
+                or "transl" not in incam or "transl" not in glob):
+            persons.append(None)
+            continue
+        persons.append({
+            "pt_path": pt_path,
+            "data": data,
+            "incam_z": np.asarray(incam["transl"])[:, 2].copy(),
+            "world_transl": np.asarray(glob["transl"]).copy(),
+        })
+
+    # Need at least 2 valid persons
+    valid = [i for i, p in enumerate(persons) if p is not None]
+    if len(valid) < 2:
+        return 0
+
+    ref_idx = valid[0]
+    ref = persons[ref_idx]
+    corrected = 0
+
+    for i in valid[1:]:
+        p = persons[i]
+        n = min(len(ref["incam_z"]), len(p["incam_z"]),
+                len(ref["world_transl"]), len(p["world_transl"]))
+        if n == 0:
+            continue
+
+        # Per-frame relative depth (camera egomotion cancels)
+        dz_incam = p["incam_z"][:n] - ref["incam_z"][:n]
+
+        # Corrected world Z: reference trend + relative depth
+        p["world_transl"][:n, 2] = ref["world_transl"][:n, 2] + dz_incam
+
+        # Frames beyond overlap: hold last corrected value
+        if len(p["world_transl"]) > n:
+            p["world_transl"][n:, 2] = p["world_transl"][n - 1, 2]
+
+        # Write back
+        p["data"]["smpl_params_global"]["transl"] = (
+            torch.from_numpy(p["world_transl"]).float()
+        )
+        p["data"]["_z_aligned"] = True
+        torch.save(p["data"], p["pt_path"])
+        corrected += 1
+
+    return corrected
+
+
 def _track_detection_mask(track) -> np.ndarray:
     """Return a track's real-detection mask as a numpy bool array."""
     mask = track.get("detection_mask")
@@ -346,6 +430,9 @@ def assemble_scene(
     output_dir = Path(output_dir)
     assembly_dir = output_dir / "assembly"
     assembly_dir.mkdir(parents=True, exist_ok=True)
+
+    # Align world-Z trajectories across persons (fixes VO drift)
+    align_world_z_trajectories(person_dirs)
 
     # Compute offsets
     offsets, offset_info = compute_person_offsets(all_tracks, camera_K, reference_frame)
