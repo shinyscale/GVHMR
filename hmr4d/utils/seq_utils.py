@@ -130,6 +130,8 @@ def mask_to_frame_id(mask):
 def linear_interpolate_frame_ids(data, frame_id_list):
     data = data.clone()
     for i, invalid_frame_ids in enumerate(frame_id_list):
+        if len(invalid_frame_ids) == 0:
+            continue
         # interplate between prev, next
         # if at beginning or end, use the same value
         if invalid_frame_ids[0] - 1 < 0 or invalid_frame_ids[-1] + 1 >= len(data):

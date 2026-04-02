@@ -31,6 +31,33 @@ GVHMR_DIR = Path(__file__).resolve().parent
 DEMO_SCRIPT = GVHMR_DIR / "tools" / "demo" / "demo.py"
 
 
+def _find_smplestx() -> tuple[str, str] | None:
+    """Auto-discover SMPLest-X install → (python_path, smplestx_dir) or None."""
+    # SMPLest-X lives alongside the GVHMR repo (sibling under /mnt/f/),
+    # not inside it. GVHMR_DIR is the inner source dir (/mnt/f/GVHMR/GVHMR),
+    # so .parent.parent gets us to /mnt/f/.
+    candidates = [
+        GVHMR_DIR.parent.parent / "SMPLest-X",  # /mnt/f/SMPLest-X (correct)
+        GVHMR_DIR.parent / "SMPLest-X",          # /mnt/f/GVHMR/SMPLest-X (fallback)
+    ]
+    smplestx_dir = None
+    for c in candidates:
+        if c.is_dir() and (c / "inference_video.py").is_file():
+            smplestx_dir = c
+            break
+    if smplestx_dir is None:
+        return None
+    # Try conda env 'smplestx'
+    conda_python = Path("/home/shinyscale/miniconda3/envs/smplestx/bin/python")
+    if conda_python.exists():
+        return (str(conda_python), str(smplestx_dir))
+    # Fallback: co-installed venv
+    venv_python = GVHMR_DIR / ".venv" / "bin" / "python"
+    if venv_python.exists():
+        return (str(venv_python), str(smplestx_dir))
+    return None
+
+
 def _find_gvhmr_python() -> str:
     """Return path to the gvhmr conda env Python, falling back to current interpreter."""
     candidate = Path("/home/shinyscale/miniconda3/envs/gvhmr/bin/python")
@@ -675,6 +702,8 @@ def _invalidate_reprocess_outputs(person_dir: Path, estimation_backend: str) -> 
         person_dir / "demo" / "isolated_video" / "1_incam.mp4",
         person_dir / "demo" / "isolated_video" / "2_global.mp4",
         person_dir / "demo" / "isolated_video" / "isolated_video_3_incam_global_horiz.mp4",
+        # Stale hybrid artifacts (body+hand merge from previous run)
+        *list(person_dir.glob("*_hybrid_smplx*.pt")),
     ]
 
     for path in artifact_paths:
@@ -682,6 +711,170 @@ def _invalidate_reprocess_outputs(person_dir: Path, estimation_backend: str) -> 
     for preprocess_dir in preprocess_dirs:
         if preprocess_dir.is_dir():
             shutil.rmtree(str(preprocess_dir), ignore_errors=True)
+
+
+def _load_gvhmr_world_params(hpe_path: Path) -> tuple[np.ndarray, np.ndarray] | None:
+    """Load GVHMR's world-grounded orient/transl from a co-located result.
+
+    Returns (global_orient, transl) both as Y-up np.float32, or None.
+    """
+    search_dirs = []
+    for parent in hpe_path.parents:
+        for subdir in ("demo", "demo.bak", "gvhmr_wg"):
+            d = parent / subdir
+            if d.is_dir():
+                search_dirs.append(d)
+        if parent.name.startswith("person_"):
+            break
+    search_dirs.append(hpe_path.parent)
+
+    for d in search_dirs:
+        for pt in d.rglob("hmr4d_results.pt"):
+            try:
+                data = torch.load(str(pt), map_location="cpu", weights_only=False)
+                bp_global = data.get("smpl_params_global") or data.get("body_params_global")
+                if bp_global is None:
+                    continue
+                go = np.array(bp_global["global_orient"]).astype(np.float32)
+                tr = np.array(bp_global["transl"]).astype(np.float32)
+                return go, tr
+            except Exception:
+                continue
+    return None
+
+
+def _load_person_offset(person_dir: Path) -> np.ndarray | None:
+    """Load XZ world offset for this person from assembly/person_offsets.json."""
+    try:
+        meta_path = person_dir / "person_meta.json"
+        if not meta_path.is_file():
+            return None
+        track_id = str(json.loads(meta_path.read_text()).get("track_id"))
+        offsets_path = person_dir.parent / "assembly" / "person_offsets.json"
+        if not offsets_path.is_file():
+            return None
+        data = json.loads(offsets_path.read_text())
+        offsets = data.get("offsets", data) if isinstance(data, dict) else data
+        off = offsets.get(track_id)
+        if off is not None and len(off) >= 3:
+            return np.array([float(off[0]), float(off[1]), float(off[2])], dtype=np.float32)
+    except Exception:
+        pass
+    return None
+
+
+def _run_smplestx_for_person(
+    person_video: str,
+    person_dir: Path,
+    smplestx_info: tuple[str, str],
+    progress_callback=None,
+) -> bool:
+    """Run SMPLest-X hand estimation for a single person.
+
+    Args:
+        person_video: path to the isolated person video
+        person_dir: per-person output directory
+        smplestx_info: (python_path, smplestx_dir) from _find_smplestx()
+        progress_callback: optional fn(frac, msg)
+
+    Returns:
+        True if SMPLest-X produced output, False otherwise.
+    """
+    smplestx_python, smplestx_dir = smplestx_info
+    output_subdir = person_dir / "smplestx_demo"
+
+    # Cache check: skip if .pt already exists and is newer than isolated video
+    existing_pts = list(output_subdir.glob("*.pt"))
+    if existing_pts:
+        video_mtime = Path(person_video).stat().st_mtime if Path(person_video).exists() else 0.0
+        newest_pt = max(existing_pts, key=lambda p: p.stat().st_mtime)
+        if newest_pt.stat().st_mtime >= video_mtime:
+            print(f"[SMPLest-X] Cached result for {person_dir.name}")
+            return True
+
+    cmd = [
+        smplestx_python,
+        "inference_video.py",
+        f"--video={person_video}",
+        f"--fps=30",
+        f"--output_dir={output_subdir}",
+        "--no_render",
+    ]
+    print(f"[SMPLest-X] Running: {' '.join(cmd)}")
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        cwd=smplestx_dir,
+        bufsize=1,
+    )
+    for line in proc.stdout:
+        stripped = line.rstrip()
+        if progress_callback and stripped:
+            progress_callback(-1, f"[SMPLest-X] {stripped}")
+    proc.wait()
+
+    if proc.returncode != 0:
+        print(f"[SMPLest-X] Failed (exit {proc.returncode}) for {person_dir.name}")
+        return False
+
+    result_pts = list(output_subdir.glob("*.pt"))
+    if not result_pts:
+        print(f"[SMPLest-X] No .pt output found in {output_subdir}")
+        return False
+
+    print(f"[SMPLest-X] Success: {result_pts[0].name}")
+    return True
+
+
+def _merge_person_hands(person_dir: Path) -> Path | None:
+    """Merge GVHMR body + SMPLest-X hands for a single person.
+
+    Looks for GVHMR hmr4d_results.pt and SMPLest-X output, merges them
+    using merge_gvhmr_smplestx_params(), saves as *_hybrid_smplx.pt.
+
+    Returns:
+        Path to the merged .pt file, or None if merge not possible.
+    """
+    from smplx_to_bvh import extract_gvhmr_params, extract_smplx_params, merge_gvhmr_smplestx_params
+
+    # Find GVHMR result
+    gvhmr_pts = list(person_dir.rglob("hmr4d_results.pt"))
+    if not gvhmr_pts:
+        return None
+
+    # Find SMPLest-X result
+    smplestx_dir = person_dir / "smplestx_demo"
+    if not smplestx_dir.is_dir():
+        return None
+    smplestx_pts = list(smplestx_dir.glob("*.pt"))
+    if not smplestx_pts:
+        return None
+    smplestx_pt = max(smplestx_pts, key=lambda p: p.stat().st_mtime)
+
+    try:
+        gvhmr_params = extract_gvhmr_params(str(gvhmr_pts[0]))
+        smplestx_params = extract_smplx_params(str(smplestx_pt))
+        merged = merge_gvhmr_smplestx_params(gvhmr_params, smplestx_params)
+
+        # Import save_merged_pt from pipeline_orchestrator (bodypipe)
+        bodypipe_dir = GVHMR_DIR.parent / "bodypipe"
+        if str(bodypipe_dir) not in sys.path:
+            sys.path.insert(0, str(bodypipe_dir))
+        from workers.pipeline_orchestrator import save_merged_pt
+
+        video_stem = Path(gvhmr_pts[0]).parent.parent.name  # demo/<stem>/hmr4d_results.pt
+        output_path = person_dir / f"{video_stem}_hybrid_smplx.pt"
+        save_merged_pt(merged, output_path)
+        print(f"[merge] Saved hybrid: {output_path.name}")
+        return output_path
+    except Exception as e:
+        print(f"[merge] Failed for {person_dir.name}: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
 
 
 def _export_person_bvh(person_dir: Path) -> Path | None:
@@ -707,6 +900,49 @@ def _export_person_bvh(person_dir: Path) -> Path | None:
             if "scale_params" in bp:
                 soma_params["scale_params"] = np.array(bp["scale_params"]).astype(np.float32)
 
+            # --- World grounding: replace camera-space root with world-grounded ---
+            world_applied = False
+            gvhmr_world = _load_gvhmr_world_params(hpe_files[0])
+            if gvhmr_world is not None:
+                go_world, tr_world = gvhmr_world
+                if len(go_world) == n_frames:
+                    # Ground-normalize Y: shift so feet at Y=0.
+                    # SOMA-77 leg length = 0.908 (matches gemx_worker convention).
+                    _LEG_LENGTH = 0.908
+                    if tr_world.shape[0] > 0:
+                        floor_y = float(tr_world[0, 1]) - _LEG_LENGTH
+                        tr_world = tr_world.copy()
+                        tr_world[:, 1] -= floor_y
+
+                    # Apply multi-person lateral offset
+                    offset = _load_person_offset(person_dir)
+                    if offset is not None:
+                        tr_world = tr_world.copy()
+                        tr_world += offset
+
+                    # Replace root orient and translation in soma_params
+                    soma_params["poses"][:, 0] = go_world.reshape(n_frames, 3)
+                    soma_params["transl"] = tr_world.astype(np.float32)
+                    world_applied = True
+
+            if not world_applied:
+                # Fallback: try GEM-X's own body_params_global
+                bp_global = data.get("body_params_global")
+                if bp_global is not None and bp_global.get("transl") is not None:
+                    go_global = np.array(bp_global["global_orient"]).reshape(n_frames, 3).astype(np.float32)
+                    tr_global = np.array(bp_global["transl"]).astype(np.float32)
+                    _LEG_LENGTH = 0.908
+                    if tr_global.shape[0] > 0:
+                        floor_y = float(tr_global[0, 1]) - _LEG_LENGTH
+                        tr_global = tr_global.copy()
+                        tr_global[:, 1] -= floor_y
+                    offset = _load_person_offset(person_dir)
+                    if offset is not None:
+                        tr_global = tr_global.copy()
+                        tr_global += offset
+                    soma_params["poses"][:, 0] = go_global
+                    soma_params["transl"] = tr_global
+
             bodypipe_dir = GVHMR_DIR.parent / "bodypipe"
             if str(bodypipe_dir) not in sys.path:
                 sys.path.insert(0, str(bodypipe_dir))
@@ -714,6 +950,15 @@ def _export_person_bvh(person_dir: Path) -> Path | None:
 
             convert_soma_to_bvh(soma_params, bvh_path)
             return bvh_path
+
+    # Try merged hybrid (GVHMR body + SMPLest-X hands) first
+    hybrid_pts = list(person_dir.glob("*_hybrid_smplx.pt"))
+    if hybrid_pts:
+        from smplx_to_bvh import convert_params_to_bvh, extract_smplx_params as _extract_hybrid
+        hybrid_pt = max(hybrid_pts, key=lambda p: p.stat().st_mtime)
+        params = _extract_hybrid(str(hybrid_pt))
+        convert_params_to_bvh(params, str(bvh_path), skip_world_grounding=True)
+        return bvh_path
 
     pt_files = list(person_dir.rglob("hmr4d_results.pt"))
     if not pt_files:
@@ -1125,6 +1370,7 @@ def split_multi_person_video(
     use_inpainting=False,
     progress_callback=None,
     estimation_backend="gvhmr",
+    use_hands=False,
 ):
     """Full multi-person isolation pipeline.
 
@@ -1150,6 +1396,7 @@ def split_multi_person_video(
             bbox-crop-and-blackout which is sufficient for most crossings.
         progress_callback: fn(frac, msg) for progress updates
         estimation_backend: "gvhmr" or "gemx" — which estimation model to use
+        use_hands: run SMPLest-X per person and merge hand data (GVHMR only)
 
     Returns:
         MultiPersonResult
@@ -1598,6 +1845,42 @@ def split_multi_person_video(
                 f"Person {i} {_backend_label} FAILED",
             )
 
+    # ── Step 5.2: Per-person hand estimation (SMPLest-X) ──
+    if use_hands and not _use_gemx:
+        smplestx_info = _find_smplestx()
+        if smplestx_info:
+            _progress(0.80, "Running SMPLest-X hand estimation...")
+            for i, (person_video, person_dir) in enumerate(zip(person_video_paths, person_dirs)):
+                _progress(
+                    0.80 + (i / max(len(person_dirs), 1)) * 0.01,
+                    f"SMPLest-X for person {i}...",
+                )
+                ok = _run_smplestx_for_person(
+                    person_video, person_dir, smplestx_info,
+                    progress_callback=progress_callback,
+                )
+                if ok:
+                    merged_path = _merge_person_hands(person_dir)
+                    if merged_path:
+                        _progress(
+                            0.80 + ((i + 1) / max(len(person_dirs), 1)) * 0.01,
+                            f"Person {i} hands merged",
+                        )
+                    else:
+                        _progress(
+                            0.80 + ((i + 1) / max(len(person_dirs), 1)) * 0.01,
+                            f"Person {i} hand merge failed — body only",
+                        )
+                else:
+                    _progress(
+                        0.80 + ((i + 1) / max(len(person_dirs), 1)) * 0.01,
+                        f"Person {i} SMPLest-X failed — body only",
+                    )
+        else:
+            _progress(0.81, "SMPLest-X not found — skipping hand estimation")
+    elif use_hands and _use_gemx:
+        _progress(0.81, "GEM-X already includes hands — skipping SMPLest-X")
+
     # ── Step 5.5: Identity verification & occlusion bridging ──
     _progress(0.82, "Running identity verification...")
 
@@ -1726,8 +2009,10 @@ def split_multi_person_video(
                     _progress(0.82 + i / max(len(person_dirs), 1) * 0.03,
                               f"Person {i}: {len(crossing_spans)} crossing spans detected, "
                               f"bridging {total_crossing} frames")
+                    overall_conf = np.array([c.overall for c in confidences], dtype=np.float32)
                     bridge_result = bridge.bridge_with_spans(
-                        body_pose, global_orient, transl, crossing_spans)
+                        body_pose, global_orient, transl, crossing_spans,
+                        overall_confidence=overall_conf)
                 else:
                     bridge_result = bridge.bake(body_pose, global_orient, transl, confidences)
                 bridged_frames = bridge_result["bridged_frames"]
@@ -1941,6 +2226,7 @@ def reprocess_person(
     estimation_backend: str = "gvhmr",
     manual_bbox_keyframes: dict[int, np.ndarray] | None = None,
     verified_identity_keyframes: list[dict] | None = None,
+    crossing_threshold: float = 0.15,
 ) -> dict:
     """Re-run isolation + estimation for a single person after bbox corrections.
 
@@ -2145,6 +2431,16 @@ def reprocess_person(
     shutil.rmtree(str(bak_demo), ignore_errors=True)
     shutil.rmtree(str(bak_gemx), ignore_errors=True)
 
+    # Re-merge hybrid if SMPLest-X result still available
+    smplestx_dir = person_dir / "smplestx_demo"
+    if smplestx_dir.is_dir():
+        try:
+            merged_path = _merge_person_hands(person_dir)
+            if merged_path:
+                print(f"[reprocess_person] Re-merged hybrid: {merged_path.name}")
+        except Exception as e:
+            print(f"[reprocess_person] Hybrid re-merge skipped: {e}")
+
     # 5. Re-compute confidence & identity
     if progress_callback:
         progress_callback(0.8, f"Verifying person {person_index}...")
@@ -2263,9 +2559,9 @@ def reprocess_person(
         bridged_frames = set()
         if body_pose is not None and global_orient is not None and transl is not None:
             if mask_overlap is not None:
-                crossing_spans = crossing_spans_from_signal(mask_overlap, threshold=0.10)
+                crossing_spans = crossing_spans_from_signal(mask_overlap, threshold=crossing_threshold)
             else:
-                crossing_spans = crossing_spans_from_overlap(confidences)
+                crossing_spans = crossing_spans_from_overlap(confidences, iou_threshold=crossing_threshold)
 
             # Merge manual crossing spans from user annotation
             manual_spans_path = person_dir / "crossing_spans.json"
@@ -2280,8 +2576,10 @@ def reprocess_person(
                     print(f"[reprocess_person] Failed to load manual crossing spans: {e}")
 
             if crossing_spans:
+                overall_conf = np.array([c.overall for c in confidences], dtype=np.float32)
                 bridge_result = bridge.bridge_with_spans(
-                    body_pose, global_orient, transl, crossing_spans)
+                    body_pose, global_orient, transl, crossing_spans,
+                    overall_confidence=overall_conf)
             else:
                 bridge_result = bridge.bake(body_pose, global_orient, transl, confidences)
             bridged_frames = bridge_result["bridged_frames"]

@@ -302,6 +302,8 @@ class OcclusionBridge:
         global_orient: np.ndarray,
         transl: np.ndarray,
         spans: list[tuple[int, int]],
+        overall_confidence: np.ndarray | None = None,
+        min_confidence: float = 0.85,
     ) -> dict:
         """Bridge explicit crossing spans using direct frame anchors.
 
@@ -314,6 +316,9 @@ class OcclusionBridge:
             global_orient: (N, 3) axis-angle root orientation
             transl: (N, 3) root translation
             spans: list of (start, end) inclusive crossing spans
+            overall_confidence: per-frame confidence scores; if provided,
+                spans where min confidence >= min_confidence are skipped
+            min_confidence: threshold above which GVHMR output is trusted
 
         Returns:
             dict with 'body_pose', 'global_orient', 'transl', 'bridged_frames'
@@ -341,6 +346,19 @@ class OcclusionBridge:
             # Guard: if span covers entire clip, no clean anchors exist
             if prev_frame == start and next_frame == end:
                 continue
+
+            # Tail-span guard: no clean exit anchor when span reaches end of sequence
+            if next_frame <= end:
+                print(f"[OcclusionBridge] Skip tail span ({start}-{end}): no clean exit anchor")
+                continue
+
+            # Confidence gate: skip spans where GVHMR output is reliable
+            if overall_confidence is not None:
+                span_min = overall_confidence[start:end + 1].min()
+                if span_min >= min_confidence:
+                    print(f"[OcclusionBridge] Skip high-conf span ({start}-{end}): "
+                          f"min {span_min:.3f} >= {min_confidence}")
+                    continue
 
             num_joints = all_rots.shape[1]
 

@@ -28,6 +28,17 @@ def _require_ffmpeg_python():
 def get_video_lwh(video_path):
     _require_imageio()
     L, H, W, _ = iio.improps(video_path, plugin="pyav").shape
+    if L == 0:
+        # Some containers don't expose frame count in metadata; fall back to cv2
+        cap = cv2.VideoCapture(str(video_path))
+        L = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if L == 0:
+            # Last resort: decode and count
+            L = sum(1 for _ in iio.imiter(video_path, plugin="pyav"))
+        if H == 0 or W == 0:
+            H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        cap.release()
     return L, W, H
 
 
