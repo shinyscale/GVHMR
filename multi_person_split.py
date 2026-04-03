@@ -1756,28 +1756,15 @@ def split_multi_person_video(
 
     _log_vram("after isolation")
 
-    # ── Step 5: Per-person pipeline execution (parallel) ──
+    # ── Step 5: Per-person pipeline execution ──
+    # NOTE: GVHMR/GEM-X and SMPLest-X each spawn GPU subprocesses. On WSL2
+    # with Blackwell, concurrent CUDA process init causes "CUDA driver error:
+    # unknown error". These stages MUST run sequentially.
     _use_gemx = estimation_backend == "gemx"
     _backend_label = "GEM-X" if _use_gemx else "GVHMR"
     _result_filename = "hpe_results.pt" if _use_gemx else "hmr4d_results.pt"
     _progress(0.50, f"Running per-person {_backend_label} pipelines...")
 
-    import os as _os
-    _os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-
-    MAX_CONCURRENT_PERSONS = 3  # 3 × ~12GB ≈ 36GB, leaves 60GB headroom
-
-    import threading
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
-    _progress_lock = threading.Lock()
-    def _safe_progress(frac, msg):
-        with _progress_lock:
-            _progress(frac, msg)
-
-    # ── Phase A: pre-compute per-person metadata & filter cached ──
-    _gemx_grounding_jobs = []  # (i, person_video, person_dir, tid, bbox_override_path)
-    _estimation_jobs = []      # same tuple shape
     for i, (person_video, person_dir) in enumerate(zip(person_video_paths, person_dirs)):
         track = all_tracks[i]
         tid = track["track_id"]
@@ -1789,120 +1776,85 @@ def split_multi_person_video(
             _save_person_meta(person_dir, meta)
             person_meta_by_tid[tid] = meta
 
-        # GEM-X: queue GVHMR world-grounding if missing
+        # GEM-X: ensure GVHMR world-grounding exists (even if GEM-X already ran).
+        # Must run BEFORE the cache check so re-runs pick up missing GVHMR results.
         if _use_gemx and not list(person_dir.rglob("hmr4d_results.pt")):
-            _gemx_grounding_jobs.append((i, person_video, person_dir, tid, bbox_override_path))
-
-        # Check if already processed (cache check)
-        existing_pt = list(person_dir.rglob(_result_filename))
-        isolated_mtime = Path(person_video).stat().st_mtime if Path(person_video).exists() else 0.0
-        newest_pt_mtime = max((pt.stat().st_mtime for pt in existing_pt), default=0.0)
-        if existing_pt and newest_pt_mtime >= isolated_mtime:
-            _safe_progress(
-                0.50 + (i + 1) / len(all_tracks) * 0.30,
-                f"Person {i} already processed",
-            )
-            continue
-        if existing_pt:
-            _safe_progress(
+            _progress(
                 0.50 + i / len(all_tracks) * 0.30,
-                f"Person {i} isolation changed; re-running {_backend_label}",
-            )
-        _estimation_jobs.append((i, person_video, person_dir, tid, bbox_override_path))
-
-    # ── Phase B: parallel GEM-X world-grounding prerequisites ──
-    if _gemx_grounding_jobs:
-        _safe_progress(0.50, f"Running GVHMR world-grounding for {len(_gemx_grounding_jobs)} persons (parallel)...")
-        _grounding_done = [0]
-
-        def _run_grounding(job):
-            i, person_video, person_dir, tid, bbx_path = job
-            _safe_progress(
-                0.50 + i / len(all_tracks) * 0.10,
-                f"GVHMR world-grounding for person {i}...",
+                f"Running GVHMR (world-grounding) for person {i}...",
             )
             run_person_pipeline(
                 video_path=person_video,
                 person_id=tid,
                 output_dir=person_dir,
                 slam_override_path=str(slam_path) if not static_cam else None,
-                bbx_override_path=str(bbx_path),
+                bbx_override_path=str(bbox_override_path),
                 static_cam=static_cam,
                 use_dpvo=use_dpvo,
                 f_mm=f_mm,
                 skip_render=True,
                 render_incam_only=False,
             )
-            _grounding_done[0] += 1
-            _safe_progress(
-                0.50 + _grounding_done[0] / len(_gemx_grounding_jobs) * 0.10,
-                f"GVHMR world-grounding done ({_grounding_done[0]}/{len(_gemx_grounding_jobs)})",
+
+        # Check if already processed (check for backend-specific output)
+        existing_pt = list(person_dir.rglob(_result_filename))
+        isolated_mtime = Path(person_video).stat().st_mtime if Path(person_video).exists() else 0.0
+        newest_pt_mtime = max((pt.stat().st_mtime for pt in existing_pt), default=0.0)
+        if existing_pt and newest_pt_mtime >= isolated_mtime:
+            _progress(
+                0.50 + (i + 1) / len(all_tracks) * 0.30,
+                f"Person {i} already processed",
+            )
+            continue
+        if existing_pt:
+            _progress(
+                0.50 + i / len(all_tracks) * 0.30,
+                f"Person {i} isolation changed; re-running {_backend_label}",
             )
 
-        with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_PERSONS) as pool:
-            list(pool.map(_run_grounding, _gemx_grounding_jobs))
+        _progress(
+            0.50 + i / len(all_tracks) * 0.30,
+            f"Running {_backend_label} for person {i}...",
+        )
 
-    # ── Phase C: parallel main estimation ──
-    if _estimation_jobs:
-        _safe_progress(0.55, f"Running {_backend_label} for {len(_estimation_jobs)} persons (parallel)...")
-        _est_done = [0]
-
-        def _run_estimation(job):
-            i, person_video, person_dir, tid, bbx_path = job
-            _safe_progress(
-                0.55 + i / len(all_tracks) * 0.25,
-                f"Running {_backend_label} for person {i}...",
+        if _use_gemx:
+            pt_path, person_log = run_person_pipeline_gemx(
+                video_path=person_video,
+                person_id=tid,
+                output_dir=person_dir,
+                slam_override_path=str(slam_path) if not static_cam else None,
+                bbx_override_path=str(bbox_override_path),
+                static_cam=static_cam,
+                progress_callback=progress_callback,
             )
-            if _use_gemx:
-                pt_path, person_log = run_person_pipeline_gemx(
-                    video_path=person_video,
-                    person_id=tid,
-                    output_dir=person_dir,
-                    slam_override_path=str(slam_path) if not static_cam else None,
-                    bbx_override_path=str(bbx_path),
-                    static_cam=static_cam,
-                    progress_callback=progress_callback,
-                )
-            else:
-                pt_path, person_log = run_person_pipeline(
-                    video_path=person_video,
-                    person_id=tid,
-                    output_dir=person_dir,
-                    slam_override_path=str(slam_path) if not static_cam else None,
-                    bbx_override_path=str(bbx_path),
-                    static_cam=static_cam,
-                    use_dpvo=use_dpvo,
-                    f_mm=f_mm,
-                    skip_render=not render_overlays,
-                    render_incam_only=render_overlays,
-                )
-            _est_done[0] += 1
-            if pt_path is None:
-                with _progress_lock:
-                    log_lines.extend(person_log)
-                _safe_progress(
-                    0.55 + _est_done[0] / len(_estimation_jobs) * 0.25,
-                    f"Person {i} {_backend_label} FAILED",
-                )
-            else:
-                _safe_progress(
-                    0.55 + _est_done[0] / len(_estimation_jobs) * 0.25,
-                    f"Person {i} {_backend_label} done ({_est_done[0]}/{len(_estimation_jobs)})",
-                )
+        else:
+            pt_path, person_log = run_person_pipeline(
+                video_path=person_video,
+                person_id=tid,
+                output_dir=person_dir,
+                slam_override_path=str(slam_path) if not static_cam else None,
+                bbx_override_path=str(bbox_override_path),
+                static_cam=static_cam,
+                use_dpvo=use_dpvo,
+                f_mm=f_mm,
+                skip_render=not render_overlays,
+                render_incam_only=render_overlays,
+            )
 
-        with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_PERSONS) as pool:
-            list(pool.map(_run_estimation, _estimation_jobs))
+        if pt_path is None:
+            log_lines.extend(person_log)
+            _progress(
+                0.50 + (i + 1) / len(all_tracks) * 0.30,
+                f"Person {i} {_backend_label} FAILED",
+            )
 
-    # ── Step 5.2: Per-person hand estimation (SMPLest-X, parallel) ──
+    # ── Step 5.2: Per-person hand estimation (SMPLest-X) ──
     if use_hands and not _use_gemx:
         smplestx_info = _find_smplestx()
         if smplestx_info:
-            _safe_progress(0.80, "Running SMPLest-X hand estimation (parallel)...")
-            _hands_done = [0]
-
-            def _run_hands(args):
-                i, person_video, person_dir = args
-                _safe_progress(
+            _progress(0.80, "Running SMPLest-X hand estimation...")
+            for i, (person_video, person_dir) in enumerate(zip(person_video_paths, person_dirs)):
+                _progress(
                     0.80 + (i / max(len(person_dirs), 1)) * 0.01,
                     f"SMPLest-X for person {i}...",
                 )
@@ -1910,30 +1862,25 @@ def split_multi_person_video(
                     person_video, person_dir, smplestx_info,
                     progress_callback=progress_callback,
                 )
-                _hands_done[0] += 1
                 if ok:
                     merged_path = _merge_person_hands(person_dir)
                     if merged_path:
-                        _safe_progress(
-                            0.80 + (_hands_done[0] / max(len(person_dirs), 1)) * 0.01,
+                        _progress(
+                            0.80 + ((i + 1) / max(len(person_dirs), 1)) * 0.01,
                             f"Person {i} hands merged",
                         )
                     else:
-                        _safe_progress(
-                            0.80 + (_hands_done[0] / max(len(person_dirs), 1)) * 0.01,
+                        _progress(
+                            0.80 + ((i + 1) / max(len(person_dirs), 1)) * 0.01,
                             f"Person {i} hand merge failed — body only",
                         )
                 else:
-                    _safe_progress(
-                        0.80 + (_hands_done[0] / max(len(person_dirs), 1)) * 0.01,
+                    _progress(
+                        0.80 + ((i + 1) / max(len(person_dirs), 1)) * 0.01,
                         f"Person {i} SMPLest-X failed — body only",
                     )
-
-            hand_jobs = [(i, pv, pd) for i, (pv, pd) in enumerate(zip(person_video_paths, person_dirs))]
-            with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_PERSONS) as pool:
-                list(pool.map(_run_hands, hand_jobs))
         else:
-            _safe_progress(0.81, "SMPLest-X not found — skipping hand estimation")
+            _progress(0.81, "SMPLest-X not found — skipping hand estimation")
     elif use_hands and _use_gemx:
         _progress(0.81, "GEM-X already includes hands — skipping SMPLest-X")
 
