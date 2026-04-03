@@ -200,7 +200,9 @@ def run_hamer(
     vitpose_path: str | None = None,
     person_bboxes: np.ndarray | None = None,
     device: str = "cuda",
-    batch_size: int = 32,
+    batch_size: int = 128,
+    model=None,
+    model_cfg=None,
 ) -> dict:
     """Run HaMeR on a video to extract MANO hand parameters.
 
@@ -236,13 +238,15 @@ def run_hamer(
                     break
         vitpose = np.array(vp)  # (F, 17, 3)
 
-    # Load HaMeR model
-    try:
-        model, model_cfg = _load_hamer_model(device)
-    except Exception as e:
-        print(f"[HaMeR] Failed to load model: {e}")
-        cap.release()
-        return zeros_result
+    # Load HaMeR model (skip if caller passed a pre-loaded model)
+    _model_loaded_here = model is None
+    if _model_loaded_here:
+        try:
+            model, model_cfg = _load_hamer_model(device)
+        except Exception as e:
+            print(f"[HaMeR] Failed to load model: {e}")
+            cap.release()
+            return zeros_result
 
     # COCO-17 indices
     LEFT_ELBOW_IDX = 7
