@@ -483,3 +483,99 @@ def axis_angle_to_euler_deg(aa: np.ndarray) -> np.ndarray:
 def euler_deg_to_axis_angle(euler_deg: np.ndarray) -> np.ndarray:
     """Convert (3,) XYZ euler degrees to (3,) axis-angle."""
     return Rotation.from_euler("XYZ", euler_deg, degrees=True).as_rotvec().astype(np.float32)
+
+
+# ── Foot-Slide Correction ──
+
+
+def compute_foot_slide_offsets(
+    params: dict,
+    foot_joint_idx: int,
+    anchors: list[tuple[int, np.ndarray]],
+    frame_start: int,
+    frame_end: int,
+    blend_frames: int = 5,
+    forward_kinematics_fn=None,
+) -> dict[int, np.ndarray]:
+    """Compute per-frame root translation offsets to pin a foot at anchor positions.
+
+    At each anchor frame, the delta between the target foot position and the
+    actual FK foot position is computed. Between adjacent anchors, deltas are
+    linearly interpolated. At range boundaries, the nearest anchor delta is
+    held constant and faded to zero with a cosine ease over ``blend_frames``.
+
+    Parameters
+    ----------
+    params : dict
+        SMPL-X params with ``transl`` (or ``transl_world``), ``global_orient``,
+        ``body_pose``, etc.
+    foot_joint_idx : int
+        Joint index for the foot (10 = L_Foot, 11 = R_Foot).
+    anchors : list of (frame_idx, target_foot_pos (3,))
+        User-specified anchor frames and desired foot positions.
+    frame_start, frame_end : int
+        Inclusive frame range to correct.
+    blend_frames : int
+        Cosine ease-in/out width at range boundaries (0 = hard cut).
+    forward_kinematics_fn : callable(params, frame) -> (J, 3), optional
+        FK function.  If *None*, imports from ``views.mesh_viewport``.
+
+    Returns
+    -------
+    offsets : dict[int, np.ndarray]
+        ``{frame_idx: (3,) offset}`` for every frame in ``[frame_start, frame_end]``.
+    """
+    if not anchors:
+        return {}
+
+    if forward_kinematics_fn is None:
+        from views.mesh_viewport import forward_kinematics
+        forward_kinematics_fn = forward_kinematics
+
+    anchors = sorted(anchors, key=lambda a: a[0])
+
+    # --- compute delta at each anchor ---
+    anchor_deltas: list[tuple[int, np.ndarray]] = []
+    for frame_idx, target_pos in anchors:
+        joints = forward_kinematics_fn(params, frame_idx)
+        actual_foot = joints[foot_joint_idx]
+        delta = np.asarray(target_pos, dtype=np.float64) - actual_foot
+        anchor_deltas.append((frame_idx, delta))
+
+    # --- interpolate deltas for every frame in range ---
+    raw_offsets: dict[int, np.ndarray] = {}
+    first_af, first_d = anchor_deltas[0]
+    last_af, last_d = anchor_deltas[-1]
+
+    for f in range(frame_start, frame_end + 1):
+        if f <= first_af:
+            # Before/at first anchor — hold first delta
+            raw_offsets[f] = first_d.copy()
+        elif f >= last_af:
+            # After/at last anchor — hold last delta
+            raw_offsets[f] = last_d.copy()
+        else:
+            # Between two anchors — find surrounding pair and lerp
+            for i in range(len(anchor_deltas) - 1):
+                af_a, d_a = anchor_deltas[i]
+                af_b, d_b = anchor_deltas[i + 1]
+                if af_a <= f <= af_b:
+                    t = (f - af_a) / max(1, af_b - af_a)
+                    raw_offsets[f] = (1.0 - t) * d_a + t * d_b
+                    break
+
+    # --- cosine blend at range boundaries ---
+    if blend_frames > 0:
+        for f in range(frame_start, min(frame_start + blend_frames, frame_end + 1)):
+            # ease-in: 0 at frame_start, 1 at frame_start + blend_frames
+            progress = (f - frame_start) / blend_frames
+            weight = 0.5 * (1.0 - np.cos(np.pi * progress))
+            raw_offsets[f] = raw_offsets[f] * weight
+
+        for f in range(max(frame_end - blend_frames + 1, frame_start), frame_end + 1):
+            # ease-out: 1 at frame_end - blend_frames, 0 at frame_end
+            progress = (frame_end - f) / blend_frames
+            weight = 0.5 * (1.0 - np.cos(np.pi * progress))
+            raw_offsets[f] = raw_offsets[f] * weight
+
+    return {f: off.astype(np.float32) for f, off in raw_offsets.items()}
