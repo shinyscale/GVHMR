@@ -496,13 +496,15 @@ def compute_foot_slide_offsets(
     frame_end: int,
     blend_frames: int = 5,
     forward_kinematics_fn=None,
+    propagate: bool = False,
 ) -> dict[int, np.ndarray]:
     """Compute per-frame root translation offsets to pin a foot at anchor positions.
 
-    At each anchor frame, the delta between the target foot position and the
-    actual FK foot position is computed. Between adjacent anchors, deltas are
-    linearly interpolated. At range boundaries, the nearest anchor delta is
-    held constant and faded to zero with a cosine ease over ``blend_frames``.
+    Target foot positions are linearly interpolated between anchors (held
+    constant outside anchor range). At every frame, FK is run to find the
+    actual foot position, and the offset ``target - actual`` is returned.
+    At range boundaries, offsets are faded to zero with a cosine ease over
+    ``blend_frames``.
 
     Parameters
     ----------
@@ -533,36 +535,30 @@ def compute_foot_slide_offsets(
         forward_kinematics_fn = forward_kinematics
 
     anchors = sorted(anchors, key=lambda a: a[0])
+    anchor_frames = [a[0] for a in anchors]
+    anchor_targets = [np.asarray(a[1], dtype=np.float64) for a in anchors]
 
-    # --- compute delta at each anchor ---
-    anchor_deltas: list[tuple[int, np.ndarray]] = []
-    for frame_idx, target_pos in anchors:
-        joints = forward_kinematics_fn(params, frame_idx)
-        actual_foot = joints[foot_joint_idx]
-        delta = np.asarray(target_pos, dtype=np.float64) - actual_foot
-        anchor_deltas.append((frame_idx, delta))
-
-    # --- interpolate deltas for every frame in range ---
+    # --- interpolate TARGET POSITIONS for every frame in range ---
     raw_offsets: dict[int, np.ndarray] = {}
-    first_af, first_d = anchor_deltas[0]
-    last_af, last_d = anchor_deltas[-1]
 
     for f in range(frame_start, frame_end + 1):
-        if f <= first_af:
-            # Before/at first anchor — hold first delta
-            raw_offsets[f] = first_d.copy()
-        elif f >= last_af:
-            # After/at last anchor — hold last delta
-            raw_offsets[f] = last_d.copy()
+        # Determine the target foot position at this frame
+        if f <= anchor_frames[0]:
+            target = anchor_targets[0]
+        elif f >= anchor_frames[-1]:
+            target = anchor_targets[-1]
         else:
-            # Between two anchors — find surrounding pair and lerp
-            for i in range(len(anchor_deltas) - 1):
-                af_a, d_a = anchor_deltas[i]
-                af_b, d_b = anchor_deltas[i + 1]
-                if af_a <= f <= af_b:
-                    t = (f - af_a) / max(1, af_b - af_a)
-                    raw_offsets[f] = (1.0 - t) * d_a + t * d_b
+            # Between two anchors — lerp target positions
+            for i in range(len(anchor_frames) - 1):
+                if anchor_frames[i] <= f <= anchor_frames[i + 1]:
+                    t = (f - anchor_frames[i]) / max(1, anchor_frames[i + 1] - anchor_frames[i])
+                    target = (1.0 - t) * anchor_targets[i] + t * anchor_targets[i + 1]
                     break
+
+        # FK at this frame to get actual foot position, then compute offset
+        joints = forward_kinematics_fn(params, f)
+        actual_foot = joints[foot_joint_idx]
+        raw_offsets[f] = target - actual_foot
 
     # --- cosine blend at range boundaries ---
     if blend_frames > 0:
@@ -572,9 +568,52 @@ def compute_foot_slide_offsets(
             weight = 0.5 * (1.0 - np.cos(np.pi * progress))
             raw_offsets[f] = raw_offsets[f] * weight
 
-        for f in range(max(frame_end - blend_frames + 1, frame_start), frame_end + 1):
-            # ease-out: 1 at frame_end - blend_frames, 0 at frame_end
-            progress = (frame_end - f) / blend_frames
+        if not propagate:
+            for f in range(max(frame_end - blend_frames + 1, frame_start), frame_end + 1):
+                # ease-out: 1 at frame_end - blend_frames, 0 at frame_end
+                progress = (frame_end - f) / blend_frames
+                weight = 0.5 * (1.0 - np.cos(np.pi * progress))
+                raw_offsets[f] = raw_offsets[f] * weight
+
+    return {f: off.astype(np.float32) for f, off in raw_offsets.items()}
+
+
+# ── Drift Correction ──
+
+def compute_drift_offsets(
+    transl: np.ndarray,       # (N, 3) full translation array
+    frame_start: int,
+    frame_end: int,
+    xz_only: bool = True,
+    blend_frames: int = 5,
+) -> dict[int, np.ndarray]:
+    """Remove linear positional drift from a frame range.
+
+    Computes net drift between frame_start and frame_end, then subtracts
+    a proportional share at each frame so the character ends where it
+    started while preserving all frame-to-frame micro-movements.
+
+    Returns dict[int, (3,) float32] of per-frame offsets, same format as
+    compute_foot_slide_offsets.
+    """
+    if frame_start >= frame_end:
+        return {}
+
+    drift = transl[frame_end] - transl[frame_start]
+    if xz_only:
+        drift = drift.copy()
+        drift[1] = 0.0  # zero Y component
+
+    span = frame_end - frame_start
+    raw_offsets: dict[int, np.ndarray] = {}
+    for f in range(frame_start, frame_end + 1):
+        t = (f - frame_start) / span
+        raw_offsets[f] = -t * drift
+
+    # cosine ease-in at start boundary
+    if blend_frames > 0:
+        for f in range(frame_start, min(frame_start + blend_frames, frame_end + 1)):
+            progress = (f - frame_start) / blend_frames
             weight = 0.5 * (1.0 - np.cos(np.pi * progress))
             raw_offsets[f] = raw_offsets[f] * weight
 
